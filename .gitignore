@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# raw broker exports (personal, replaced often) — keep them out of the repo
+*.csv
