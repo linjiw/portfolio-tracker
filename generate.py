@@ -193,15 +193,68 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                      "txns": [{"date": t["date"], "side": t["side"], "qty": t["qty"],
                                "price": t["price"], "amount": round(t["amount"], 2)} for t in tl]})
 
+    # ---- daily portfolio net-worth + time-weighted return vs benchmarks ----
+    stock_syms = sorted(set(txns) | set(cur))
+
+    def shares_after(sym, d):
+        """Shares held at END of day d (anchored to current holdings)."""
+        f = cur.get(sym, {}).get("shares", 0.0)
+        chg = sum((t["qty"] if t["side"] == "BUY" else -t["qty"])
+                  for t in txns.get(sym, []) if t["date"] > d)
+        return f - chg
+
+    # market-day axis = S&P 500 trading days (fallback NASDAQ, then any stock)
+    axis_src = prices.get("^GSPC") or prices.get("^IXIC") or {}
+    axis = [d for d in sorted(axis_src) if dmin <= d <= dmax]
+    if not axis:
+        alldays = sorted({d for s, ps in prices.items() if not s.startswith("^") for d in ps})
+        axis = [d for d in alldays if dmin <= d <= dmax]
+
+    def pval(d, shares_date=None):
+        """Portfolio equity value on day d, optionally using holdings as of shares_date."""
+        sd = shares_date or d
+        tot = 0.0
+        for sym in stock_syms:
+            p = price_on(prices, sym, d)
+            if p:
+                tot += shares_after(sym, sd) * p
+        return tot
+
+    sp_base = price_on(prices, "^GSPC", axis[0]) if axis else None
+    nq_base = price_on(prices, "^IXIC", axis[0]) if axis else None
+    series = []
+    cum = 1.0
+    prevd = None
+    vprev = 0.0
+    for i, d in enumerate(axis):
+        v = pval(d)
+        if i == 0 or vprev <= 0:
+            cumret = 0.0
+        else:
+            today_on_prev = pval(d, shares_date=prevd)   # yesterday's holdings at today's prices
+            r = today_on_prev / vprev - 1
+            cum *= (1 + r)
+            cumret = cum - 1
+        sp = price_on(prices, "^GSPC", d)
+        nq = price_on(prices, "^IXIC", d)
+        series.append({"date": d, "value": round(v, 2), "ret": round(cumret * 100, 3),
+                       "sp500": (round((sp / sp_base - 1) * 100, 3) if sp and sp_base else None),
+                       "nasdaq": (round((nq / nq_base - 1) * 100, 3) if nq and nq_base else None)})
+        prevd, vprev = d, v
+
     held_val = sum(s["value"] for s in stocks if s["held"])
     held_unreal = sum(s["unreal"] for s in stocks if s["held"])
+    last = series[-1] if series else {}
     summary = {"marketValue": round(held_val, 2), "unrealized": round(held_unreal, 2),
                "realized": round(total_realized, 2), "netInvested": round(tot_buy - tot_sell, 2),
                "totalBuy": round(tot_buy, 2), "totalSell": round(tot_sell, 2),
                "deposits": round(deposits, 2), "optNet": round(opt_net, 2),
                "dateRange": [dmin, dmax], "numStocks": len(stocks),
-               "numHeld": sum(1 for s in stocks if s["held"])}
-    return {"summary": summary, "stocks": stocks, "options": opts}
+               "numHeld": sum(1 for s in stocks if s["held"]),
+               "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
+               "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
+               "netWorthStart": series[0]["value"] if series else 0}
+    return {"summary": summary, "stocks": stocks, "options": opts, "series": series}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -317,7 +370,7 @@ const kpis=[
 ];
 document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="l">${k[0]}</div><div class="v ${k[2]}">${k[1]}</div></div>`).join('');
 
-let filter='held', sortKey='value', q='', sel=null;
+let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
 function filtered(){
  let a=stocks.filter(s=>filter==='all'||(filter==='held'?s.held:!s.held));
@@ -328,14 +381,17 @@ function filtered(){
 }
 function renderList(){
  const a=filtered();
- document.getElementById('list').innerHTML=a.map(s=>{
+ const ov=`<div class="row ovrow ${sel==='__OV__'?'sel':''}" data-s="__OV__">
+   <div><div class="sym">📊 组合总览</div><div class="meta">净值 & 收益率 vs 指数</div></div>
+   <div class="pnl ${cls(S.curReturn)}">${pct(S.curReturn)}<div class="meta">区间收益</div></div></div>`;
+ document.getElementById('list').innerHTML=ov+(a.map(s=>{
   const main=s.held?s.unreal:s.realized, lbl=s.held?'未实现':'已实现';
   return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}">
     <div><div class="sym">${s.sym}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
     <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}</div></div>
-    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||'<div style="padding:16px;color:var(--mut)">无匹配</div>';
+    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||'<div style="padding:16px;color:var(--mut)">无匹配</div>');
  document.querySelectorAll('.row').forEach(r=>r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();});
- if(!sel&&a.length){sel=a[0].sym;renderDetail();}
+ renderDetail();
 }
 function chart(s){
  const W=900,H=420,mL=58,mR=120,mT=18,mB=42;
@@ -374,7 +430,56 @@ function chart(s){
    el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="0.55" stroke="${col}" stroke-width="1.4" data-i="${idx}" data-sym="${s.sym}" class="mk" style="cursor:pointer"/>`;});
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
+function svgLines(ser,defs,opts){
+ const W=900,H=opts.h||340,mL=66,mR=70,mT=16,mB=40;
+ const xmin=+new Date(ser[0].date),xmax=+new Date(ser[ser.length-1].date);
+ let vals=[];defs.forEach(d=>ser.forEach(p=>{if(p[d.key]!=null)vals.push(p[d.key]);}));
+ if(opts.zero)vals.push(0);
+ let ymin=Math.min(...vals),ymax=Math.max(...vals);const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
+ const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
+ const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB);
+ let el='';
+ for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
+   el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1c2336"/>`;
+   el+=`<text x="${mL-8}" y="${y+4}" fill="#8a97b0" font-size="11" text-anchor="end">${opts.fmt(v)}</text>`;}
+ const n=ser.length;
+ for(let i=0;i<=5;i++){const idx=Math.round((n-1)*i/5),p=ser[idx],x=xs(p.date),dt=new Date(p.date);
+   el+=`<text x="${x}" y="${H-mB+18}" fill="#8a97b0" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
+ if(opts.zero){const y=yc(0);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#46506e" stroke-dasharray="3 3"/>`;}
+ defs.forEach(d=>{const f=ser.filter(p=>p[d.key]!=null);
+   const pts=f.map(p=>`${xs(p.date).toFixed(1)},${yc(p[d.key]).toFixed(1)}`).join(' ');
+   if(opts.area&&f.length){const base=yc(Math.max(ymin,0));
+     el+=`<polygon points="${xs(f[0].date).toFixed(1)},${base} ${pts} ${xs(f[f.length-1].date).toFixed(1)},${base}" fill="${d.color}" fill-opacity="0.10"/>`;}
+   el+=`<polyline points="${pts}" fill="none" stroke="${d.color}" stroke-width="2.1" ${d.dash?'stroke-dasharray="5 3"':''}/>`;
+   const last=f[f.length-1];
+   if(last)el+=`<text x="${xs(last.date)+5}" y="${yc(last[d.key])+4}" fill="${d.color}" font-size="11" font-weight="700">${opts.fmt(last[d.key])}</text>`;});
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+}
+function renderOverview(){
+ const ser=DATA.series||[],right=document.getElementById('right');
+ if(ser.length<2){right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
+ const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn;
+ const cards=[
+  ['当前持仓市值',fmt(S.netWorthNow)],
+  ['期初持仓市值',fmt(S.netWorthStart)],
+  ['区间收益率 (时间加权)',`<span class="${cls(pr)}">${pct(pr)}</span>`],
+  ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
+  ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
+  ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
+ ];
+ right.innerHTML=`
+ <div class="card">
+   <div class="dh"><span class="t">📊 组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
+   <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
+ </div>
+ <div class="card"><div style="font-weight:650;margin-bottom:8px">持仓总市值（$）</div>
+   ${svgLines(ser,[{key:'value',color:'#34d399'}],{area:true,fmt:v=>'$'+(v/1000).toFixed(0)+'k'})}</div>
+ <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
+   <div class="legend"><span><i style="background:#a78bfa"></i>我的组合</span><span><i style="background:#60a5fa"></i>S&P 500</span><span><i style="background:#fbbf24"></i>纳斯达克综合</span></div>
+   ${svgLines(ser,[{key:'ret',color:'#a78bfa'},{key:'sp500',color:'#60a5fa',dash:1},{key:'nasdaq',color:'#fbbf24',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>`;
+}
 function renderDetail(){
+ if(sel==='__OV__'){renderOverview();return;}
  const s=stocks.find(x=>x.sym===sel);if(!s){document.getElementById('right').innerHTML='';return;}
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
   ['现价',fmt(s.curPrice)],['市值',s.held?fmt(s.value):'—'],
@@ -417,7 +522,7 @@ document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().tri
 document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderList();};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
- b.classList.add('on');filter=b.dataset.f;sel=null;renderList();});
+ b.classList.add('on');filter=b.dataset.f;renderList();});
 renderList();
 const obs=()=>{const r=document.getElementById('right');
  if(r&&!document.getElementById('optsec')){const d=document.createElement('div');d.id='optsec';
@@ -457,7 +562,8 @@ def main():
     # fetch window: a few days before first trade through day after last
     start = (datetime.date.fromisoformat(dmin) - datetime.timedelta(days=4)).isoformat()
     end = (datetime.date.fromisoformat(dmax) + datetime.timedelta(days=1)).isoformat()
-    prices = fetch_prices(tickers, start, end, no_fetch=args.no_fetch)
+    BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
+    prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
 
     payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
