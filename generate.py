@@ -299,12 +299,28 @@ def compute_fib(items):
             sig.append({"date": dates[i], "type": "golden", "price": round(px[i], 2)})
         elif e5[i - 1] >= e13[i - 1] and e5[i] < e13[i]:
             sig.append({"date": dates[i], "type": "death", "price": round(px[i], 2)})
+    # multi-indicator RESONANCE: trend alignment + recent EMA5x13 cross + RSI not extreme
+    res = []
+    lg = ld = -999
+    active = None
+    for i in range(len(px)):
+        if i >= 1 and e5[i - 1] <= e13[i - 1] and e5[i] > e13[i]:
+            lg = i
+        if i >= 1 and e5[i - 1] >= e13[i - 1] and e5[i] < e13[i]:
+            ld = i
+        bull = state[i] == "up" and (i - lg) <= 3 and rsi[i] < 70
+        bear = state[i] == "down" and (i - ld) <= 3 and rsi[i] > 30
+        cur = "bull" if bull else ("bear" if bear else None)
+        if cur and cur != active:
+            res.append({"date": dates[i], "price": round(px[i], 2), "rsi": round(rsi[i], 1), "type": cur})
+        active = cur
     rnd = lambda L: [round(x, 2) for x in L]
     label = {"up": "多头趋势", "down": "空头趋势", "range": "盘整纠缠", "mixed": "转换中"}
     return {"e5": rnd(e5), "e8": rnd(e8), "e13": rnd(e13), "e21": rnd(e21),
-            "mom": mom, "rsi": [round(x, 1) for x in rsi], "state": state, "signals": sig,
+            "mom": mom, "rsi": [round(x, 1) for x in rsi], "state": state,
+            "signals": sig, "resonance": res,
             "now": {"state": state[-1], "label": label[state[-1]],
-                    "mom": mom[-1], "rsi": round(rsi[-1], 1)}}
+                    "mom": mom[-1], "rsi": round(rsi[-1], 1), "res": active}}
 
 # ---------------------------------------------------------------- engine
 def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
@@ -351,6 +367,12 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
             "realized": round(realized, 2), "hasLegacy": has_legacy,
             "numTrades": len(tl), "prices": sorted(prices.get(sym, {}).items()),
             "txns": rows, "fib": compute_fib(sorted(prices.get(sym, {}).items()))})
+
+    # per-stock momentum keyed by date (for the portfolio-level overlay)
+    mom_map = {}
+    for s in stocks:
+        if s["fib"]:
+            mom_map[s["sym"]] = {d: m for (d, _), m in zip(s["prices"], s["fib"]["mom"])}
 
     opts, opt_net = [], 0.0
     for sym in sorted(opt_txns):
@@ -404,9 +426,21 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
             cumret = cum - 1
         sp = price_on(prices, "^GSPC", d)
         nq = price_on(prices, "^IXIC", d)
+        # value-weighted portfolio Fibonacci momentum on day d
+        num = den = 0.0
+        for sym in stock_syms:
+            sh = shares_after(sym, d)
+            if sh <= 0:
+                continue
+            p = price_on(prices, sym, d)
+            m = mom_map.get(sym, {}).get(d)
+            if p and m is not None:
+                num += sh * p * m; den += sh * p
+        pmom = round(num / den, 1) if den else 0
         series.append({"date": d, "value": round(v, 2), "ret": round(cumret * 100, 3),
                        "sp500": (round((sp / sp_base - 1) * 100, 3) if sp and sp_base else None),
-                       "nasdaq": (round((nq / nq_base - 1) * 100, 3) if nq and nq_base else None)})
+                       "nasdaq": (round((nq / nq_base - 1) * 100, 3) if nq and nq_base else None),
+                       "pmom": pmom})
         prevd, vprev = d, v
 
     held_val = sum(s["value"] for s in stocks if s["held"])
@@ -437,65 +471,86 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>投资组合时间线</title>
 <style>
-:root{--bg:#0b0f1a;--panel:#141b2d;--panel2:#1b2438;--line:#26304a;--txt:#e6ecf5;--mut:#8a97b0;
---green:#34d399;--red:#f87171;--blue:#60a5fa;--orange:#fbbf24;--purple:#a78bfa;}
+:root{--bg:#0a0c12;--bg2:#0e1118;--panel:#13161f;--panel2:#191d29;--line:#232838;
+--txt:#eef1f7;--mut:#7e879b;--faint:#4b5366;--green:#3ddc97;--red:#ff6b6b;--blue:#5b9dff;
+--orange:#ffbe4d;--purple:#b69bff;--accent:#5b9dff;}
 *{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,"PingFang SC","Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--txt);}
-header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px;flex-wrap:wrap;background:linear-gradient(180deg,#10172a,#0b0f1a);}
-header h1{font-size:18px;margin:0;font-weight:650}
-header .sub{color:var(--mut);font-size:13px}
-.kpis{display:flex;gap:12px;flex-wrap:wrap;padding:16px 24px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:150px;flex:1}
-.kpi .l{color:var(--mut);font-size:12px;margin-bottom:4px}
-.kpi .v{font-size:20px;font-weight:700}
-.wrap{display:flex;gap:16px;padding:0 24px 24px;align-items:flex-start}
-.left{width:300px;flex:none;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;position:sticky;top:12px}
-.controls{padding:10px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
-.controls input,.controls select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 9px;font-size:13px;width:100%}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:"Inter",-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif;
+background:radial-gradient(1200px 600px at 80% -10%,#141a2b 0%,var(--bg) 55%);color:var(--txt);
+font-feature-settings:"tnum" 1;-webkit-font-smoothing:antialiased;letter-spacing:.1px}
+::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#262c3d;border-radius:8px}
+::-webkit-scrollbar-track{background:transparent}
+header{padding:16px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;position:sticky;top:0;z-index:10;
+background:rgba(10,12,18,.72);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px}
+header .sub{color:var(--mut);font-size:12.5px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:20px 28px 6px}
+.kpi{background:linear-gradient(180deg,var(--panel),#10131c);border:1px solid var(--line);border-radius:14px;
+padding:14px 16px;transition:transform .15s,border-color .15s}
+.kpi:hover{transform:translateY(-2px);border-color:#2f3852}
+.kpi .l{color:var(--mut);font-size:11px;margin-bottom:6px;text-transform:uppercase;letter-spacing:.7px;font-weight:600}
+.kpi .v{font-size:21px;font-weight:750;letter-spacing:.2px}
+.wrap{display:flex;gap:18px;padding:14px 28px 32px;align-items:flex-start}
+.left{width:312px;flex:none;background:var(--panel);border:1px solid var(--line);border-radius:16px;
+overflow:hidden;position:sticky;top:78px;box-shadow:0 10px 40px -20px #000}
+.controls{padding:14px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:9px}
+.controls input,.controls select{background:var(--bg2);border:1px solid var(--line);color:var(--txt);
+border-radius:10px;padding:9px 11px;font-size:13px;width:100%;outline:none;transition:border-color .15s}
+.controls input:focus,.controls select:focus{border-color:var(--accent)}
 .tabs{display:flex;gap:6px}
-.tabs button{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--mut);border-radius:8px;padding:6px;font-size:12px;cursor:pointer}
-.tabs button.on{background:var(--blue);color:#06122b;border-color:var(--blue);font-weight:600}
-.list{max-height:72vh;overflow:auto}
-.row{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-bottom:1px solid #1c2336;cursor:pointer;gap:8px}
+.tabs button{flex:1;background:var(--bg2);border:1px solid var(--line);color:var(--mut);border-radius:9px;
+padding:7px;font-size:12px;cursor:pointer;transition:.15s;font-weight:600}
+.tabs button:hover{color:var(--txt)}
+.tabs button.on{background:var(--accent);color:#06122b;border-color:var(--accent)}
+.list{max-height:74vh;overflow:auto}
+.row{display:flex;justify-content:space-between;align-items:center;padding:11px 14px;
+border-bottom:1px solid #181c27;cursor:pointer;gap:8px;border-left:3px solid transparent;transition:background .12s}
 .row:hover{background:var(--panel2)}
-.row.sel{background:#1f2a44;border-left:3px solid var(--blue)}
-.row .sym{font-weight:650;font-size:14px}
-.row .meta{font-size:11px;color:var(--mut)}
-.row .pnl{font-size:13px;font-weight:600;text-align:right;white-space:nowrap}
+.row.sel{background:#171f30;border-left-color:var(--accent)}
+.row .sym{font-weight:700;font-size:13.5px}
+.row .meta{font-size:11px;color:var(--mut);margin-top:2px}
+.row .pnl{font-size:13px;font-weight:700;text-align:right;white-space:nowrap}
 .right{flex:1;min-width:0}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
-.dh{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-.dh .t{font-size:22px;font-weight:700}
-.dh .nm{color:var(--mut);font-size:13px}
-.badges{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 4px}
-.badge .l{color:var(--mut);font-size:11px}
-.badge .v{font-size:16px;font-weight:650}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px;margin-bottom:18px;
+box-shadow:0 10px 40px -24px #000}
+.dh{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.dh .t{font-size:23px;font-weight:780;letter-spacing:.2px}
+.dh .nm{color:var(--mut);font-size:12.5px}
+.badges{display:flex;gap:26px;flex-wrap:wrap;margin:16px 0 8px}
+.badge .l{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:3px}
+.badge .v{font-size:17px;font-weight:720}
 .pos{color:var(--green)}.neg{color:var(--red)}
-.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:6px 0 2px}
-.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--mut);margin:10px 0 4px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle}
 .chartbox{position:relative;width:100%;overflow:hidden}
 svg{width:100%;height:auto;display:block}
-.tt{position:fixed;pointer-events:none;background:#0a1326ee;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;z-index:9;display:none;min-width:150px}
+.tt{position:fixed;pointer-events:none;background:rgba(8,11,20,.94);border:1px solid #2c3346;border-radius:10px;
+padding:9px 11px;font-size:12px;z-index:30;display:none;min-width:155px;box-shadow:0 8px 30px -8px #000}
 table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
-th,td{padding:7px 8px;text-align:right;border-bottom:1px solid #1c2336;white-space:nowrap}
-th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--panel)}
+th,td{padding:8px 9px;text-align:right;border-bottom:1px solid #181c27;white-space:nowrap}
+th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--panel);text-transform:uppercase;
+font-size:10.5px;letter-spacing:.5px}
+tbody tr:hover{background:var(--panel2)}
 td.l,th.l{text-align:left}
-.tag{font-size:10px;padding:2px 6px;border-radius:6px;font-weight:600}
-.tag.b{background:#0d3b2e;color:var(--green)}
-.tag.s{background:#3b1414;color:var(--red)}
-.tag.o{background:#2a2f45;color:var(--mut)}
-.note{color:var(--mut);font-size:12px;line-height:1.6}
-.scroll{max-height:420px;overflow:auto}
-details{margin-top:4px}
-summary{cursor:pointer;color:var(--blue);font-size:13px}
-.legacychip{font-size:10px;background:#3a2d10;color:var(--orange);padding:2px 7px;border-radius:6px;margin-left:6px}
-.frow{display:flex;align-items:center;gap:10px;padding:3px 0;font-size:12.5px}
-.frow .fsym{width:60px;font-weight:600}
-.frow .fval{width:50px;text-align:right;font-weight:700}
-.frow .fst{width:60px;font-size:11px;color:var(--mut)}
-.fbar{position:relative;height:14px;background:#161d2e;border-radius:4px;flex:1}
-.fbar .z{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#46506e}
-.fbar .p{position:absolute;top:2px;height:10px;border-radius:3px}
+.tag{font-size:10px;padding:2px 7px;border-radius:6px;font-weight:700}
+.tag.b{background:rgba(61,220,151,.14);color:var(--green)}
+.tag.s{background:rgba(255,107,107,.14);color:var(--red)}
+.tag.o{background:#222838;color:var(--mut)}
+.note{color:var(--mut);font-size:12px;line-height:1.7}
+.scroll{max-height:420px;overflow:auto;border-radius:10px}
+details{margin-top:6px}summary{cursor:pointer;color:var(--accent);font-size:13px;padding:3px 0}
+.legacychip{font-size:9.5px;background:rgba(255,190,77,.13);color:var(--orange);padding:2px 7px;border-radius:6px;margin-left:6px}
+.frow{display:flex;align-items:center;gap:11px;padding:5px 0;font-size:12.5px;border-radius:8px;transition:background .12s}
+.frow:hover{background:var(--panel2)}
+.frow .fsym{width:64px;font-weight:700}
+.frow .fval{width:52px;text-align:right;font-weight:750}
+.frow .fst{width:62px;font-size:11px;color:var(--mut)}
+.fbar{position:relative;height:15px;background:#11141d;border-radius:5px;flex:1;overflow:hidden}
+.fbar .z{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#39415a}
+.fbar .p{position:absolute;top:2.5px;height:10px;border-radius:3px}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;
+border:1px solid var(--line)}
 </style>
 </head>
 <body>
@@ -565,9 +620,10 @@ function renderList(){
  document.getElementById('list').innerHTML=ov+(a.map(s=>{
   const main=s.held?s.unreal:s.realized, lbl=s.held?'未实现':'已实现';
   const fn=s.fib&&s.fib.now, dot=fn?`<span style="color:${FIBCOL[fn.state]}">●</span> `:'';
+  const zap=fn&&fn.res?`<span title="${fn.res==='bull'?'多头共振':'空头共振'}" style="color:${fn.res==='bull'?'#3ddc97':'#ff6b6b'}">⚡</span>`:'';
   const momtxt=fn?` · 动能<span style="color:${momColor(fn.mom)}">${fn.mom>0?'+':''}${fn.mom}</span>`:'';
   return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}">
-    <div><div class="sym">${dot}${s.sym}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
+    <div><div class="sym">${dot}${s.sym} ${zap}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
     <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}</div></div>
     <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||'<div style="padding:16px;color:var(--mut)">无匹配</div>');
  document.querySelectorAll('.row').forEach(r=>r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();});
@@ -637,6 +693,30 @@ function svgLines(ser,defs,opts){
    if(last)el+=`<text x="${xs(last.date)+5}" y="${yc(last[d.key])+4}" fill="${d.color}" font-size="11" font-weight="700">${opts.fmt(last[d.key])}</text>`;});
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
+function nwChart(ser){
+ const W=900,H=330,mL=64,mR=22,mT=16,mB=40,stripH=11,stripY=H-mB+22;
+ const xmin=+new Date(ser[0].date),xmax=+new Date(ser[ser.length-1].date);
+ const vals=ser.map(p=>p.value);let ymin=Math.min(...vals),ymax=Math.max(...vals);
+ const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
+ const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
+ const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB-stripH);
+ const base=yc(ymin),col=m=>m>15?'#3ddc97':(m<-15?'#ff6b6b':'#ffbe4d');
+ let el='';
+ for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
+   el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1c2336"/><text x="${mL-8}" y="${y+4}" fill="#7e879b" font-size="11" text-anchor="end">$${(v/1000).toFixed(0)}k</text>`;}
+ for(let i=0;i<=5;i++){const t=xmin+(xmax-xmin)*i/5,x=xs(new Date(t)),dt=new Date(t);
+   el+=`<text x="${x}" y="${stripY+stripH+12}" fill="#7e879b" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
+ for(let i=1;i<ser.length;i++){const x0=xs(ser[i-1].date),x1=xs(ser[i].date);
+   el+=`<polygon points="${x0},${base} ${x0},${yc(ser[i-1].value)} ${x1},${yc(ser[i].value)} ${x1},${base}" fill="${col(ser[i].pmom)}" fill-opacity="0.15"/>`;}
+ const pts=ser.map(p=>`${xs(p.date).toFixed(1)},${yc(p.value).toFixed(1)}`).join(' ');
+ el+=`<polyline points="${pts}" fill="none" stroke="#eef1f7" stroke-width="1.9"/>`;
+ const last=ser[ser.length-1];
+ el+=`<text x="${xs(last.date)-2}" y="${yc(last.value)-9}" fill="#eef1f7" font-size="12" font-weight="700" text-anchor="end">$${(last.value/1000).toFixed(1)}k</text>`;
+ for(let i=1;i<ser.length;i++){const x0=xs(ser[i-1].date),x1=xs(ser[i].date);
+   el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${col(ser[i].pmom)}" fill-opacity="0.9"/>`;}
+ el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#7e879b" font-size="10" text-anchor="end">组合动能</text>`;
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+}
 function renderOverview(){
  const ser=DATA.series||[],right=document.getElementById('right');
  if(ser.length<2){right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
@@ -654,12 +734,24 @@ function renderOverview(){
    <div class="dh"><span class="t">📊 组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
    <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
  </div>
- <div class="card"><div style="font-weight:650;margin-bottom:8px">持仓总市值（$）</div>
-   ${svgLines(ser,[{key:'value',color:'#34d399'}],{area:true,fmt:v=>'$'+(v/1000).toFixed(0)+'k'})}</div>
+ <div class="card"><div style="font-weight:650;margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
+   <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#3ddc97">绿=强(>15)</span> / <span style="color:#ffbe4d">黄=中性</span> / <span style="color:#ff6b6b">红=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
+   ${nwChart(ser)}</div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
    <div class="legend"><span><i style="background:#a78bfa"></i>我的组合</span><span><i style="background:#60a5fa"></i>S&P 500</span><span><i style="background:#fbbf24"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#a78bfa'},{key:'sp500',color:'#60a5fa',dash:1},{key:'nasdaq',color:'#fbbf24',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>`
- +fibRanking();
+   ${svgLines(ser,[{key:'ret',color:'#b69bff'},{key:'sp500',color:'#5b9dff',dash:1},{key:'nasdaq',color:'#ffbe4d',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>`
+ +resonanceCard()+fibRanking();
+}
+function resonanceCard(){
+ const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
+ const bear=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bear');
+ const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
+ return `<div class="card"><div class="dh"><span class="t" style="font-size:18px">⚡ 今日多指标共振</span><span class="nm">趋势排列 + 3日内金/死叉 + RSI 未极端 → 高确信度</span></div>
+   <div style="margin-top:10px"><div class="l" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px;font-weight:600">多头共振 · ${bull.length}</div>
+   <div style="display:flex;gap:8px;flex-wrap:wrap">${bull.map(x=>chip(x,'#3ddc97')).join('')||'<span class="note">无</span>'}</div></div>
+   <div style="margin-top:14px"><div class="l" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px;font-weight:600">空头共振 · ${bear.length}</div>
+   <div style="display:flex;gap:8px;flex-wrap:wrap">${bear.map(x=>chip(x,'#ff6b6b')).join('')||'<span class="note">无</span>'}</div></div>
+   <div class="note" style="margin-top:12px">共振 = 三个指标同向确认，比单一金叉更能过滤震荡假信号；仍为技术参考，非投资建议。</div></div>`;
 }
 function fibRanking(){
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
@@ -700,8 +792,11 @@ function fibChart(s){
  el+=line(f.e21,'#fb923c',1.4)+line(f.e13,'#eab308',1.4)+line(f.e8,'#84cc16',1.5)+line(f.e5,'#22c55e',1.8);
  // golden/death cross markers
  (f.signals||[]).forEach(g=>{const x=xs(g.date),y=yc(g.price);
-   if(g.type==='golden')el+=`<path d="M ${x} ${y-13} l 5 9 l -10 0 z" fill="#34d399" stroke="#0b0f1a" stroke-width="0.5"/>`;
-   else el+=`<path d="M ${x} ${y+13} l 5 -9 l -10 0 z" fill="#f87171" stroke="#0b0f1a" stroke-width="0.5"/>`;});
+   if(g.type==='golden')el+=`<path d="M ${x} ${y-13} l 5 9 l -10 0 z" fill="#3ddc97" stroke="#0a0c12" stroke-width="0.5"/>`;
+   else el+=`<path d="M ${x} ${y+13} l 5 -9 l -10 0 z" fill="#ff6b6b" stroke="#0a0c12" stroke-width="0.5"/>`;});
+ // resonance: trend + recent cross + RSI-ok  → highlighted ring
+ (f.resonance||[]).forEach(g=>{const x=xs(g.date),y=yc(g.price),c=g.type==='bull'?'#3ddc97':'#ff6b6b';
+   el+=`<circle cx="${x}" cy="${y}" r="10" fill="none" stroke="${c}" stroke-width="2.2" stroke-opacity="0.9"/><circle cx="${x}" cy="${y}" r="2.6" fill="${c}"/>`;});
  // current price label
  const cp=prices[prices.length-1][1];el+=`<text x="${W-mR+4}" y="${yc(cp)+4}" fill="#5b6b8c" font-size="11">现价</text>`;
  // state strip
@@ -716,20 +811,24 @@ function renderFib(s){
  const rsiCol=n.rsi>70?'#f87171':(n.rsi<30?'#34d399':'#e6ecf5');
  const lastSig=(f.signals||[]).slice(-1)[0];
  const ser=s.prices.map((p,i)=>({date:p[0],mom:f.mom[i],rsi:f.rsi[i]}));
+ const resChip=n.res==='bull'?'<span class="chip" style="color:#3ddc97;border-color:#1f5a40;background:rgba(61,220,151,.1)">⚡ 多头共振</span>'
+   :(n.res==='bear'?'<span class="chip" style="color:#ff6b6b;border-color:#5a1f1f;background:rgba(255,107,107,.1)">⚡ 空头共振</span>':'');
  const badges=[
   ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
   ['动能强弱',`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
   ['RSI(14)',`<span style="color:${rsiCol}">${n.rsi}</span>`],
   ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
+  ['多指标共振',n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
  ];
  return `<div class="card">
-   <div class="dh"><span class="t" style="font-size:18px">🌀 斐波那契动能分析</span><span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div>
+   <div class="dh"><span class="t" style="font-size:18px">🌀 斐波那契动能分析</span>${resChip}<span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="legend">
      <span><i style="background:#22c55e"></i>EMA5</span><span><i style="background:#84cc16"></i>EMA8</span>
      <span><i style="background:#eab308"></i>EMA13</span><span><i style="background:#fb923c"></i>EMA21</span>
-     <span><i style="background:#34d399"></i>金叉</span><span><i style="background:#f87171"></i>死叉</span>
-     <span>底部状态带：<span style="color:#34d399">绿=多头</span> / <span style="color:#f87171">红=空头</span> / <span style="color:#fbbf24">黄=转换</span> / <span style="color:#9ca3af">灰=盘整</span></span>
+     <span><i style="background:#3ddc97"></i>金叉</span><span><i style="background:#ff6b6b"></i>死叉</span>
+     <span>◎ 共振信号(多空趋势+金/死叉+RSI未极端)</span>
+     <span>底部状态带：<span style="color:#3ddc97">绿=多头</span> / <span style="color:#ff6b6b">红=空头</span> / <span style="color:#ffbe4d">黄=转换</span> / <span style="color:#9ca3af">灰=盘整</span></span>
    </div>
    ${fibChart(s)}
    <div style="font-weight:650;margin:12px 0 2px">动能振荡器（−100 ~ +100）</div>
@@ -739,6 +838,7 @@ function renderFib(s){
    ${svgLines(ser,[{key:'rsi',color:'#22d3ee'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
      guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}]})}
    <div class="note" style="margin-top:10px"><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
+   <b>多指标共振(◎ 圆环)：</b>同时满足「均线多头/空头排列 + 3 日内出现金叉/死叉 + RSI 未到超买/超卖」三个条件才标记——比单一信号更高确信度，能过滤掉震荡市里的假交叉。<br>
    <b>诚实说明：</b>“斐波那契周期更神奇”在学术上并无强证据——5/8/13/21 相比其它周期没有统计显著的超额收益。它真正有用的地方是<b>周期按几何级数(≈1.6 倍)递增</b>，天然形成快/中/慢分层，便于判断趋势结构；这来自间距而非数字的“神秘性”。本面板为技术分析参考，<b>非投资建议</b>。</div>
  </div>`;
 }
