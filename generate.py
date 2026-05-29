@@ -66,6 +66,7 @@ def parse_history(path):
     n_buys = n_eft = n_div = 0
     dmin = dmax = None
     cmap = None
+    cash_rows = []   # (date, kind, amount) for cross-file union
     with open(path, encoding="utf-8-sig") as f:
         for r in csv.reader(f):
             if cmap is None:
@@ -81,10 +82,14 @@ def parse_history(path):
             dmin = d if dmin is None or d < dmin else dmin
             dmax = d if dmax is None or d > dmax else dmax
             if "Electronic Funds Transfer Received" in action or "TRANSFERRED" in action:
-                deposits += amt; n_eft += 1 if "Electronic" in action else 0
+                deposits += amt
+                if "Electronic" in action:
+                    n_eft += 1; cash_rows.append((d, "EFT", round(amt, 2)))
+                else:
+                    cash_rows.append((d, "TRANSFER", round(amt, 2)))
                 continue
             if "DIVIDEND RECEIVED" in action or "INTEREST" in action:
-                dividends += amt; n_div += 1
+                dividends += amt; n_div += 1; cash_rows.append((d, "DIV", round(amt, 2)))
                 continue
             if "JOURNALED" in action or sym == "":
                 continue
@@ -104,7 +109,8 @@ def parse_history(path):
     return {"txns": txns, "opt_txns": opt_txns, "names": names,
             "deposits": round(deposits, 2), "dividends": round(dividends, 2),
             "totals": (tot_buy, tot_sell), "dmin": dmin, "dmax": dmax,
-            "n_buys": n_buys, "n_eft": n_eft, "n_div": n_div, "path": path}
+            "n_buys": n_buys, "n_eft": n_eft, "n_div": n_div,
+            "cash_rows": cash_rows, "path": path}
 
 def parse_portfolio(path):
     """Return dict: sym -> {shares, price, value, gain, cost, avg, gainpct}."""
@@ -124,6 +130,69 @@ def parse_portfolio(path):
         d["avg"] = d["cost"] / d["shares"] if d["shares"] else 0
         d["gainpct"] = d["gain"] / d["cost"] * 100 if d["cost"] else 0
     return cur
+
+# ---------------------------------------------------------------- merge
+def merge_histories(parsed):
+    """Merge trades across overlapping exports. Each real transaction appears
+    once per export that covers its date; overlapping exports repeat it. So we
+    take, per identical-transaction key, the MAX count seen in any single file
+    (not the sum) — robust dedup that preserves genuine same-day duplicates."""
+    from collections import Counter, defaultdict
+    sc, oc, names = Counter(), Counter(), {}
+    for h in parsed:
+        fsc, foc = Counter(), Counter()
+        for sym, L in h["txns"].items():
+            names.setdefault(sym, h["names"].get(sym, sym))
+            for t in L:
+                fsc[(t["date"], t["side"], sym, round(t["qty"], 3),
+                     round(t["price"], 2), round(t["amount"], 2))] += 1
+        for sym, L in h["opt_txns"].items():
+            for t in L:
+                foc[(t["date"], t["side"], sym, round(t["qty"], 3),
+                     round(t["price"], 2), round(t["amount"], 2))] += 1
+        for k, n in fsc.items():
+            sc[k] = max(sc[k], n)
+        for k, n in foc.items():
+            oc[k] = max(oc[k], n)
+    txns, opt = defaultdict(list), defaultdict(list)
+    for store, src in ((txns, sc), (opt, oc)):
+        for (d, side, sym, qty, price, amt), n in src.items():
+            for _ in range(n):
+                store[sym].append({"date": d, "side": side, "qty": qty, "price": price, "amount": amt})
+    for L in txns.values():
+        L.sort(key=lambda t: t["date"])
+    return txns, opt, names
+
+def continuous_start(txns, gap_days=20):
+    """Largest gap-free span ending at the latest trade: returns the first date
+    after the last coverage gap >= gap_days (missing-data hole, not a quiet week)."""
+    dates = sorted({t["date"] for L in txns.values() for t in L})
+    if not dates:
+        return None, []
+    start = dates[0]
+    gaps = []
+    for a, b in zip(dates, dates[1:]):
+        if (datetime.date.fromisoformat(b) - datetime.date.fromisoformat(a)).days >= gap_days:
+            gaps.append((a, b)); start = b
+    return start, gaps
+
+def union_cash(parsed, lo, hi):
+    """Deduped union of cash rows across all exports, within [lo, hi]."""
+    seen = set()
+    dep = div = 0.0
+    for h in parsed:
+        for d, kind, amt in h["cash_rows"]:
+            if not (lo <= d <= hi):
+                continue
+            key = (d, kind, amt)
+            if key in seen:
+                continue
+            seen.add(key)
+            if kind in ("EFT", "TRANSFER"):
+                dep += amt
+            elif kind == "DIV":
+                div += amt
+    return round(dep, 2), round(div, 2)
 
 # ---------------------------------------------------------------- prices
 def fetch_prices(tickers, start, end, no_fetch=False):
@@ -172,7 +241,7 @@ def price_on(prices, sym, isodate):
     return prev if prev is not None else ps[min(ps)]
 
 # ---------------------------------------------------------------- engine
-def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0):
+def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
     tot_buy, tot_sell = totals
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
@@ -279,8 +348,8 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     summary = {"marketValue": round(held_val, 2), "unrealized": round(held_unreal, 2),
                "realized": round(total_realized, 2), "netInvested": round(tot_buy - tot_sell, 2),
                "totalBuy": round(tot_buy, 2), "totalSell": round(tot_sell, 2),
-               "deposits": round(deposits, 2), "dividends": round(dividends, 2),
-               "optNet": round(opt_net, 2),
+               "deposits": round(deposits, 2), "lifeDeposits": round(life_deposits, 2),
+               "dividends": round(dividends, 2), "optNet": round(opt_net, 2),
                "dateRange": [dmin, dmax], "numStocks": len(stocks),
                "numHeld": sum(1 for s in stocks if s["held"]),
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
@@ -398,7 +467,8 @@ const kpis=[
  ['已实现盈亏 (窗口内·含估算)',fmt(S.realized),cls(S.realized)],
  ['期权净现金流',fmt(S.optNet),cls(S.optNet)],
  ['窗口内净买入',fmt(S.netInvested),''],
- ['现金转入 (入金)',fmt(S.deposits),''],
+ ['现金转入 (窗口内)',fmt(S.deposits),''],
+ ['累计入金 (开户至今)',fmt(S.lifeDeposits||S.deposits),''],
  ['股息收入',fmt(S.dividends||0),(S.dividends>0?'pos':'')],
 ];
 document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="l">${k[0]}</div><div class="v ${k[2]}">${k[1]}</div></div>`).join('');
@@ -600,28 +670,32 @@ def main():
         sys.exit("!! Could not find any history CSV. Pass --history explicitly.")
     parsed = [parse_history(p) for p in hist_files]
 
-    # Only anchor to exports that reach the most recent date across all exports
-    # (the Portfolio snapshot's date). Mixing a stale export that ends earlier
-    # than the current holdings would corrupt the reverse-reconstruction.
-    latest = max(h["dmax"] for h in parsed)
-    compat = [h for h in parsed if h["dmax"] == latest] or parsed
-    trade_src = max(compat, key=lambda h: h["n_buys"])          # most complete trades, in-window
-    cash_src = max(compat, key=lambda h: (h["n_eft"] + h["n_div"], h["deposits"]))  # most complete cash
-    if len(parsed) > 1:
-        print(f"· found {len(parsed)} history exports; anchoring to window ending {latest}")
-        skipped = [os.path.basename(h["path"]) for h in parsed if h not in compat]
-        if skipped:
-            print(f"  (ignored stale exports ending earlier: {', '.join(skipped)})")
-    print(f"· portfolio:  {portfolio}")
-    print(f"· trades  ←  {os.path.basename(trade_src['path'])}  ({trade_src['n_buys']} buys)")
-    print(f"· cash    ←  {os.path.basename(cash_src['path'])}  (deposits ${cash_src['deposits']:,.0f}, dividends ${cash_src['dividends']:,.0f})")
-    if cash_src["path"] != trade_src["path"] and cash_src["deposits"] != trade_src["deposits"]:
-        print(f"  ⚠ deposits differ across exports: using ${cash_src['deposits']:,.0f} "
-              f"(trade file shows ${trade_src['deposits']:,.0f})")
+    # Merge ALL exports (each contributes the dates it covers; dedup by max-count
+    # per identical transaction). Then restrict the timeline to the largest
+    # gap-free span ending at the latest trade — a >=20-day hole means an export
+    # is simply missing those weeks, and reconstructing across it would be wrong.
+    txns_all, opt_txns, names = merge_histories(parsed)
+    dmin, gaps = continuous_start(txns_all)
+    dmax = max((t["date"] for L in txns_all.values() for t in L), default=None)
 
-    txns, opt_txns, names = trade_src["txns"], trade_src["opt_txns"], trade_src["names"]
-    totals, dmin, dmax = trade_src["totals"], trade_src["dmin"], trade_src["dmax"]
-    deposits, dividends = cash_src["deposits"], cash_src["dividends"]
+    txns = {s: [t for t in L if t["date"] >= dmin] for s, L in txns_all.items()}
+    txns = {s: L for s, L in txns.items() if L}
+    opt_txns = {s: [t for t in L if t["date"] >= dmin] for s, L in opt_txns.items()}
+    opt_txns = {s: L for s, L in opt_txns.items() if L}
+    tot_buy = sum(-t["amount"] for L in txns.values() for t in L if t["side"] == "BUY")
+    tot_sell = sum(t["amount"] for L in txns.values() for t in L if t["side"] == "SELL")
+    totals = (tot_buy, tot_sell)
+    deposits, dividends = union_cash(parsed, dmin, dmax)
+    life_dep, _ = union_cash(parsed, "0000-00", "9999-99")
+
+    n_trades = sum(len(L) for L in txns.values())
+    print(f"· portfolio:  {portfolio}")
+    print(f"· merged {len(parsed)} exports → {n_trades} trades, window {dmin}→{dmax}")
+    if gaps:
+        print(f"  (excluded earlier data before {dmin}: coverage gap "
+              + ", ".join(f"{a}→{b}" for a, b in gaps) + ")")
+    print(f"· deposits {dmin[:7]}→{dmax[:7]}: ${deposits:,.0f}  ·  lifetime deposits ${life_dep:,.0f}  ·  dividends ${dividends:,.2f}")
+
     cur = parse_portfolio(portfolio)
     tickers = sorted(set(list(txns) + list(cur)))
 
@@ -631,7 +705,7 @@ def main():
     BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
     prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
 
-    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends)
+    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]
