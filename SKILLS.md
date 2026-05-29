@@ -36,6 +36,34 @@ step, no external libraries at view time. Just open the `.html` file.
      but **sum them as cash deposits**.
    - Options = symbol starts with `-` or action contains `CALL`/`PUT`.
 
+## Multiple / partial exports (Fidelity gives inconsistent files)
+
+The user tends to accumulate many overlapping exports in `~/Downloads`. Observed:
+- `History_for_Account_*.csv` — full **trade** log, but no dividends and can
+  **miss cash transfers** (one was missing a $1,000 deposit).
+- `Accounts_History*.csv` — layout has extra `Account`/`Account Number` columns;
+  some are trade-only, some are cash/dividend-complete, some are **stale**
+  (end weeks before the current portfolio date), some go back to **Sept 2025**.
+
+Rules `generate.py` follows (don't regress these):
+- **Header-aware parsing** (`_colmap`): map columns by header name, never fixed
+  indices — the two layouts differ by two columns.
+- **Anchor only to exports reaching the latest date** (= portfolio snapshot date).
+  A trade export ending earlier than current holdings would corrupt the
+  reverse-reconstruction, so stale ones are ignored for the timeline.
+- Among compatible exports, pick the **trade source** (most stock buys) and the
+  **cash source** (most EFT+dividend rows) *independently*. Warn if deposit
+  totals disagree.
+- Deposits are window-scoped (consistent with the dashboard window). For the
+  **lifetime** deposit total, union EFT rows across *all* exports deduped by
+  `(date, action, amount)` — this is a slight lower bound (collapses any genuine
+  same-day-same-amount duplicates, and months whose exports lack cash rows are
+  missing). As of the May-2026 data, lifetime EFT ≈ **$48,884** since 09/2025,
+  vs only $5,171 inside the 2-month dashboard window.
+
+Return rate is **unaffected** by any of this: TWR uses holdings×price, never cash
+flows. A missing/extra deposit only changes the displayed deposit KPI.
+
 ## ⚠️ The single most important gotcha: the history is INCOMPLETE
 
 The history export only covers a ~2-month window and is **not** from account
