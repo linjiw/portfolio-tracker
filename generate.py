@@ -41,39 +41,70 @@ def newest(pattern, where):
     return hits[0] if hits else None
 
 # ---------------------------------------------------------------- parsing
+def _colmap(header):
+    """Map a Fidelity history header row to column indices (handles both export
+    layouts: with or without the extra Account/Account Number columns)."""
+    idx = {}
+    for i, h in enumerate(header):
+        h = h.strip().lower()
+        if h == "run date": idx["date"] = i
+        elif h == "action": idx["action"] = i
+        elif h == "symbol": idx["symbol"] = i
+        elif h == "description": idx["desc"] = i
+        elif h.startswith("price"): idx["price"] = i
+        elif h == "quantity": idx["qty"] = i
+        elif h.startswith("amount"): idx["amount"] = i
+    return idx
+
 def parse_history(path):
-    """Return (txns, opt_txns, names, deposits, totals, date_min, date_max)."""
+    """Header-aware parser. Returns a dict with txns/opt_txns/names, cash flows
+    (deposits, dividends), trade totals, date range, and counts used to pick the
+    best source file when several exports are present."""
     from collections import defaultdict
     txns, opt_txns, names = defaultdict(list), defaultdict(list), {}
-    deposits = tot_buy = tot_sell = 0.0
-    dmin, dmax = None, None
-    with open(path) as f:
+    deposits = dividends = tot_buy = tot_sell = 0.0
+    n_buys = n_eft = n_div = 0
+    dmin = dmax = None
+    cmap = None
+    with open(path, encoding="utf-8-sig") as f:
         for r in csv.reader(f):
-            if len(r) < 13 or r[0] == "Run Date" or not re.match(r"\d{2}/\d{2}/\d{4}", r[0]):
+            if cmap is None:
+                if r and r[0].strip() == "Run Date":
+                    cmap = _colmap(r)
                 continue
-            date, action, sym, desc, price, qty, amt = r[0], r[1], r[2].strip(), r[3], r[5], r[6], r[10]
-            d = iso(date)
+            if len(r) <= cmap.get("amount", 99) or not re.match(r"\d{2}/\d{2}/\d{4}", r[0]):
+                continue
+            action = r[cmap["action"]]
+            amt = fnum(r[cmap["amount"]])
+            sym = r[cmap["symbol"]].strip()
+            d = iso(r[cmap["date"]])
             dmin = d if dmin is None or d < dmin else dmin
             dmax = d if dmax is None or d > dmax else dmax
-            if "Electronic Funds" in action or "TRANSFERRED" in action:
-                deposits += fnum(amt)
+            if "Electronic Funds Transfer Received" in action or "TRANSFERRED" in action:
+                deposits += amt; n_eft += 1 if "Electronic" in action else 0
                 continue
-            if sym == "":
+            if "DIVIDEND RECEIVED" in action or "INTEREST" in action:
+                dividends += amt; n_div += 1
+                continue
+            if "JOURNALED" in action or sym == "":
                 continue
             is_opt = sym.startswith("-") or "CALL" in action or "PUT" in action
             side = "BUY" if "BOUGHT" in action else ("SELL" if "SOLD" in action else "?")
-            rec = {"date": d, "side": side, "qty": abs(fnum(qty)),
-                   "price": fnum(price), "amount": fnum(amt)}
+            rec = {"date": d, "side": side, "qty": abs(fnum(r[cmap["qty"]])),
+                   "price": fnum(r[cmap["price"]]), "amount": amt}
             if is_opt:
                 opt_txns[sym].append(rec)
             else:
                 txns[sym].append(rec)
-                names.setdefault(sym, desc.strip())
-                if rec["amount"] < 0:
-                    tot_buy += -rec["amount"]
-                else:
+                names.setdefault(sym, r[cmap["desc"]].strip())
+                if side == "BUY":
+                    tot_buy += -rec["amount"]; n_buys += 1
+                elif side == "SELL":
                     tot_sell += rec["amount"]
-    return txns, opt_txns, names, deposits, (tot_buy, tot_sell), dmin, dmax
+    return {"txns": txns, "opt_txns": opt_txns, "names": names,
+            "deposits": round(deposits, 2), "dividends": round(dividends, 2),
+            "totals": (tot_buy, tot_sell), "dmin": dmin, "dmax": dmax,
+            "n_buys": n_buys, "n_eft": n_eft, "n_div": n_div, "path": path}
 
 def parse_portfolio(path):
     """Return dict: sym -> {shares, price, value, gain, cost, avg, gainpct}."""
@@ -141,7 +172,7 @@ def price_on(prices, sym, isodate):
     return prev if prev is not None else ps[min(ps)]
 
 # ---------------------------------------------------------------- engine
-def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax):
+def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0):
     tot_buy, tot_sell = totals
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
@@ -248,7 +279,8 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     summary = {"marketValue": round(held_val, 2), "unrealized": round(held_unreal, 2),
                "realized": round(total_realized, 2), "netInvested": round(tot_buy - tot_sell, 2),
                "totalBuy": round(tot_buy, 2), "totalSell": round(tot_sell, 2),
-               "deposits": round(deposits, 2), "optNet": round(opt_net, 2),
+               "deposits": round(deposits, 2), "dividends": round(dividends, 2),
+               "optNet": round(opt_net, 2),
                "dateRange": [dmin, dmax], "numStocks": len(stocks),
                "numHeld": sum(1 for s in stocks if s["held"]),
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
@@ -366,7 +398,8 @@ const kpis=[
  ['已实现盈亏 (窗口内·含估算)',fmt(S.realized),cls(S.realized)],
  ['期权净现金流',fmt(S.optNet),cls(S.optNet)],
  ['窗口内净买入',fmt(S.netInvested),''],
- ['现金转入',fmt(S.deposits),''],
+ ['现金转入 (入金)',fmt(S.deposits),''],
+ ['股息收入',fmt(S.dividends||0),(S.dividends>0?'pos':'')],
 ];
 document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="l">${k[0]}</div><div class="v ${k[2]}">${k[1]}</div></div>`).join('');
 
@@ -549,13 +582,46 @@ def main():
     args = ap.parse_args()
 
     portfolio = args.portfolio or newest("Portfolio_Positions*.csv", args.input_dir)
-    history = args.history or newest("History_for_Account*.csv", args.input_dir)
-    if not portfolio or not history:
-        sys.exit("!! Could not find CSVs. Pass --portfolio and --history explicitly.")
-    print(f"· portfolio: {portfolio}")
-    print(f"· history:   {history}")
+    if not portfolio:
+        sys.exit("!! Could not find a Portfolio_Positions*.csv. Pass --portfolio explicitly.")
 
-    txns, opt_txns, names, deposits, totals, dmin, dmax = parse_history(history)
+    # Gather every history-style export and parse them all. Different Fidelity
+    # exports are complete in different ways: "History_for_Account" has the full
+    # trade log; "Accounts_History" often has the complete cash/dividend record
+    # (and may include deposits the other file misses). So pick the best source
+    # for each purpose instead of trusting a single file.
+    if args.history:
+        hist_files = [args.history]
+    else:
+        hist_files = []
+        for pat in ("History_for_Account*.csv", "Accounts_History*.csv"):
+            hist_files += glob.glob(os.path.join(args.input_dir, pat))
+    if not hist_files:
+        sys.exit("!! Could not find any history CSV. Pass --history explicitly.")
+    parsed = [parse_history(p) for p in hist_files]
+
+    # Only anchor to exports that reach the most recent date across all exports
+    # (the Portfolio snapshot's date). Mixing a stale export that ends earlier
+    # than the current holdings would corrupt the reverse-reconstruction.
+    latest = max(h["dmax"] for h in parsed)
+    compat = [h for h in parsed if h["dmax"] == latest] or parsed
+    trade_src = max(compat, key=lambda h: h["n_buys"])          # most complete trades, in-window
+    cash_src = max(compat, key=lambda h: (h["n_eft"] + h["n_div"], h["deposits"]))  # most complete cash
+    if len(parsed) > 1:
+        print(f"· found {len(parsed)} history exports; anchoring to window ending {latest}")
+        skipped = [os.path.basename(h["path"]) for h in parsed if h not in compat]
+        if skipped:
+            print(f"  (ignored stale exports ending earlier: {', '.join(skipped)})")
+    print(f"· portfolio:  {portfolio}")
+    print(f"· trades  ←  {os.path.basename(trade_src['path'])}  ({trade_src['n_buys']} buys)")
+    print(f"· cash    ←  {os.path.basename(cash_src['path'])}  (deposits ${cash_src['deposits']:,.0f}, dividends ${cash_src['dividends']:,.0f})")
+    if cash_src["path"] != trade_src["path"] and cash_src["deposits"] != trade_src["deposits"]:
+        print(f"  ⚠ deposits differ across exports: using ${cash_src['deposits']:,.0f} "
+              f"(trade file shows ${trade_src['deposits']:,.0f})")
+
+    txns, opt_txns, names = trade_src["txns"], trade_src["opt_txns"], trade_src["names"]
+    totals, dmin, dmax = trade_src["totals"], trade_src["dmin"], trade_src["dmax"]
+    deposits, dividends = cash_src["deposits"], cash_src["dividends"]
     cur = parse_portfolio(portfolio)
     tickers = sorted(set(list(txns) + list(cur)))
 
@@ -565,7 +631,7 @@ def main():
     BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
     prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
 
-    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax)
+    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]
