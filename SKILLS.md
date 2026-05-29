@@ -117,10 +117,39 @@ Output → `output/portfolio_dashboard.html`.
 4. Open the HTML; confirm `DATA` parses (no JS console errors), a held stock
    shows price line + markers + avg-cost line.
 
+## Portfolio overview: net-worth curve + return vs benchmarks (IMPLEMENTED)
+
+The "📊 组合总览" view (`payload["series"]`, built in `build_payload`):
+
+- **Daily holdings**: `shares_after(sym, d) = final_shares − Σ(signed qty of
+  trades dated after d)`. Works for legacy AND exited names (anchored to the
+  Portfolio CSV), so every day's holdings are exact.
+- **Net-worth curve**: `value(d) = Σ shares_after(sym,d)·close(sym,d)`. This is
+  **equity only** — no cash, no options (those need separate, less reliable
+  data). Labeled as such in the UI.
+- **Time-weighted return (TWR)** — the right metric to compare against an index
+  when the user keeps depositing/buying. Daily return revalues *yesterday's*
+  holdings at *today's* prices, so same-day buys/sells and deposits don't
+  distort it: `r_t = pval(d, shares_date=prev) / value(prev) − 1`, then chain
+  `Π(1+r_t)−1`. Do NOT use (value_today/value_yesterday) directly — that would
+  count fresh cash as "return".
+- **Benchmarks**: fetch `^GSPC` (S&P 500) and `^IXIC` (NASDAQ Composite) and
+  normalize cumulative % from the first axis day. The market-day axis comes from
+  `^GSPC` trading days. Benchmarks are added to the fetch list but never become
+  "stocks" (they're not in txns/cur).
+- Summary exposes `curReturn`, `spReturn`, `nasdaqReturn`, `netWorthNow/Start`;
+  the UI also shows **excess return (alpha) = curReturn − spReturn**.
+- Generic `svgLines(ser, defs, opts)` JS renders both charts (area for $,
+  multi-line + zero baseline for %).
+
+Sanity numbers from the May-2026 dataset: net worth $80.9k→$109.4k, portfolio
+TWR +23.4% vs S&P +19.2% (alpha +4.1%) vs NASDAQ +29.4%.
+
 ## Extension ideas (not yet built)
 
-- Portfolio-level net-worth / cost-basis curve over time (needs daily MV =
-  Σ holdings(t)·price(t); holdings(t) already reconstructable).
+- Include cash & option mark-to-market in net worth (needs reliable cash-balance
+  history + option price history — both currently messy).
+- Money-weighted return (IRR/XIRR) as an alternative to TWR.
 - Export per-stock chart to PNG, or full data to Excel.
 - Sector grouping / allocation treemap.
 - True realized P&L if a full-history export (from inception) becomes available
