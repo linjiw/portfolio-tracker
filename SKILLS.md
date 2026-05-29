@@ -48,18 +48,26 @@ The user tends to accumulate many overlapping exports in `~/Downloads`. Observed
 Rules `generate.py` follows (don't regress these):
 - **Header-aware parsing** (`_colmap`): map columns by header name, never fixed
   indices — the two layouts differ by two columns.
-- **Anchor only to exports reaching the latest date** (= portfolio snapshot date).
-  A trade export ending earlier than current holdings would corrupt the
-  reverse-reconstruction, so stale ones are ignored for the timeline.
-- Among compatible exports, pick the **trade source** (most stock buys) and the
-  **cash source** (most EFT+dividend rows) *independently*. Warn if deposit
-  totals disagree.
-- Deposits are window-scoped (consistent with the dashboard window). For the
-  **lifetime** deposit total, union EFT rows across *all* exports deduped by
-  `(date, action, amount)` — this is a slight lower bound (collapses any genuine
-  same-day-same-amount duplicates, and months whose exports lack cash rows are
-  missing). As of the May-2026 data, lifetime EFT ≈ **$48,884** since 09/2025,
-  vs only $5,171 inside the 2-month dashboard window.
+- **Merge ALL exports** (`merge_histories`): each export contributes the dates
+  it covers; the same real trade repeats across overlapping exports. Dedup by
+  taking the **MAX count per identical-transaction key** across files (never the
+  sum) — this preserves genuine same-day duplicate trades while collapsing
+  cross-file repeats. Key = `(date, side, symbol, qty, price, amount)`.
+- **Continuous-span anchoring** (`continuous_start`): after merging, find the
+  largest gap-free span ending at the latest trade. A `>=20`-day hole = an
+  export is missing those weeks; reconstructing across it would be wrong, so the
+  timeline starts after the last such gap. For the May-2026 data this is
+  2026-01-06 (a 64-day Nov2025–Jan2026 hole is excluded). Trades before the start
+  are dropped from the timeline (opening lot at the start date absorbs them).
+- **Validate**: reconstructed holdings must never go meaningfully negative
+  (`pos >= -0.01`); a negative means a buy is missing. The merged Jan–May set
+  passes with 0 negatives, confirming completeness.
+- **Cash** (`union_cash`): deduped union of EFT/dividend rows by
+  `(date, kind, amount)`. Show **window** deposits (KPI, consistent with the
+  timeline) AND **lifetime** deposits (since account open). Lifetime is a slight
+  lower bound (collapses genuine same-day-same-amount dupes; months whose
+  exports lack cash rows are missing). As of May-2026: lifetime EFT ≈ **$48,884**
+  since 09/2025; window (Jan–May) ≈ $35,742.
 
 Return rate is **unaffected** by any of this: TWR uses holdings×price, never cash
 flows. A missing/extra deposit only changes the displayed deposit KPI.
