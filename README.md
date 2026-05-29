@@ -53,6 +53,11 @@ python3 generate.py [options]
 - **Transaction table** — price, amount, position after, avg cost after,
   realized P&L per sell.
 - **Options section** — net cash flow per contract.
+- **Fibonacci momentum** — per stock: EMA 5/8/13/21 ribbon with state coloring
+  (range / trend / transition), momentum oscillator, RSI(14), golden/death
+  crosses; plus a momentum ranking across holdings on the overview. (Technical
+  reference, not investment advice — Fib periods aren't magic, the value is the
+  geometric fast/mid/slow layering.)
 
 ## How numbers are computed
 

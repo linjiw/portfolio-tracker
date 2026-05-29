@@ -181,6 +181,34 @@ The "📊 组合总览" view (`payload["series"]`, built in `build_payload`):
 Sanity numbers from the May-2026 dataset: net worth $80.9k→$109.4k, portfolio
 TWR +23.4% vs S&P +19.2% (alpha +4.1%) vs NASDAQ +29.4%.
 
+## Fibonacci momentum analytics (IMPLEMENTED)
+
+`compute_fib(items)` runs on each stock's full daily-close series (so it needs
+the price fetch, not just trade dates) and attaches `stock["fib"]`:
+- **EMA ribbon** 5/8/13/21 (`e5..e21`) — the geometric (~1.6×) spacing gives a
+  natural fast/mid/slow layering. Drawn as a state-colored band + 4 lines.
+- **State** per day (Alligator-style): `range` (ribbon width <0.8% of price →
+  tangled/no-trade), `up`/`down` (cleanly stacked), else `mixed` (transition).
+  Shown as the bottom color strip and the list-row dot.
+- **Momentum** `= 100*tanh((EMA5-EMA21)/EMA21 / 0.06)` → signed, ±100 bounded.
+  The 0.06 divisor was tuned so a field of strong momentum names doesn't all pin
+  at ±100 (0.04 saturated). Drives the list sort + overview ranking.
+- **RSI(14)** Wilder's; **golden/death cross** = EMA5 crossing EMA13.
+- `now` = latest snapshot {state,label,mom,rsi} used by list/overview/badges.
+
+UI: per-stock "斐波那契动能分析" card (ribbon chart + momentum oscillator + RSI
+with 30/70 guides), list momentum column + "按斐波那契动能" sort, overview
+"斐波那契动能排行" diverging bars. `svgLines` gained `opts.fixed` (y-range) and
+`opts.guides` (dashed reference lines) for the oscillator/RSI.
+
+**Honest framing (keep this in the UI).** There's no strong evidence Fibonacci
+periods beat other periods; the real value is the geometric spacing's layering,
+not numerology. The panel is labeled a technical-analysis reference, **not
+investment advice** — don't let it drift into signal-chasing claims.
+
+Validate after changes: `node --check` on the extracted `<script>` (the template
+has a lot of nested template-literals; a stray backtick breaks silently).
+
 ## Extension ideas (not yet built)
 
 - Include cash & option mark-to-market in net worth (needs reliable cash-balance
