@@ -16,7 +16,7 @@ Designed to be re-run whenever you export fresh CSVs:
 Nothing is hard-coded: ticker list, date range, holdings and costs are all
 derived from the two CSV files at run time.  See SKILLS.md for methodology.
 """
-import csv, re, json, glob, os, sys, argparse, datetime
+import csv, re, json, glob, os, sys, argparse, datetime, math
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -240,6 +240,72 @@ def price_on(prices, sym, isodate):
             break
     return prev if prev is not None else ps[min(ps)]
 
+# ---------------------------------------------------------------- Fibonacci indicators
+def _ema(vals, n):
+    a = 2.0 / (n + 1)
+    out, e = [], None
+    for v in vals:
+        e = v if e is None else a * v + (1 - a) * e
+        out.append(e)
+    return out
+
+def _rsi(vals, n=14):
+    out = [50.0] * len(vals)
+    if len(vals) <= n:
+        return out
+    deltas = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
+    ag = sum(d for d in deltas[:n] if d > 0) / n
+    al = sum(-d for d in deltas[:n] if d < 0) / n
+    rs = ag / al if al > 0 else 999
+    out[n] = 100 - 100 / (1 + rs)
+    for i in range(n + 1, len(vals)):
+        d = deltas[i - 1]
+        ag = (ag * (n - 1) + max(d, 0)) / n
+        al = (al * (n - 1) + max(-d, 0)) / n
+        rs = ag / al if al > 0 else 999
+        out[i] = 100 - 100 / (1 + rs)
+    for i in range(n):
+        out[i] = out[n]
+    return out
+
+def compute_fib(items):
+    """Fibonacci EMA ribbon (5/8/13/21) + momentum + RSI + crossover signals.
+    Momentum = 100*tanh((EMA5-EMA21)/EMA21 / 0.04): signed by fast-vs-slow
+    separation, smoothly bounded to ±100. State borrows the Alligator idea:
+    tight ribbon = range; cleanly stacked = trend; else transition."""
+    dates = [d for d, _ in items]
+    px = [p for _, p in items]
+    if len(px) < 21:
+        return None
+    e5, e8, e13, e21 = _ema(px, 5), _ema(px, 8), _ema(px, 13), _ema(px, 21)
+    rsi = _rsi(px)
+    mom, state = [], []
+    for i in range(len(px)):
+        sp = (e5[i] - e21[i]) / e21[i] if e21[i] else 0
+        mom.append(round(100 * math.tanh(sp / 0.06), 1))
+        band = max(e5[i], e8[i], e13[i], e21[i]) - min(e5[i], e8[i], e13[i], e21[i])
+        w = band / px[i] * 100 if px[i] else 0
+        if w < 0.8:
+            state.append("range")
+        elif e5[i] > e8[i] > e13[i] > e21[i]:
+            state.append("up")
+        elif e5[i] < e8[i] < e13[i] < e21[i]:
+            state.append("down")
+        else:
+            state.append("mixed")
+    sig = []
+    for i in range(1, len(px)):
+        if e5[i - 1] <= e13[i - 1] and e5[i] > e13[i]:
+            sig.append({"date": dates[i], "type": "golden", "price": round(px[i], 2)})
+        elif e5[i - 1] >= e13[i - 1] and e5[i] < e13[i]:
+            sig.append({"date": dates[i], "type": "death", "price": round(px[i], 2)})
+    rnd = lambda L: [round(x, 2) for x in L]
+    label = {"up": "多头趋势", "down": "空头趋势", "range": "盘整纠缠", "mixed": "转换中"}
+    return {"e5": rnd(e5), "e8": rnd(e8), "e13": rnd(e13), "e21": rnd(e21),
+            "mom": mom, "rsi": [round(x, 1) for x in rsi], "state": state, "signals": sig,
+            "now": {"state": state[-1], "label": label[state[-1]],
+                    "mom": mom[-1], "rsi": round(rsi[-1], 1)}}
+
 # ---------------------------------------------------------------- engine
 def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
     tot_buy, tot_sell = totals
@@ -283,7 +349,8 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
             "value": round(c.get("value", 0), 2), "unreal": round(c.get("gain", 0), 2),
             "unrealPct": round(c.get("gainpct", 0), 2), "cost": round(c.get("cost", 0), 2),
             "realized": round(realized, 2), "hasLegacy": has_legacy,
-            "numTrades": len(tl), "prices": sorted(prices.get(sym, {}).items()), "txns": rows})
+            "numTrades": len(tl), "prices": sorted(prices.get(sym, {}).items()),
+            "txns": rows, "fib": compute_fib(sorted(prices.get(sym, {}).items()))})
 
     opts, opt_net = [], 0.0
     for sym in sorted(opt_txns):
@@ -422,6 +489,13 @@ td.l,th.l{text-align:left}
 details{margin-top:4px}
 summary{cursor:pointer;color:var(--blue);font-size:13px}
 .legacychip{font-size:10px;background:#3a2d10;color:var(--orange);padding:2px 7px;border-radius:6px;margin-left:6px}
+.frow{display:flex;align-items:center;gap:10px;padding:3px 0;font-size:12.5px}
+.frow .fsym{width:60px;font-weight:600}
+.frow .fval{width:50px;text-align:right;font-weight:700}
+.frow .fst{width:60px;font-size:11px;color:var(--mut)}
+.fbar{position:relative;height:14px;background:#161d2e;border-radius:4px;flex:1}
+.fbar .z{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#46506e}
+.fbar .p{position:absolute;top:2px;height:10px;border-radius:3px}
 </style>
 </head>
 <body>
@@ -439,6 +513,7 @@ summary{cursor:pointer;color:var(--blue);font-size:13px}
        <option value="unreal">按未实现盈亏</option>
        <option value="realized">按已实现盈亏</option>
        <option value="numTrades">按交易次数</option>
+       <option value="fibmom">按斐波那契动能</option>
        <option value="sym">按代码字母</option>
      </select>
      <div class="tabs">
@@ -478,8 +553,8 @@ const stocks=DATA.stocks;
 function filtered(){
  let a=stocks.filter(s=>filter==='all'||(filter==='held'?s.held:!s.held));
  if(q)a=a.filter(s=>s.sym.toLowerCase().includes(q)||(s.name||'').toLowerCase().includes(q));
- const k=sortKey;
- a.sort((x,y)=> k==='sym'? x.sym.localeCompare(y.sym) : (y[k]||0)-(x[k]||0));
+ const k=sortKey, fm=s=>(s.fib&&s.fib.now)?s.fib.now.mom:-999;
+ a.sort((x,y)=> k==='sym'? x.sym.localeCompare(y.sym) : (k==='fibmom'? fm(y)-fm(x) : (y[k]||0)-(x[k]||0)));
  return a;
 }
 function renderList(){
@@ -489,9 +564,11 @@ function renderList(){
    <div class="pnl ${cls(S.curReturn)}">${pct(S.curReturn)}<div class="meta">区间收益</div></div></div>`;
  document.getElementById('list').innerHTML=ov+(a.map(s=>{
   const main=s.held?s.unreal:s.realized, lbl=s.held?'未实现':'已实现';
+  const fn=s.fib&&s.fib.now, dot=fn?`<span style="color:${FIBCOL[fn.state]}">●</span> `:'';
+  const momtxt=fn?` · 动能<span style="color:${momColor(fn.mom)}">${fn.mom>0?'+':''}${fn.mom}</span>`:'';
   return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}">
-    <div><div class="sym">${s.sym}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
-    <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}</div></div>
+    <div><div class="sym">${dot}${s.sym}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
+    <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}</div></div>
     <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||'<div style="padding:16px;color:var(--mut)">无匹配</div>');
  document.querySelectorAll('.row').forEach(r=>r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();});
  renderDetail();
@@ -539,9 +616,11 @@ function svgLines(ser,defs,opts){
  let vals=[];defs.forEach(d=>ser.forEach(p=>{if(p[d.key]!=null)vals.push(p[d.key]);}));
  if(opts.zero)vals.push(0);
  let ymin=Math.min(...vals),ymax=Math.max(...vals);const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
+ if(opts.fixed){ymin=opts.fixed[0];ymax=opts.fixed[1];}
  const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
  const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB);
  let el='';
+ (opts.guides||[]).forEach(g=>{const y=yc(g.v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${g.color||'#46506e'}" stroke-dasharray="4 3"/><text x="${W-mR+4}" y="${y+4}" fill="${g.color||'#8a97b0'}" font-size="10">${g.label!=null?g.label:g.v}</text>`;});
  for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1c2336"/>`;
    el+=`<text x="${mL-8}" y="${y+4}" fill="#8a97b0" font-size="11" text-anchor="end">${opts.fmt(v)}</text>`;}
@@ -579,7 +658,89 @@ function renderOverview(){
    ${svgLines(ser,[{key:'value',color:'#34d399'}],{area:true,fmt:v=>'$'+(v/1000).toFixed(0)+'k'})}</div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
    <div class="legend"><span><i style="background:#a78bfa"></i>我的组合</span><span><i style="background:#60a5fa"></i>S&P 500</span><span><i style="background:#fbbf24"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#a78bfa'},{key:'sp500',color:'#60a5fa',dash:1},{key:'nasdaq',color:'#fbbf24',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>`;
+   ${svgLines(ser,[{key:'ret',color:'#a78bfa'},{key:'sp500',color:'#60a5fa',dash:1},{key:'nasdaq',color:'#fbbf24',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>`
+ +fibRanking();
+}
+function fibRanking(){
+ const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
+ if(!held.length)return'';
+ const rows=held.map(x=>{const m=x.fib.now.mom,c=momColor(m),w=Math.abs(m)/100*50,left=m>=0?50:50-w;
+   return `<div class="frow" style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <span class="fsym"><span style="color:${FIBCOL[x.fib.now.state]}">●</span> ${x.sym}</span>
+     <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${c}"></div></div>
+     <span class="fval" style="color:${c}">${m>0?'+':''}${m}</span>
+     <span class="fst">${x.fib.now.label}</span></div>`;}).join('');
+ return `<div class="card"><div class="dh"><span class="t" style="font-size:18px">🌀 斐波那契动能排行</span><span class="nm">持仓按 EMA5/8/13/21 动能强弱排序（点击查看个股）</span></div>
+   <div style="margin-top:6px">${rows}</div>
+   <div class="note" style="margin-top:10px">动能 = EMA5 相对 EMA21 偏离度（±100 封顶），正=多头、负=空头；颜色点为斐波那契状态。技术参考，非投资建议。</div></div>`;
+}
+const FIBCOL={up:'#34d399',down:'#f87171',range:'#6b7280',mixed:'#fbbf24'};
+const FIBLBL={up:'多头趋势',down:'空头趋势',range:'盘整纠缠',mixed:'转换中'};
+function momColor(m){return m>15?'#34d399':(m<-15?'#f87171':'#fbbf24');}
+function fibChart(s){
+ const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';
+ const W=900,H=400,mL=58,mR=80,mT=16,mB=46,stripH=12,stripY=H-mB+24;
+ const xmin=+new Date(prices[0][0]),xmax=+new Date(D1);
+ let ys=[];prices.forEach((p,i)=>{ys.push(p[1],f.e5[i],f.e21[i]);});
+ let ymin=Math.min(...ys),ymax=Math.max(...ys);const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
+ const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
+ const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB-stripH);
+ let el='';
+ for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
+   el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1c2336"/><text x="${mL-8}" y="${y+4}" fill="#8a97b0" font-size="11" text-anchor="end">$${v.toFixed(0)}</text>`;}
+ for(let i=0;i<=5;i++){const t=xmin+(xmax-xmin)*i/5,x=xs(new Date(t)),dt=new Date(t);
+   el+=`<text x="${x}" y="${stripY+stripH+12}" fill="#8a97b0" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
+ // ribbon band fill (e5..e21) colored by per-day state
+ for(let i=1;i<prices.length;i++){const x0=xs(prices[i-1][0]),x1=xs(prices[i][0]);
+   const c=FIBCOL[f.state[i]]||'#6b7280';
+   el+=`<polygon points="${x0},${yc(f.e5[i-1])} ${x1},${yc(f.e5[i])} ${x1},${yc(f.e21[i])} ${x0},${yc(f.e21[i-1])}" fill="${c}" fill-opacity="0.13" stroke="none"/>`;}
+ // price (faint) + 4 EMAs (fast green -> slow orange)
+ const line=(arr,col,w,key)=>{const pts=arr.map((v,i)=>`${xs(prices[i][0]).toFixed(1)},${yc(key?v[key]:v).toFixed(1)}`).join(' ');return `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="${w}"/>`;};
+ el+=line(prices,'#5b6b8c',1,1);
+ el+=line(f.e21,'#fb923c',1.4)+line(f.e13,'#eab308',1.4)+line(f.e8,'#84cc16',1.5)+line(f.e5,'#22c55e',1.8);
+ // golden/death cross markers
+ (f.signals||[]).forEach(g=>{const x=xs(g.date),y=yc(g.price);
+   if(g.type==='golden')el+=`<path d="M ${x} ${y-13} l 5 9 l -10 0 z" fill="#34d399" stroke="#0b0f1a" stroke-width="0.5"/>`;
+   else el+=`<path d="M ${x} ${y+13} l 5 -9 l -10 0 z" fill="#f87171" stroke="#0b0f1a" stroke-width="0.5"/>`;});
+ // current price label
+ const cp=prices[prices.length-1][1];el+=`<text x="${W-mR+4}" y="${yc(cp)+4}" fill="#5b6b8c" font-size="11">现价</text>`;
+ // state strip
+ for(let i=1;i<prices.length;i++){const x0=xs(prices[i-1][0]),x1=xs(prices[i][0]);
+   el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${FIBCOL[f.state[i]]}" fill-opacity="0.85"/>`;}
+ el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#8a97b0" font-size="10" text-anchor="end">状态</text>`;
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+}
+function renderFib(s){
+ const f=s.fib;if(!f)return'';
+ const n=f.now,sc=momColor(n.mom);
+ const rsiCol=n.rsi>70?'#f87171':(n.rsi<30?'#34d399':'#e6ecf5');
+ const lastSig=(f.signals||[]).slice(-1)[0];
+ const ser=s.prices.map((p,i)=>({date:p[0],mom:f.mom[i],rsi:f.rsi[i]}));
+ const badges=[
+  ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
+  ['动能强弱',`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
+  ['RSI(14)',`<span style="color:${rsiCol}">${n.rsi}</span>`],
+  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
+ ];
+ return `<div class="card">
+   <div class="dh"><span class="t" style="font-size:18px">🌀 斐波那契动能分析</span><span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
+   <div class="legend">
+     <span><i style="background:#22c55e"></i>EMA5</span><span><i style="background:#84cc16"></i>EMA8</span>
+     <span><i style="background:#eab308"></i>EMA13</span><span><i style="background:#fb923c"></i>EMA21</span>
+     <span><i style="background:#34d399"></i>金叉</span><span><i style="background:#f87171"></i>死叉</span>
+     <span>底部状态带：<span style="color:#34d399">绿=多头</span> / <span style="color:#f87171">红=空头</span> / <span style="color:#fbbf24">黄=转换</span> / <span style="color:#9ca3af">灰=盘整</span></span>
+   </div>
+   ${fibChart(s)}
+   <div style="font-weight:650;margin:12px 0 2px">动能振荡器（−100 ~ +100）</div>
+   ${svgLines(ser,[{key:'mom',color:'#a78bfa'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),
+     guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}]})}
+   <div style="font-weight:650;margin:12px 0 2px">RSI(14)</div>
+   ${svgLines(ser,[{key:'rsi',color:'#22d3ee'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
+     guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}]})}
+   <div class="note" style="margin-top:10px"><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
+   <b>诚实说明：</b>“斐波那契周期更神奇”在学术上并无强证据——5/8/13/21 相比其它周期没有统计显著的超额收益。它真正有用的地方是<b>周期按几何级数(≈1.6 倍)递增</b>，天然形成快/中/慢分层，便于判断趋势结构；这来自间距而非数字的“神秘性”。本面板为技术分析参考，<b>非投资建议</b>。</div>
+ </div>`;
 }
 function renderDetail(){
  if(sel==='__OV__'){renderOverview();return;}
@@ -602,7 +763,7 @@ function renderDetail(){
    <div class="chartbox">${chart(s)}</div></div>
  <div class="card"><div style="font-weight:650;margin-bottom:6px">交易明细（${s.numTrades} 笔）</div>
    <div class="scroll"><table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>数量</th><th>成交价</th><th>金额</th><th>持仓后</th><th>均价后</th><th>已实现</th></tr></thead>
-   <tbody>${rows}</tbody></table></div></div>`;
+   <tbody>${rows}</tbody></table></div></div>`+renderFib(s);
  bindMarkers();
 }
 function bindMarkers(){
