@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 # raw broker exports (personal, replaced often) — keep them out of the repo
 *.csv
+# reference books / PDFs (personal, often copyrighted) — keep them out of the repo
+*.pdf

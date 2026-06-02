@@ -18,20 +18,31 @@ No server, no internet needed to view — it's one self-contained `.html` file.
 # 2. (first time) install the one dependency:
 pip install yfinance
 
-# 3. generate:
-python3 generate.py
+# 3. sync (regenerate + self-verify against the broker CSV + log the snapshot):
+python3 sync.py
 
 # 4. open it:
-open output/portfolio_dashboard.html      # macOS
+open output/portfolio_dashboard.html      # macOS  (or: python3 sync.py --open)
 ```
 
-That's it. Re-run `python3 generate.py` any time you export fresh CSVs — it
-auto-detects the newest files and rebuilds everything.
+That's it. Re-run `python3 sync.py` any time you export fresh CSVs — it
+auto-detects the newest portfolio, **merges every** history export, rebuilds
+everything, then **verifies** the numbers against the broker CSV and appends a
+snapshot to `output/sync_log.json`. (`python3 generate.py` is the underlying
+generator if you ever want it without the verify/log wrapper.)
 
 ## Usage
 
 ```
-python3 generate.py [options]
+python3 sync.py [options]          # recommended: generate + verify + log
+
+  --input-dir DIR     where to auto-detect CSVs (default: ~/Downloads)
+  --portfolio PATH    explicit Portfolio Positions CSV (default: newest)
+  --no-fetch          reuse cached prices, no network (offline)
+  --open              open the dashboard when done
+  ...any other flag is passed straight through to generate.py
+
+python3 generate.py [options]      # the underlying generator
 
   --portfolio PATH    Portfolio Positions CSV (default: newest in --input-dir)
   --history PATH      Account History CSV       (default: newest in --input-dir)
@@ -74,12 +85,15 @@ gotchas (start there if extending or debugging).
 
 ```
 portfolio-tracker/
+├── sync.py         # one-command sync: regenerate + verify vs broker CSV + log
 ├── generate.py     # the whole pipeline (parse → fetch prices → build HTML)
 ├── README.md       # this file
 ├── SKILLS.md       # methodology + maintenance notes
+├── .claude/skills/portfolio-sync/   # Claude Code skill for the sync workflow
 └── output/
     ├── portfolio_dashboard.html   # the generated dashboard
-    └── prices_cache.json          # cached Yahoo prices (for --no-fetch)
+    ├── prices_cache.json          # cached Yahoo prices (for --no-fetch)
+    └── sync_log.json              # one row per sync (value, P&L, return, …)
 ```
 
 ## Requirements

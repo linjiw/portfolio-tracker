@@ -11,15 +11,51 @@ that visualizes **every buy/sell of every stock on a price timeline**, plus
 realized & unrealized P&L. Pure HTML + SVG + vanilla JS — no server, no build
 step, no external libraries at view time. Just open the `.html` file.
 
+## 🔄 Syncing new exports (the recurring update workflow)
+
+The user periodically drops fresh Fidelity exports in `~/Downloads`
+(`Portfolio_Positions_*.csv` + `Accounts_History*.csv`) and asks Claude to read
+them and update the tracker. **That whole job is one command:**
+
+```bash
+python3 sync.py            # regenerate + verify + log (fetches prices)
+python3 sync.py --no-fetch # offline: reuse cached prices
+python3 sync.py --open     # also open the dashboard when done
+```
+
+`sync.py` wraps `generate.py` (still the single source of truth) and adds two
+things `generate.py` alone can't:
+
+1. **A verification gate.** After regenerating, it re-derives held-equity market
+   value / unrealized P&L / held count *independently* from the newest Portfolio
+   CSV and asserts the written dashboard agrees to the cent. If a holding — or a
+   whole account — is silently dropped, the sync **fails loudly** instead of
+   shipping a wrong dashboard. (This is exactly the class of bug that hid the
+   Rollover IRA; see the multi-account note below.)
+2. **A sync log.** Appends a snapshot (value, P&L, TWR, deposits) to
+   `output/sync_log.json` and prints the delta vs the previous sync.
+
+There is also a Claude Code skill at `.claude/skills/portfolio-sync/SKILL.md` so
+a future Claude session auto-recognizes "sync / update my portfolio" requests.
+Everything below is the methodology `generate.py` implements.
+
 ## Inputs (the two CSVs)
 
 1. **Portfolio Positions CSV** — `Portfolio_Positions_*.csv`
    - Current holdings snapshot. Columns used: `Symbol`(2), `Quantity`(4),
      `Last Price`(5), `Current Value`(7), `Total Gain/Loss Dollar`(10),
      `Cost Basis Total`(13).
-   - Rows to skip: `SPAXX**` (money market), `Pending activity`, blank symbols,
-     and option rows (symbol starts with `-`).
-   - A symbol can appear in **multiple lots** (Cash + Margin) — sum them.
+   - Rows to skip: **any money-market core position** (symbol ends in `**`, e.g.
+     `SPAXX**`, `FDRXX**` — these are cash, counted separately), `Pending
+     activity`, blank symbols, and option rows (symbol starts with `-`).
+   - A symbol can appear in **multiple lots** (Cash + Margin) **and across
+     multiple accounts** — sum them all. The export spans several accounts:
+     brokerage ids start with `Z` (Z20695967, Z33862818, …) **and** a Rollover
+     IRA has a *numeric* id (`257937289`). `parse_portfolio` matches account rows
+     by an alphanumeric id in col 0 (`^[A-Z0-9]{5,}$`) — **never** a `Z`-only
+     prefix, which silently dropped the entire IRA (and the `**` skip must cover
+     `FDRXX**`, not just `SPAXX**`). The `sync.py` gate guards against regressing
+     either of these.
    - This file is the **source of truth for current holdings, average cost,
      and unrealized P&L** (broker-accurate).
 
@@ -133,16 +169,18 @@ Average-cost engine per stock (chronological):
 ## How to regenerate when CSVs change
 
 ```bash
-# drop the new exports in ~/Downloads, then:
+# drop the new exports in ~/Downloads, then (preferred — regenerate+verify+log):
+python3 sync.py
+# raw generator (no verification gate / no log):
 python3 generate.py
 # or be explicit:
 python3 generate.py --portfolio /path/Portfolio_Positions_X.csv --history /path/History_X.csv
 # offline (reuse cached prices):
-python3 generate.py --no-fetch
+python3 sync.py --no-fetch          # or: python3 generate.py --no-fetch
 ```
-Auto-detect picks the **newest** file matching `Portfolio_Positions*.csv` and
-`History_for_Account*.csv` in `--input-dir` (default `~/Downloads`).
-Output → `output/portfolio_dashboard.html`.
+Auto-detect picks the **newest** `Portfolio_Positions*.csv` and **merges every**
+`Accounts_History*.csv` + `History_for_Account*.csv` in `--input-dir` (default
+`~/Downloads`). Output → `output/portfolio_dashboard.html`.
 
 ## Validation checklist after a rebuild
 
@@ -178,8 +216,14 @@ The "📊 组合总览" view (`payload["series"]`, built in `build_payload`):
 - Generic `svgLines(ser, defs, opts)` JS renders both charts (area for $,
   multi-line + zero baseline for %).
 
-Sanity numbers from the May-2026 dataset: net worth $80.9k→$109.4k, portfolio
-TWR +23.4% vs S&P +19.2% (alpha +4.1%) vs NASDAQ +29.4%.
+Sanity numbers (latest sync, **Jun-01-2026** snapshot, window 2026-01-06→05-29,
+all 4 accounts): market value **$113.8k**, unrealized **+$19.2k**, net-worth
+curve $62.3k→$111.2k, portfolio TWR **+10.9%** vs S&P +9.1% (alpha +1.7%) vs
+NASDAQ +14.5%. (The net-worth curve is equity-only and ends at the last *trade*
+date 05-29, so it sits ~$2.6k below the 06-01 broker market value — the one
+trading-day price move, not a bug.) The earlier single-account May snapshot read
+differently because it anchored holdings to just `Z20695967`; syncing all
+accounts is the correct, consistent picture.
 
 ## Fibonacci momentum analytics (IMPLEMENTED)
 
