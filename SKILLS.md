@@ -442,11 +442,51 @@ itself the intervention (p.1595), so it's the default-first frame.
   holding NVDA is only 1 (RSI neutral) — a cross-family pattern invisible in any
   single tab. Each row deep-links to the per-stock detail. 非投资建议.
 
+## Whole-account view (IMPLEMENTED)
+
+Top of the **净值 · 全账户** tab: folds the cash + option mark-to-market the
+dashboard used to ignore into a true account picture, and makes the hidden
+derivative leverage salient. Book grounding (agent-team design): which slice you
+DISPLAY is itself a Supposedly-Irrelevant-Factor (salience, p.1595); money is
+fungible so net worth must sum all buckets (law of one price, p.1588); state the
+unit of account explicitly (footnote 9, p.1592); a small NET option mark must not
+mask large GROSS exposure (dominated-pair framing, p.1582).
+
+- **`parse_account_extras(path)`** — a SEPARATE additive parser (never touch
+  `parse_portfolio`, which `sync.py` verifies to the cent). Reads exactly the rows
+  the equity parser skips: cash (`**`), option legs (`-`, with col-7 Current Value
+  = the MARK), and `Pending activity`. Sign/side from the MARK, NOT the `-` prefix
+  (every option symbol starts `-`; a long call is `-...C175` too). `len(r) < 8`
+  guard (the pending row is 14 cols). Captures the CSV "Date downloaded" line as
+  `asOf` (dynamic — no hardcoded date).
+- **Whole-account net worth = equity + cash + Σ(option mark) + pending**, all
+  broker-exact. On Jun-01: **$115,444.85** = 113,790.76 + 1,333.09 + 269.00 +
+  52.00. New `summary` keys only (`accountNetWorth/cashTotal/optMarkNet/
+  optMarkGross/optPctEquity/pendingTotal`) + `payload.account`.
+- **CRITICAL naming**: `optMarkNet` (current MTM, +269) is a DIFFERENT number from
+  the pre-existing `summary.optNet` (history cash-flow, −912.53) and
+  `payload.options` (16 history legs) — never reuse those for MTM (a real
+  collision bug). Verified both stay untouched.
+- **`wholeAccountCard()`**: hero tiles + a dollars-first composition bar + the
+  exact identity line + a per-account cash sub-table.
+- **`optionsExposureCard()`** (the salience deliverable): GROSS option market
+  value **$53,749 ≈ 47% of equity** shown LARGE; the tiny net +269 demoted; the 4
+  legs on a shared zero line (short −$22,950 bar visibly long). The TER Jan-2028
+  calendar + QQQ Jun-2026 vertical.
+- **Honesty (load-bearing)**: it's MARK, not delta/notional/Greeks; the margin
+  DEBIT balance is NOT in the export (only positive money-market cash), so the
+  total may overstate free cash; true leverage is larger and not computable here.
+  Never print a leverage ratio/delta/notional. Risk lens & rebalancer stay
+  EQUITY-ONLY (option Greeks/margin unavailable) — their old "低估你的真实杠杆"
+  notes now DEEP-LINK to this view instead of just apologizing.
+- Validate: `parse_account_extras` unit asserts (cash 1333.09 / optMarkNet 269 /
+  optMarkGross 53749 / pending 52 / 4 legs); the **sync.py equity gate must still
+  match** (additive keys are inert); anti-collision assert (`optNet` still
+  −912.53); `node --check`; mocked-DOM smoke incl. the `DATA.account==null`
+  empty-string path.
+
 ## Extension ideas (not yet built)
 
-- Include cash & option mark-to-market in net worth (needs reliable cash-balance
-  history + option price history — both currently messy); would also upgrade the
-  risk lens from equity-only to whole-account/leverage risk.
 - Export per-stock chart to PNG, or full data to Excel.
 - Sector grouping / allocation treemap (needs sector metadata — not fetched yet).
 - True realized P&L if a full-history export (from inception) becomes available

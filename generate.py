@@ -140,6 +140,44 @@ def parse_portfolio(path):
         d["gainpct"] = d["gain"] / d["cost"] * 100 if d["cost"] else 0
     return cur
 
+def parse_account_extras(path):
+    """Additive companion to parse_portfolio: returns exactly the rows the equity
+    parser SKIPS — cash core ('**'), option legs ('-'), and 'Pending activity' —
+    so whole-account net worth can be summed WITHOUT touching the broker-verified
+    equity path that sync.py asserts to the cent. Every value is broker Current
+    Value (col 7): a MARK, not delta/notional/Greeks. The margin DEBIT balance is
+    NOT in this export (only positive money-market cash appears)."""
+    cash, opt_legs = [], []
+    cash_total = pending = opt_net = opt_gross = 0.0
+    as_of = ""
+    with open(path) as f:
+        for r in csv.reader(f):
+            if r and r[0].strip().startswith("Date downloaded"):
+                as_of = r[0].strip()[len("Date downloaded"):].strip()
+            # len<8 (NOT <14): the 'Pending activity' row is 14 cols; data rows 17.
+            # Current Value is col 7, so 8 cols is the true minimum. Header,
+            # disclaimer paragraphs and blank lines contain spaces -> fail regex.
+            if len(r) < 8 or not re.match(r"^[A-Z0-9]{5,}$", r[0].strip()):
+                continue
+            acct, sym, val = r[0].strip(), r[2].strip(), fnum(r[7])
+            if sym.endswith("**"):
+                cash_total += val
+                cash.append({"acct": acct, "sym": sym, "value": round(val, 2)})
+            elif sym.startswith("-"):
+                # side = sign of the MARK (col 7), NOT the '-' symbol prefix (which
+                # is on ALL option rows). A long call also starts with '-'.
+                opt_net += val; opt_gross += abs(val)
+                opt_legs.append({"acct": acct, "sym": sym, "name": r[3].strip(),
+                                 "qty": fnum(r[4]), "mark": round(val, 2),
+                                 "side": "short" if val < 0 else "long",
+                                 "type": (r[15].strip() if len(r) > 15 else "")})
+            elif sym == "Pending activity":
+                pending += val
+    return {"cash": cash, "cashTotal": round(cash_total, 2),
+            "pending": round(pending, 2), "optLegs": opt_legs,
+            "optMarkNet": round(opt_net, 2), "optMarkGross": round(opt_gross, 2),
+            "asOf": as_of}
+
 # ---------------------------------------------------------------- merge
 def merge_histories(parsed):
     """Merge trades across overlapping exports. Each real transaction appears
@@ -672,7 +710,7 @@ def compute_risk(series, stocks):
             "basisNote": "equity-only TWR basis; excludes cash/margin/options"}
 
 # ---------------------------------------------------------------- engine
-def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
+def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0, account=None):
     tot_buy, tot_sell = totals
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
@@ -811,6 +849,25 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
                "netWorthStart": series[0]["value"] if series else 0}
 
+    # ---- whole-account: fold cash + option mark-to-market into net worth ----
+    # Strictly additive: NEW summary keys only. The 股票 bucket = held_val (the
+    # same value feeding marketValue), so it stays broker-verified to the cent.
+    acct_block = None
+    if account:
+        eq = round(held_val, 2)
+        whole = round(eq + account["cashTotal"] + account["optMarkNet"] + account["pending"], 2)
+        acct_block = {**account, "equity": eq, "netWorthWhole": whole,
+                      "optPctEquity": (round(account["optMarkGross"] / held_val * 100, 2) if held_val else None),
+                      "asOf": account.get("asOf") or "券商最新快照"}
+        summary["accountNetWorth"] = whole
+        summary["cashTotal"] = account["cashTotal"]
+        summary["pendingTotal"] = account["pending"]
+        summary["optMarkNet"] = account["optMarkNet"]      # MTM net — distinct from summary.optNet (history cash-flow)
+        summary["optMarkGross"] = account["optMarkGross"]
+        summary["optPctEquity"] = acct_block["optPctEquity"]
+        summary["marginDebitKnown"] = False
+        assert abs(whole - (eq + summary["cashTotal"] + summary["optMarkNet"] + summary["pendingTotal"])) < 0.005
+
     # ---- money-weighted return (equity-book XIRR) + plain-dollar bridge ----
     # Honest metric: equity-book IRR (cash & margin balances over time aren't
     # tracked, so an account-level IRR would be a fudge factor). Flows = −V0 at
@@ -862,7 +919,8 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
     risk = compute_risk(series, stocks)
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
-            "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk, "bridge": bridge}
+            "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk,
+            "bridge": bridge, "account": acct_block}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1537,6 +1595,40 @@ function scorecardCard(){
    <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
    <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></div></div>`;
 }
+function wholeAccountCard(){
+ const A=DATA.account;if(!A)return'';
+ const tiles=[['全账户净值',fmt(A.netWorthWhole)],['股票',fmt(A.equity)],['现金',fmt(A.cashTotal)],
+   ['期权净·市价',`<span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span>`],['待结算',fmt(A.pending)]];
+ const W=A.netWorthWhole||1,seg=(amt,c)=>amt>0?`<div style="width:${amt/W*100}%;background:${c}"></div>`:'';
+ const bar=`<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin:10px 0 6px">${seg(A.equity,'#E8B339')}${seg(A.cashTotal,'#4FB286')}${seg(Math.max(0,A.optMarkNet),'#7F8794')}${seg(A.pending,'#555A63')}</div>`;
+ const cashRows=A.cash.map(c=>`<tr><td class="l">${c.acct}</td><td class="l">${c.sym}</td><td style="text-align:right">${fmt(c.value)}</td></tr>`).join('');
+ return `<div class="card">
+   <div class="dh"><span class="t">全账户净值</span><span class="nm">截至 ${A.asOf} · 股票＋现金＋期权按市价＋待结算（券商精确美元口径，非敞口/杠杆口径）</span></div>
+   <div class="badges">${tiles.map(t=>`<div class="badge"><div class="l">${t[0]}</div><div class="v">${t[1]}</div></div>`).join('')}</div>
+   ${bar}
+   <div class="legend"><span><i style="background:#E8B339"></i>股票</span><span><i style="background:#4FB286"></i>现金</span><span><i style="background:#7F8794"></i>期权净</span><span><i style="background:#555A63"></i>待结算</span></div>
+   <div class="note" style="line-height:1.6;margin-top:6px">恒等式：股票 ${fmt(A.equity)} ＋ 现金 ${fmt(A.cashTotal)} ＋ 期权净市价 ${fmt(A.optMarkNet)} ＋ 待结算 ${fmt(A.pending)} ＝ 全账户净值 ${fmt(A.netWorthWhole)}（四项皆券商当前价值，逐项相加，精确）。这是“净值”口径，不是“敞口/杠杆”口径——后者本导出无法计算（见下方期权敞口卡片）。</div>
+   <div class="scroll" style="margin-top:8px"><table><thead><tr><th class="l">账户</th><th class="l">货币基金</th><th style="text-align:right">当前价值</th></tr></thead><tbody>${cashRows}<tr style="border-top:1px solid #1A1C21"><td class="l"><b>合计</b></td><td></td><td style="text-align:right"><b>${fmt(A.cashTotal)}</b></td></tr></tbody></table></div>
+   <div class="note" style="margin-top:6px">现金仅含 Fidelity 货币基金核心(正)余额；<b>保证金借记(margin debit)余额不在本导出中</b>——若存在借记，本净值可能高估你的可动用现金。<b>非投资建议。</b></div>
+ </div>`;}
+function optionsExposureCard(){
+ const A=DATA.account;if(!A||!A.optLegs.length)return'';
+ const legs=A.optLegs.slice().sort((a,b)=>Math.abs(b.mark)-Math.abs(a.mark));
+ const maxAbs=Math.max(1,...legs.map(l=>Math.abs(l.mark)));
+ const dol=(v,c)=>`<span style="display:inline-block;width:92px;text-align:right;color:${c};font-variant-numeric:tabular-nums">${fmt(v)}</span>`;
+ const leg=l=>{const c=l.mark<0?'#E5707A':'#4FB286',wd=Math.abs(l.mark)/maxAbs*50,left=l.mark>=0?50:50-wd;
+   return `<div class="frow"><span class="fsym" style="width:auto;min-width:150px"><span class="chip" style="color:${c};border-color:${c}55">${l.side==='short'?'空头':'多头'}</span> ${l.sym.trim()}</span>
+     <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>${dol(l.mark,c)}</div>`;};
+ const legsHtml=legs.map(leg).join('')+`<div class="frow" style="border-top:1px solid #1A1C21;margin-top:4px;padding-top:6px"><span class="fsym" style="width:auto;min-width:150px"><b>净市价小计</b></span><div class="fbar"></div>${dol(A.optMarkNet,A.optMarkNet<0?'#E5707A':'#4FB286')}</div>`;
+ const tbl=`<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th class="l">数量</th><th style="text-align:right">当前市价</th><th class="l">账户</th></tr></thead><tbody>${legs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name}</td><td class="l">${fmtN(l.qty,0)}</td><td style="text-align:right" class="${cls(l.mark)}">${fmt(l.mark)}</td><td class="l">${l.type||'—'}</td></tr>`).join('')}</tbody></table></div>`;
+ return `<div class="card" style="border-left:3px solid #E8B339">
+   <div class="dh"><span class="t">期权敞口（隐藏杠杆）</span><span class="chip" style="color:#E8B339;border-color:#E8B33966">留意</span></div>
+   <div style="font-size:23px;font-weight:650;margin:6px 0 2px">期权总市值 GROSS ${fmt(A.optMarkGross)} <span style="font-size:13px;color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
+   <div class="note" style="margin-bottom:8px">净市价仅 <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> —— 这是<b>盈亏口径</b>，不是你的敞口（小净值会掩盖大总额，Thaler p.1582）。</div>
+   ${legsHtml}${tbl}
+   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。四条期权腿均在<b>保证金(Margin)账户</b>。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:6px;opacity:.65">Thaler 2016 · p.1582 / p.1589 / p.1594</div>
+ </div>`;}
 function bridgeCard(){
  const B=DATA.bridge;if(!B||B.terminal==null)return'';
  const g=S.behaviorGap;
@@ -1588,11 +1680,11 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
+ <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值 · 全账户</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
- <div class="seg" data-seg="nw" hidden>
+ <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
  <div class="card">
-   <div class="dh"><span class="t">组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
+   <div class="dh"><span class="t">组合总览</span><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部“全账户”卡片）</span></div>
    <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
  </div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
@@ -1742,7 +1834,7 @@ function riskCard(){
  <div class="card"><div class="dh"><span class="t">风险贡献分解</span><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th></tr></thead>
    <tbody>${rows}</tbody></table></div>${exNote}
-   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。<b>非投资建议。</b></div></div>`;
+   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
 }
 /* ===== Rebalancing Planner (Thaler commitment device) ===== */
 let rebalDraft=null;
@@ -1768,7 +1860,7 @@ function rebalTargets(rule,uni,volMap){const ws=uni.u.map(x=>x.w),N=ws.length;
   return{t:raw.map(r=>r/sm*100),note:'目标 ∝ 1/波动率：高波动标的权重更低，使各仓位风险贡献趋于均衡',disabled:false};}
  const c=capTargets(ws,rule.cap);return{t:c.t,note:c.fallback?('上限 '+rule.cap+'% 对 '+N+' 只标的不可行，已退回等权'):null,disabled:false};}
 function rebalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">诚实说明与边界（点击展开）</summary>
- <div class="note" style="margin-top:8px;line-height:1.65">本计划只是把权重拉回<b>你自己设定的区间</b>的描述性算术，仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆）。它<b>忽略</b>税费、洗售(wash-sale)、成本批次(lot)选择与交易/佣金/点差成本——交易成本若不实测，就是“万能借口”(Thaler)。反波动率目标基于“风险”页同一份<b>小样本、描述性（非预测）</b>协方差。股数四舍五入到整股。规则只存在<b>本浏览器本设备</b>，不跨设备。本计划<b>不声称提高收益</b>，只把权重拉回你选的区间。<b>非投资建议。</b></div></details></div>`;}
+ <div class="note" style="margin-top:8px;line-height:1.65">本计划只是把权重拉回<b>你自己设定的区间</b>的描述性算术，仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆${DATA.account?`，<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}）。它<b>忽略</b>税费、洗售(wash-sale)、成本批次(lot)选择与交易/佣金/点差成本——交易成本若不实测，就是“万能借口”(Thaler)。反波动率目标基于“风险”页同一份<b>小样本、描述性（非预测）</b>协方差。股数四舍五入到整股。规则只存在<b>本浏览器本设备</b>，不跨设备。本计划<b>不声称提高收益</b>，只把权重拉回你选的区间。<b>非投资建议。</b></div></details></div>`;}
 function rebalancePlanner(){
  if(rebalDraft===null)rebalDraft=rebalLoad();
  const rule=rebalDraft,uni=rebalUniverse(),volMap=rebalVolMap();
@@ -2033,6 +2125,7 @@ def main():
     print(f"· deposits {dmin[:7]}→{dmax[:7]}: ${deposits:,.0f}  ·  lifetime deposits ${life_dep:,.0f}  ·  dividends ${dividends:,.2f}")
 
     cur = parse_portfolio(portfolio)
+    acct_extras = parse_account_extras(portfolio)
     tickers = sorted(set(list(txns) + list(cur)))
 
     # fetch window: a few days before first trade through day after last
@@ -2041,7 +2134,7 @@ def main():
     BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
     prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
 
-    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep)
+    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep, acct_extras)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]
