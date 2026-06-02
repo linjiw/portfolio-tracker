@@ -113,14 +113,23 @@ def parse_history(path):
             "cash_rows": cash_rows, "path": path}
 
 def parse_portfolio(path):
-    """Return dict: sym -> {shares, price, value, gain, cost, avg, gainpct}."""
+    """Return dict: sym -> {shares, price, value, gain, cost, avg, gainpct}.
+
+    Sums every lot of a symbol across ALL accounts in the export — brokerage
+    (Z...) *and* retirement (numeric, e.g. a Rollover IRA "257937289"). Match
+    account rows by an alphanumeric account id in col 0 (the header "Account
+    Number" and the trailing disclaimer paragraphs both contain spaces, so they
+    fail the regex). Skip money-market core positions (Fidelity flags these with
+    a "**" suffix: SPAXX**, FDRXX** — they're cash, counted separately), the
+    "Pending activity" line, blank symbols, and option rows (symbol starts "-").
+    """
     cur = {}
     with open(path) as f:
         for r in csv.reader(f):
-            if len(r) < 14 or r[0] == "Account Number" or not r[0].startswith("Z"):
+            if len(r) < 14 or not re.match(r"^[A-Z0-9]{5,}$", r[0].strip()):
                 continue
             sym = r[2].strip()
-            if sym in ("SPAXX**", "Pending activity", "") or sym.startswith("-"):
+            if sym.endswith("**") or sym in ("Pending activity", "") or sym.startswith("-"):
                 continue
             shares, price, val = fnum(r[4]), fnum(r[5]), fnum(r[7])
             gain, cost = fnum(r[10]), fnum(r[13])
