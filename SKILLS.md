@@ -329,11 +329,47 @@ Validate: `compute_risk` sanity gates — `Σ riskPct ≈ 100`, `maxDrawdown ≤
 currentUnderwater ≤ 0`; then the standard `node --check` + mocked-DOM smoke test
 (`riskCard()`, `renderOverview()`).
 
+## Rebalancing planner (IMPLEMENTED)
+
+Overview "再平衡计划" tab — a Thaler **commitment device** that turns the
+concentration finding into a pre-committed, defaulted plan with a drift-band
+nudge. Grounded in the book (designed by an agent-team workflow that read it):
+- **Default does the work** (auto-enrollment, p.1595): opens with a fully-applied
+  default policy — single-name **CAP 20%** with pro-rata redistribution — so the
+  user *accepts/tweaks* a plan, never builds one from a blank form.
+- **Planner vs doer + commitment** (p.1585-86): the rule (policy, cap, band,
+  glide) is persisted to `localStorage` (`ptrak.rebal.v1`) with a "规则设定于
+  <date>" stamp — set when calm, the page holds you to it across reloads.
+- **Band = no-action zone** (status-quo bias as ally, p.1595-96): default ±5pp;
+  in-band names show a loud green "无需操作" — rewarding the high-turnover user
+  for *inaction*. Only out-of-band names get an action row (the SMarT-style
+  future trigger).
+- **Policies** (computed CLIENT-SIDE in JS — single source of truth, recompute on
+  every control change): `cap` (iterative cap+redistribute), `equal` (1/N),
+  `invvol` (∝1/annVol risk-parity — **disabled, not silently equal-weighted, when
+  any held name lacks vol**; needs the one Python addition `contrib[].annVol`).
+- **Action math**: glide to band edge (default, gentler) or to target center;
+  Δ$=(target−cur)/100·MV, shares=round(Δ$/price). NOT generally cash-neutral with
+  one-sided glides → shows 卖出/买入/净 honestly, not a fake "/2".
+- **Reference-point discipline** (p.1582,1592): the view suppresses P&L / cost /
+  avg entirely; bars colored by drift *direction*, never by profit — so the only
+  on-screen anchor is the target band (defeats the disposition reflex).
+- **Honesty**: equity-only (understates leverage), ignores tax/wash-sale/lot/
+  commissions ("transaction costs = the all-purpose fudge factor", p.1593),
+  whole-share rounding, single-browser. Prominent 非投资建议.
+
+Python footprint is ONE field (`annVol` on each `risk.contrib` row, from the
+covariance diagonal). All target/band/action math is JS. `wireRebal()` binds the
+controls and re-renders only the `rebal` seg (never `renderOverview`, which would
+reset the active tab). Validate: `capTargets` sums to 100 with no name > cap;
+`node --check`; mocked-DOM smoke test (`localStorage` stub) of `rebalancePlanner`,
+`capTargets`, persistence, and reference-point discipline (no P/L strings leak).
+
+Scoped out for now (follow-ups): editable per-name custom targets, relative-band
+mode, glide scheduler/calendar, cross-device sync, print/export.
+
 ## Extension ideas (not yet built)
 
-- **Rebalancing planner / target weight bands** — the natural next step now that
-  risk-weight exists: a Thaler "commitment device" (defaults / Save More
-  Tomorrow) that lets the user pre-set per-name bands and nudges on drift.
 - Money-weighted return (IRR/XIRR) alongside TWR (heavy irregular depositor →
   TWR and lived dollar experience diverge).
 - Include cash & option mark-to-market in net worth (needs reliable cash-balance

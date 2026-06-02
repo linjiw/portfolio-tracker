@@ -587,8 +587,10 @@ def compute_risk(series, stocks):
             tot = sum(mcr) or 1.0
             for a in range(m):
                 rc = mcr[a] / tot * 100
+                avol = (Sigma[a][a] ** 0.5) * rt * 100 if Sigma[a][a] > 0 else 0.0
                 contrib.append({"sym": names[a]["sym"], "weightPct": round(w[a] * 100, 1),
-                                "riskPct": round(rc, 1), "gap": round(rc - w[a] * 100, 1)})
+                                "riskPct": round(rc, 1), "gap": round(rc - w[a] * 100, 1),
+                                "annVol": round(avol, 1)})
             contrib.sort(key=lambda c: -c["riskPct"])
 
     return {"annVol": round(annVol, 1), "spAnnVol": round(spAnnVol, 1),
@@ -1382,7 +1384,7 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button></div>
+ <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
  <div class="seg" data-seg="nw">
  <div class="card">
    <div class="dh"><span class="t">组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
@@ -1400,8 +1402,9 @@ function renderOverview(){
  </div>
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
- <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>`;
- segWire();
+ <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
+ <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
+ segWire();wireRebal();
 }
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
@@ -1536,6 +1539,93 @@ function riskCard(){
    <tbody>${rows}</tbody></table></div>${exNote}
    <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。<b>非投资建议。</b></div></div>`;
 }
+/* ===== Rebalancing Planner (Thaler commitment device) ===== */
+let rebalDraft=null;
+function rebalDefault(){return{policy:'cap',cap:20,band:5,glide:'edge',setOn:null};}
+function rebalLoad(){try{const s=JSON.parse(localStorage.getItem('ptrak.rebal.v1'));if(s&&s.policy)return Object.assign(rebalDefault(),s);}catch(e){}return rebalDefault();}
+function rebalSave(){rebalDraft.setOn=new Date().toISOString().slice(0,10);try{localStorage.setItem('ptrak.rebal.v1',JSON.stringify(rebalDraft));}catch(e){}}
+function rebalClear(){try{localStorage.removeItem('ptrak.rebal.v1');}catch(e){}rebalDraft=rebalDefault();}
+function rebalUniverse(){const MV=S.marketValue||stocks.filter(s=>s.held).reduce((a,s)=>a+s.value,0)||1;
+ return{MV,u:stocks.filter(s=>s.held&&s.value>0).map(s=>({sym:s.sym,value:s.value,price:s.curPrice,w:s.value/MV*100})).sort((a,b)=>b.w-a.w)};}
+function rebalVolMap(){const m={};((DATA.risk&&DATA.risk.contrib)||[]).forEach(c=>{if(c.annVol!=null&&c.annVol>0)m[c.sym]=c.annVol;});return m;}
+function capTargets(ws,C){const N=ws.length;if(!N)return{t:[],fallback:false};if(C*N<100-1e-9)return{t:ws.map(()=>100/N),fallback:true};
+ let t=ws.slice();
+ for(let it=0;it<60;it++){let exc=0;t=t.map(v=>{if(v>C+1e-9){exc+=v-C;return C;}return v;});if(exc<1e-9)break;
+  const base=t.reduce((a,v)=>a+(v<C-1e-9?v:0),0);
+  if(base<=1e-9){const k=t.filter(v=>v<C-1e-9).length||N;t=t.map(v=>v<C-1e-9?v+exc/k:v);break;}
+  t=t.map(v=>v<C-1e-9?v+exc*(v/base):v);}
+ const s=t.reduce((a,b)=>a+b,0)||1;return{t:t.map(v=>v/s*100),fallback:false};}
+function rebalTargets(rule,uni,volMap){const ws=uni.u.map(x=>x.w),N=ws.length;
+ if(rule.policy==='equal')return{t:ws.map(()=>N?100/N:0),note:null,disabled:false};
+ if(rule.policy==='invvol'){const ok=DATA.risk&&uni.u.every(x=>volMap[x.sym]>0);
+  if(!ok)return{t:null,note:'部分持仓缺少波动率数据，反波动目标不可用',disabled:true};
+  const raw=uni.u.map(x=>1/volMap[x.sym]),sm=raw.reduce((a,b)=>a+b,0)||1;
+  return{t:raw.map(r=>r/sm*100),note:'目标 ∝ 1/波动率：高波动标的权重更低，使各仓位风险贡献趋于均衡',disabled:false};}
+ const c=capTargets(ws,rule.cap);return{t:c.t,note:c.fallback?('上限 '+rule.cap+'% 对 '+N+' 只标的不可行，已退回等权'):null,disabled:false};}
+function rebalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">诚实说明与边界（点击展开）</summary>
+ <div class="note" style="margin-top:8px;line-height:1.65">本计划只是把权重拉回<b>你自己设定的区间</b>的描述性算术，仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆）。它<b>忽略</b>税费、洗售(wash-sale)、成本批次(lot)选择与交易/佣金/点差成本——交易成本若不实测，就是“万能借口”(Thaler)。反波动率目标基于“风险”页同一份<b>小样本、描述性（非预测）</b>协方差。股数四舍五入到整股。规则只存在<b>本浏览器本设备</b>，不跨设备。本计划<b>不声称提高收益</b>，只把权重拉回你选的区间。<b>非投资建议。</b></div></details></div>`;}
+function rebalancePlanner(){
+ if(rebalDraft===null)rebalDraft=rebalLoad();
+ const rule=rebalDraft,uni=rebalUniverse(),volMap=rebalVolMap();
+ if(!uni.u.length)return '<div class="card"><div class="dh"><span class="t">再平衡计划</span></div><div class="note">暂无持仓可用于再平衡。</div></div>';
+ const invvolOk=DATA.risk&&uni.u.every(x=>volMap[x.sym]>0);
+ const bt=(active,attrs,lbl,dis)=>`<button ${attrs} ${dis?'disabled':''} style="padding:5px 11px;border-radius:7px;border:1px solid ${active?'#E8B339':'#2A2E36'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':(dis?'#555':'#cfd3da')};cursor:${dis?'not-allowed':'pointer'};font-size:12px;margin-right:6px">${lbl}</button>`;
+ const pol=(k,lbl,dis)=>bt(rule.policy===k,`data-reb="pol" data-v="${k}"`,lbl,dis);
+ const gl=(k,lbl)=>bt(rule.glide===k,`data-reb="glide" data-v="${k}"`,lbl,false);
+ const stamp=rule.setOn?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">规则设定于 ${rule.setOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">建议默认 · 未保存</span>`;
+ const row=(lbl,body)=>`<div style="display:flex;align-items:center;gap:10px;margin:9px 0;flex-wrap:wrap"><span style="color:var(--mut);min-width:78px;font-size:12px">${lbl}</span>${body}</div>`;
+ const controls=`<div class="card">
+   <div class="dh"><span class="t">再平衡计划</span><span class="nm">现在冷静时定下规则，之后由面板替你执行（Thaler 的 planner / doer 两个自我）</span></div>
+   <div class="note" style="margin:2px 0 8px;line-height:1.6">规则存在本浏览器、跨刷新有效，替你扛住情绪上头的那一刻。你是<b>接受/微调默认</b>，而非从零搭建。 ${stamp}</div>
+   ${row('策略',pol('cap','限制集中度')+pol('equal','等权')+pol('invvol','反波动·风险平价',!invvolOk))}
+   ${rule.policy==='cap'?row('单一上限',`<input id="rebCap" type="number" min="5" max="50" step="1" value="${rule.cap}" style="width:60px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:3px 6px"> %`):''}
+   ${row('触发区间 ±',`<input id="rebBand" type="number" min="1" max="20" step="0.5" value="${rule.band}" style="width:60px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:3px 6px"> pp <span class="note">（落在带内就什么都不做）</span>`)}
+   ${row('回归方式',gl('edge','回到区间边缘')+gl('center','回到目标中心'))}
+   <div style="margin-top:6px;display:flex;gap:8px">${bt(true,'id="rebSave"','确认并保存规则',false)}${bt(false,'id="rebClear"','清除规则',false)}</div></div>`;
+ return controls+`<div id="rebalOut">`+rebalOutput(rule,uni,volMap)+`</div>`+rebalHonesty();
+}
+function rebalOutput(rule,uni,volMap){
+ const tt=rebalTargets(rule,uni,volMap);
+ if(tt.disabled||!tt.t)return `<div class="card"><div class="note">${tt.note||'目标不可用'}。请改选其它策略。</div></div>`;
+ const MV=uni.MV,band=rule.band;
+ const rows=uni.u.map((x,i)=>{const t=tt.t[i],lo=Math.max(0,t-band),hi=t+band,inB=x.w>=lo-1e-9&&x.w<=hi+1e-9,drift=x.w-t;
+   let tw=t;if(!inB)tw=rule.glide==='center'?t:(x.w>hi?hi:lo);
+   const d$=(tw-x.w)/100*MV,sh=x.price>0?Math.round(d$/x.price):null;
+   return Object.assign({},x,{t,lo,hi,inB,drift,d$,sh});});
+ const out=rows.filter(r=>!r.inB);
+ const sells=out.filter(r=>r.d$<0).reduce((a,r)=>a-r.d$,0),buys=out.filter(r=>r.d$>0).reduce((a,r)=>a+r.d$,0),net=buys-sells;
+ const hhi=a=>a.reduce((s,v)=>s+(v/100)**2,0);
+ const wn=rows.map(r=>r.w),tn=rows.map(r=>r.t);
+ const top=rows[0],topT=Math.max.apply(null,tn);
+ const top5n=wn.slice(0,5).reduce((a,b)=>a+b,0),top5t=tn.slice().sort((a,b)=>b-a).slice(0,5).reduce((a,b)=>a+b,0);
+ let banner;
+ if(!out.length)banner=`<div class="card" style="border-left:3px solid #4FB286"><div style="font-weight:650;color:#4FB286">✓ 全部在区间内 · 无需操作</div><div class="note" style="margin-top:4px">在带内什么都不做，才是纪律所在——也直接对冲你的高换手。这是纪律的胜利。</div></div>`;
+ else banner=`<div class="card" style="border-left:3px solid #E5707A"><div style="font-weight:650;color:#E5707A">你预先设定的规则触发了：${out.length} 只标的越界</div><div class="note" style="margin-top:4px">这不是“市场动了快行动”，而是你冷静时定下的 ±${band}pp 带宽到点了。${tt.note?'<br>'+tt.note:''}</div></div>`;
+ const badges=[['最大持仓',`${top.sym} ${top.w.toFixed(0)}% → ${topT.toFixed(0)}%`],['前五合计',`${top5n.toFixed(0)}% → ${top5t.toFixed(0)}%`],
+   ['HHI 集中度',`${hhi(wn).toFixed(2)} → ${hhi(tn).toFixed(2)}`],['越界标的',`${out.length} / ${rows.length}`],['双向成交额',`≈ ${fmt(sells+buys)}`]];
+ const bars=rows.map(r=>{const c=r.inB?'#888D96':(r.drift>0?'#E5707A':'#4FB286'),wd=Math.min(Math.abs(r.drift),20)/20*50,left=r.drift>=0?50:50-wd;
+   return `<div class="frow" style="cursor:pointer" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <span class="fsym">${r.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
+     <span class="fval" style="color:${c}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</span><span class="fst">${r.inB?'区间内':(r.drift>0?'超配':'低配')}</span></div>`;}).join('');
+ const arows=out.map(r=>{const sh=r.sh==null?'<span class="note">缺价</span>':((r.d$<0?'−':'+')+Math.abs(r.sh)+'股'),edge=rule.glide==='center'?'目标':(r.drift>0?'上沿':'下沿');
+   return `<tr style="cursor:pointer" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <td class="l">${r.sym}</td><td>${r.w.toFixed(1)}%</td><td>${r.lo.toFixed(0)}–${(r.t+band).toFixed(0)}%</td>
+     <td style="color:${r.drift>0?'#E5707A':'#4FB286'}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</td>
+     <td class="l">${sh} <span class="note">(${fmt(Math.abs(r.d$))})</span> 拉回${edge}</td></tr>`;}).join('');
+ const actionTable=out.length?`<div class="card"><div class="dh"><span class="t">动作清单</span><span class="nm">仅越界标的 · 你的规则触发</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>当前</th><th>目标区间</th><th>偏离pp</th><th class="l">动作</th></tr></thead><tbody>${arows}</tbody></table></div>
+   <div class="note" style="margin-top:8px">卖出释放 ${fmt(sells)} · 买入部署 ${fmt(buys)} · 净${net>=0?'需追加':'释放'} ${fmt(Math.abs(net))}（股数已取整，带内标的不动）。</div></div>`:'';
+ return banner+`<div class="card"><div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>`
+   +`<div class="card"><div style="font-weight:650;margin-bottom:4px">权重偏离目标（pp）· 颜色 = 方向</div>
+      <div class="legend"><span><i style="background:#E5707A"></i>超配</span><span><i style="background:#4FB286"></i>低配</span><span><i style="background:#888D96"></i>区间内·无需操作</span></div>${bars}</div>`+actionTable;
+}
+function wireRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(!seg)return;
+ seg.querySelectorAll('[data-reb]').forEach(b=>b.onclick=()=>{if(b.disabled)return;const k=b.dataset.reb,v=b.dataset.v;if(k==='pol')rebalDraft.policy=v;if(k==='glide')rebalDraft.glide=v;rerenderRebal();});
+ const cap=seg.querySelector('#rebCap');if(cap)cap.onchange=()=>{rebalDraft.cap=Math.max(5,Math.min(50,+cap.value||20));rerenderRebal();};
+ const band=seg.querySelector('#rebBand');if(band)band.onchange=()=>{rebalDraft.band=Math.max(1,Math.min(20,+band.value||5));rerenderRebal();};
+ const sv=seg.querySelector('#rebSave');if(sv)sv.onclick=()=>{rebalSave();rerenderRebal();};
+ const cl=seg.querySelector('#rebClear');if(cl)cl.onclick=()=>{if(rebalDraft.setOn&&!confirm('清除已保存的规则、退回建议默认？'))return;rebalClear();rerenderRebal();};}
+function rerenderRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(seg){seg.innerHTML=rebalancePlanner();wireRebal();}}
 function fibChart(s,fmtY){
  const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';
  const yl=fmtY||(v=>'$'+v.toFixed(0));
