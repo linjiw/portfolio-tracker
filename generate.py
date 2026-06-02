@@ -483,13 +483,30 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
 
     order = {"alert": 0, "watch": 1, "good": 2, "info": 3}
     flags.sort(key=lambda f: order.get(f["level"], 9))
+    # Per-symbol bias map for the 决策一览 scorecard, so the JS join doesn't have to
+    # re-parse Chinese example strings. Only GENUINELY per-name biases (their
+    # examples are symbol-prefixed) and only at level alert/watch — account-level
+    # flags (overtrading) have no per-name examples and are excluded. When the data
+    # is clean a name simply gets no chip (honest; never manufactured).
+    PER_NAME_IDS = {"concentration", "disposition", "sunkcost", "recency", "anchoring"}
+    biasBySym = {}
+    for f in flags:
+        if f["id"] not in PER_NAME_IDS or f["level"] not in ("alert", "watch"):
+            continue
+        seen = set()
+        for ex in f.get("examples", []):
+            tok = (ex or "").strip().split(" ")[0].strip()
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            biasBySym.setdefault(tok, []).append({"id": f["id"], "level": f["level"]})
     stats = {"sells": nsells, "buys": nbuys, "trades": ntrades,
              "winSells": len(win_sells), "losSells": len(los_sells),
              "heldWin": len(held_win), "heldLos": len(held_los),
              "pgr": round(pgr, 3), "plr": round(plr, 3), "dispositionRatio": round(ratio, 2),
              "turnoverAnnPct": round(turn_ann * 100, 0), "topWeight": round(top[1], 1),
              "top5Weight": round(top5, 1), "hhi": round(hhi, 3)}
-    return {"flags": flags, "stats": stats}
+    return {"flags": flags, "stats": stats, "biasBySym": biasBySym}
 
 # ---------------------------------------------------------------- money-weighted return
 def _xnpv(rate, flows):
@@ -1473,6 +1490,53 @@ function nwChart(ser){
  el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#6B7079" font-size="10" text-anchor="end">组合动能</text>`;
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
+function rebalDriftMap(){
+ const uni=rebalUniverse(),volMap=rebalVolMap(),rule=(typeof rebalDraft!=='undefined'&&rebalDraft)?rebalDraft:rebalLoad();
+ const tt=rebalTargets(rule,uni,volMap),m={};
+ if(tt&&tt.t&&!tt.disabled){uni.u.forEach((x,i)=>{m[x.sym]={cur:x.w,tgt:tt.t[i],drift:x.w-tt.t[i]};});}
+ return {map:m,policy:rule.policy,band:rule.band||5};
+}
+function scorecardCard(){
+ const mv=S.marketValue||1;
+ const bias=(DATA.behavior&&DATA.behavior.biasBySym)||{};
+ const rc={};((DATA.risk&&DATA.risk.contrib)||[]).forEach(c=>rc[c.sym]=c);
+ const dm=rebalDriftMap();
+ const BL={concentration:'集中',disposition:'浮亏持有',sunkcost:'越跌越买',recency:'追涨',anchoring:'回本卖'};
+ const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now);
+ if(!held.length)return'';
+ const data=held.map(x=>{
+   const w=x.value/mv*100,n=x.fib.now,sig=(x.fib.signals||[]).slice(-1)[0],c=rc[x.sym],bl=bias[x.sym]||[],d=dm.map[x.sym];
+   let attn=0;
+   if(n.rsi>70)attn++;
+   if(c&&c.gap>10)attn++;
+   attn+=bl.filter(b=>b.level==='alert').length;
+   if(d&&Math.abs(d.drift)>dm.band)attn++;
+   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
+   const rsiCls=n.rsi>70?'neg':(n.rsi<30?'pos':'');
+   let riskCell='<td>—</td><td>—</td>';
+   if(c){const g=c.gap,gc=g>0?'#E5707A':'#4FB286',bw=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-bw;
+     riskCell=`<td>${c.riskPct.toFixed(1)}%</td><td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
+   const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#E8B339';return `<span class="chip" style="color:${col};border-color:${col}66">${BL[b.id]||b.id}</span>`;}).join(' '):'<span class="note">—</span>';
+   let driftCell='<td>—</td>';
+   if(d){const g=d.drift,gc=g>0?'#E5707A':'#4FB286',bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
+     driftCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
+   const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">${attn}</span>`:'<span class="note">—</span>';
+   const html=`<tr style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
+     <td>${fmt(x.value)} <span class="note">${w.toFixed(1)}%</span></td>
+     <td class="${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</td>
+     <td style="color:${FIBCOL[n.state]}">${n.label}</td>
+     <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
+     <td class="${rsiCls}">${n.rsi}</td><td>${sigTxt}</td>${riskCell}
+     <td class="l">${biasHtml}</td>${driftCell}<td>${attnBadge}</td></tr>`;
+   return {attn,w,html};
+ });
+ data.sort((a,b)=>b.attn-a.attn||b.w-a.w);
+ return `<div class="card"><div class="dh"><span class="t">决策一览</span><span class="nm">每只持仓的 技术 · 风险 · 行为 · 再平衡偏离 同屏，联合评估而非逐项割裂（点击看个股）</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th>动能</th><th>RSI</th><th>最近信号</th><th>风险贡献</th><th>风险−资金</th><th class="l">行为标记</th><th>偏离目标</th><th>关注度</th></tr></thead>
+   <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
+   <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></div></div>`;
+}
 function bridgeCard(){
  const B=DATA.bridge;if(!B||B.terminal==null)return'';
  const g=S.behaviorGap;
@@ -1524,8 +1588,9 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
- <div class="seg" data-seg="nw">
+ <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
+ <div class="seg" data-seg="score">`+scorecardCard()+`</div>
+ <div class="seg" data-seg="nw" hidden>
  <div class="card">
    <div class="dh"><span class="t">组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
    <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>

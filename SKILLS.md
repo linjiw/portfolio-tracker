@@ -408,6 +408,40 @@ TWR judges the *strategy*; MWR + the bridge judge *your money*; 指数对比 jud
 *vs the market* — three different questions, co-located so they can't be framed
 in isolation. Equity-only; 非投资建议.
 
+## Decision scorecard (IMPLEMENTED)
+
+The **决策一览** tab — now the DEFAULT overview segment (placed first). One row
+per held name that joins the four signal families the dashboard already computes
+but had SCATTERED across the 持仓信号 / 风险 / 行为决策 / 再平衡计划 tabs:
+technical (fib state/momentum/RSI/last cross), risk (riskPct + the risk−weight
+gap bar), behavioral (per-name bias chips), and rebalance drift. Book grounding:
+Thaler's narrow-vs-broad framing (Problem 1 vs 2, p.1582) — holdings must be
+evaluated JOINTLY in one frame, not piecemeal; and display order/salience is
+itself the intervention (p.1595), so it's the default-first frame.
+
+- **关注度 (attention)** = a per-row COUNT of red signals (RSI>70, risk gap>10pp,
+  any alert-level bias, |rebalance drift|>band). It is the **default sort key
+  only** — explicitly NOT a score and NEVER a buy/sell rating (the load-bearing
+  not-advice guardrail). Labeled 关注度/需复盘.
+- **Python**: one additive field — `behavior.biasBySym` (sym → [{id,level}]),
+  built in `analyze_behavior` from the symbol-prefixed `examples` of GENUINELY
+  per-name flags (concentration/disposition/sunkcost/recency/anchoring) at level
+  alert/watch only. When the data is clean a name gets no chip (honest — today
+  only the 5 concentration names carry one; disposition/recency are "good").
+  Don't lower the threshold to manufacture chips, and don't attach account-level
+  flags (overtrading) to rows.
+- **JS**: `scorecardCard()` (modeled on `positionSignalsCard`) + a shared
+  read-only `rebalDriftMap()` (reuses `rebalUniverse/rebalTargets/rebalLoad` so
+  the scorecard and the planner agree on drift). Reuses every existing helper
+  (FIBCOL/momColor/cls/fmt, .scroll>table, .fbar/.z/.p, .chip, deep-link). Risk
+  cells degrade to "—" for names absent from `risk.contrib`; drift cells "—" when
+  no target (e.g. inverse-vol disabled). No new CSS, no new payload beyond
+  biasBySym, no parse change.
+- Insight it surfaces (joint view): on the Jun-01 data VOO/QQQ/MU each hit
+  attention 2 (RSI>70 overbought AND concentration-flagged) while the largest
+  holding NVDA is only 1 (RSI neutral) — a cross-family pattern invisible in any
+  single tab. Each row deep-links to the per-stock detail. 非投资建议.
+
 ## Extension ideas (not yet built)
 
 - Include cash & option mark-to-market in net worth (needs reliable cash-balance
