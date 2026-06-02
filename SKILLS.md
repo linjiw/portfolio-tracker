@@ -227,31 +227,73 @@ accounts is the correct, consistent picture.
 
 ## Fibonacci momentum analytics (IMPLEMENTED)
 
-`compute_fib(items)` runs on each stock's full daily-close series (so it needs
-the price fetch, not just trade dates) and attaches `stock["fib"]`:
+`compute_fib(items)` runs on **any** `(date, value)` series — each stock's daily
+closes AND the whole-portfolio net-worth curve — and returns the same dict:
 - **EMA ribbon** 5/8/13/21 (`e5..e21`) — the geometric (~1.6×) spacing gives a
   natural fast/mid/slow layering. Drawn as a state-colored band + 4 lines.
-- **State** per day (Alligator-style): `range` (ribbon width <0.8% of price →
-  tangled/no-trade), `up`/`down` (cleanly stacked), else `mixed` (transition).
-  Shown as the bottom color strip and the list-row dot.
-- **Momentum** `= 100*tanh((EMA5-EMA21)/EMA21 / 0.06)` → signed, ±100 bounded.
-  The 0.06 divisor was tuned so a field of strong momentum names doesn't all pin
-  at ±100 (0.04 saturated). Drives the list sort + overview ranking.
-- **RSI(14)** Wilder's; **golden/death cross** = EMA5 crossing EMA13.
-- `now` = latest snapshot {state,label,mom,rsi} used by list/overview/badges.
+  Verified bit-identical to `pandas ewm(span=n, adjust=False)` (seeded with the
+  first value; the first ~n bars are warm-up — expected for that convention).
+- **State** per day (Alligator-style): checks **stack order first** so a genuine
+  low-volatility trend isn't hidden — `up`/`down` (cleanly stacked EMAs), else
+  `range` (ribbon width <0.8% of price → chop), else `mixed` (transition). Shown
+  as the bottom color strip and the list-row dot. *(Was: range-first, which
+  mislabeled slow steady trends as chop — fixed.)*
+- **Momentum** `= 100*tanh((EMA5-EMA21)/EMA21 / MOM_SCALE)` → signed, ±100
+  bounded. `MOM_SCALE = 0.06` is a **named constant** referenced by both the code
+  and the docstring (they had silently drifted: doc said 0.04, code 0.06).
+- **RSI(14)** Wilder's (verified max-diff 0.0 vs an independent reference; zero-
+  loss windows read 99.9 not 100.0 — a harmless 0.1 ceiling, ~never hit).
+- **golden/death cross** = EMA5 crossing EMA13 — this is the **fast ribbon
+  cross**, NOT the classic 50/200-day cross; it's labeled as such in the UI and
+  the docstring so users don't expect a long-term signal. `resonance` gates it
+  (trend + cross within 3 days + RSI not extreme) to filter false crosses.
+- `now` = latest snapshot {state,label,mom,rsi,res} used by list/overview/badges.
 
-UI: per-stock "斐波那契动能分析" card (ribbon chart + momentum oscillator + RSI
-with 30/70 guides), list momentum column + "按斐波那契动能" sort, overview
-"斐波那契动能排行" diverging bars. `svgLines` gained `opts.fixed` (y-range) and
-`opts.guides` (dashed reference lines) for the oscillator/RSI.
+UI per stock: "斐波那契动能分析" card (ribbon chart with cross triangles +
+resonance rings, momentum oscillator, RSI with 30/70 guides; oscillator/RSI now
+draw dashed vertical lines at cross dates via `svgLines` `opts.marks`).
+
+**Portfolio-level Fibonacci (IMPLEMENTED).** `payload["portfolioFib"] =
+compute_fib([(p["date"], p["value"]) for p in series])` runs the same engine on
+the net-worth curve. Drawn in the overview "组合斐波那契" tab by reusing
+`fibChart`/`svgLines` with a pseudo-stock `{prices: ser.map(p=>[date,value]),
+fib: portfolioFib}` and a `$k` y-formatter (`fibChart(s, fmtY)`). Plus a "持仓
+信号" tab: per-holding table of weight/state/momentum/RSI/last-cross/resonance +
+a neutral "技术姿态" string. Guard: `portfolioFib` is `None` if the curve has
+<21 trading days.
 
 **Honest framing (keep this in the UI).** There's no strong evidence Fibonacci
 periods beat other periods; the real value is the geometric spacing's layering,
 not numerology. The panel is labeled a technical-analysis reference, **not
 investment advice** — don't let it drift into signal-chasing claims.
 
-Validate after changes: `node --check` on the extracted `<script>` (the template
-has a lot of nested template-literals; a stray backtick breaks silently).
+## Behavioral decision support (IMPLEMENTED)
+
+`analyze_behavior(stocks, summary, prices, dmin, dmax)` → `payload["behavior"]`,
+rendered in the overview "行为决策" tab. Grounded in **Thaler, "Behavioral
+Economics: Past, Present, and Future" (AER 2016)** — each flag computes a
+concrete signal from the user's OWN trades & positions, with a page-cited
+reference and a constructive nudge. **Framed as reflective prompts, NOT trade
+advice** (this is the load-bearing constraint — never emit "buy/sell X"):
+- **disposition** — Odean PGR/PLR from realized-gain vs realized-loss sells and
+  held winners/losers (ratio >1.5 ⇒ sell-winners/ride-losers). *(In the current
+  data this is GOOD: PGR/PLR≈0.73 — the user actually cuts losers faster.)*
+- **overtrading** — trade count + annualized turnover, cross-checked vs the S&P
+  TWR already computed (Thaler: active trading on avg trails the index).
+- **concentration** — top weight / top-5 / HHI (self-control & defaults nudge).
+- **sunkcost** — BUYs priced below running avg into currently-losing names.
+- **anchoring** — SELLs clustered at break-even (|realized|/proceeds <2%).
+- **recency** — BUYs made after a >12% 20-day run-up (extrapolation).
+
+Levels `alert|watch|good` drive the card color; `flags` are sorted worst-first.
+Detection thresholds are heuristics — keep them transparent (show the numbers),
+and keep the disclaimer prominent.
+
+Validate after changes: `node --check` on the extracted `<script>` (nested
+template-literals — a stray backtick breaks silently), AND a mocked-DOM runtime
+smoke test (stub `document`/`MutationObserver`, then call `portfolioFibCard()`,
+`positionSignalsCard()`, `behaviorCard()`, `renderOverview()`, `renderFib()`) to
+catch ReferenceErrors that `node --check` can't.
 
 ## Extension ideas (not yet built)
 

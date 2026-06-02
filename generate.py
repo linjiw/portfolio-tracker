@@ -277,11 +277,27 @@ def _rsi(vals, n=14):
         out[i] = out[n]
     return out
 
+# Momentum oscillator scale: the divisor on the EMA5-vs-EMA21 separation inside
+# tanh. Smaller = more reactive (saturates sooner). 0.06 was tuned so a field of
+# strong names doesn't all pin at ±100 (0.04 saturated). Named so the docstring
+# and the code can't silently drift apart (they had: doc said 0.04, code 0.06).
+MOM_SCALE = 0.06
+
 def compute_fib(items):
     """Fibonacci EMA ribbon (5/8/13/21) + momentum + RSI + crossover signals.
-    Momentum = 100*tanh((EMA5-EMA21)/EMA21 / 0.04): signed by fast-vs-slow
-    separation, smoothly bounded to ±100. State borrows the Alligator idea:
-    tight ribbon = range; cleanly stacked = trend; else transition."""
+    Works on ANY (date, value) series — a single stock's closes OR the whole
+    portfolio's daily net-worth curve.
+
+    Momentum = 100*tanh((EMA5-EMA21)/EMA21 / MOM_SCALE): signed by fast-vs-slow
+    separation, smoothly bounded to ±100 (MOM_SCALE = 0.06).
+
+    State borrows the Alligator idea but checks STACK ORDER FIRST, so a genuine
+    low-volatility trend isn't mislabeled as chop: cleanly stacked EMAs = up/down
+    trend; otherwise a tight ribbon (<0.8% of price) = range, else transition.
+
+    NOTE: "golden"/"death" here are the FAST ribbon cross (EMA5 x EMA13) — much
+    faster/noisier than the classic 50/200-day cross; resonance gating (trend +
+    recent cross + RSI-not-extreme) filters the false crosses out."""
     dates = [d for d, _ in items]
     px = [p for _, p in items]
     if len(px) < 21:
@@ -291,15 +307,15 @@ def compute_fib(items):
     mom, state = [], []
     for i in range(len(px)):
         sp = (e5[i] - e21[i]) / e21[i] if e21[i] else 0
-        mom.append(round(100 * math.tanh(sp / 0.06), 1))
+        mom.append(round(100 * math.tanh(sp / MOM_SCALE), 1))
         band = max(e5[i], e8[i], e13[i], e21[i]) - min(e5[i], e8[i], e13[i], e21[i])
         w = band / px[i] * 100 if px[i] else 0
-        if w < 0.8:
-            state.append("range")
-        elif e5[i] > e8[i] > e13[i] > e21[i]:
+        if e5[i] > e8[i] > e13[i] > e21[i]:
             state.append("up")
         elif e5[i] < e8[i] < e13[i] < e21[i]:
             state.append("down")
+        elif w < 0.8:
+            state.append("range")
         else:
             state.append("mixed")
     sig = []
@@ -330,6 +346,150 @@ def compute_fib(items):
             "signals": sig, "resonance": res,
             "now": {"state": state[-1], "label": label[state[-1]],
                     "mom": mom[-1], "rsi": round(rsi[-1], 1), "res": active}}
+
+# ---------------------------------------------------------------- behavioral
+def analyze_behavior(stocks, summary, prices, dmin, dmax):
+    """Behavioral-economics decision support, grounded in Thaler, "Behavioral
+    Economics: Past, Present, and Future" (AER 2016). Detects common investing
+    biases from the user's OWN trades & positions and returns observation+nudge
+    flags. These are reflective prompts, NOT trade advice — every nudge reframes
+    the decision toward the user's own thesis, never "buy/sell X".
+
+    Detectors (each with a concrete, data-driven rule):
+      disposition  — Odean PGR/PLR: realize winners, ride losers (p.1582)
+      overtrading  — trade count / turnover vs the index benchmark (p.1587,1593)
+      concentration— single-name weight, top-5, HHI (self-control, p.1595)
+      sunkcost     — buying below avg into already-losing names (p.1585,1592)
+      anchoring    — selling clustered at break-even / cost (p.1594)
+      recency      — buying after a sharp run-up (extrapolation, p.1588-89)
+    """
+    held = [s for s in stocks if s["held"]]
+    mv = summary.get("marketValue") or 1.0
+    eps = 0.01
+    flags = []
+
+    def add(fid, level, title, headline, detail, nudge, ref, examples=None):
+        flags.append({"id": fid, "level": level, "title": title, "headline": headline,
+                      "detail": detail, "nudge": nudge, "ref": ref, "examples": examples or []})
+
+    # collect sells / buys with running context from each stock's walked rows
+    sells, buys, avgdown = [], [], []
+    for s in stocks:
+        rows = s["txns"]
+        for j, t in enumerate(rows):
+            if t["side"] == "SELL" and t["realized"] is not None:
+                sells.append({"sym": s["sym"], "date": t["date"], "price": t["price"],
+                              "proceeds": abs(t["amount"]), "realized": t["realized"]})
+            elif t["side"] == "BUY":
+                prev_avg = rows[j - 1]["avg"] if j > 0 else 0
+                buys.append({"sym": s["sym"], "date": t["date"], "price": t["price"],
+                             "amount": abs(t["amount"]), "prev_avg": prev_avg})
+                if prev_avg and t["price"] < prev_avg * 0.995:
+                    avgdown.append({"sym": s["sym"], "date": t["date"], "price": t["price"]})
+
+    # 1) Disposition effect — Odean's PGR vs PLR
+    win_sells = [x for x in sells if x["realized"] > eps]
+    los_sells = [x for x in sells if x["realized"] < -eps]
+    held_win = [s for s in held if s["unreal"] > 0]
+    held_los = [s for s in held if s["unreal"] < 0]
+    pgr = len(win_sells) / (len(win_sells) + len(held_win)) if (len(win_sells) + len(held_win)) else 0
+    plr = len(los_sells) / (len(los_sells) + len(held_los)) if (len(los_sells) + len(held_los)) else 0
+    ratio = (pgr / plr) if plr > 0 else (9.99 if pgr > 0 else 0)
+    lvl = "alert" if ratio >= 1.5 else ("watch" if ratio >= 1.1 else "good")
+    top_losers = sorted(held_los, key=lambda s: s["unrealPct"])[:5]
+    add("disposition", lvl, "处置效应 · 卖盈持亏",
+        f"PGR/PLR ≈ {ratio:.2f}（盈利卖出 {len(win_sells)} 笔、亏损卖出 {len(los_sells)} 笔；当前持仓盈 {len(held_win)} / 亏 {len(held_los)}）",
+        f"PGR(已兑现盈利占比)={pgr:.0%}，PLR(已兑现亏损占比)={plr:.0%}。比值 >1.5 说明你更倾向于过早兑现盈利、却死扛亏损——经典的处置效应。",
+        "在买入当下就写下卖出条件（目标价 / 止损 / “逻辑破坏即走”），让卖出由逻辑是否成立驱动，而不是由此刻是红是绿驱动。",
+        "Thaler 2016 · Problem 1 (p.1582)",
+        [f"{s['sym']} {s['unrealPct']:+.0f}%（仍持有）" for s in top_losers])
+
+    # 2) Overconfidence & overtrading — turnover vs benchmark
+    nbuys, nsells = len(buys), len(sells)
+    ntrades = nbuys + nsells
+    span = max(1, (datetime.date.fromisoformat(dmax) - datetime.date.fromisoformat(dmin)).days)
+    avg_val = (summary.get("netWorthStart", 0) + summary.get("netWorthNow", 0)) / 2 or mv
+    gross = summary.get("totalBuy", 0) + summary.get("totalSell", 0)
+    turn_ann = (gross / avg_val * (365.0 / span)) if avg_val else 0
+    sp = summary.get("spReturn")
+    alpha = (summary["curReturn"] - sp) if sp is not None else None
+    lvl = "alert" if turn_ann > 6 else ("watch" if turn_ann > 3 else "good")
+    det = (f"窗口 {span} 天内 {ntrades} 笔交易（买 {nbuys} / 卖 {nsells}），成交额 ${gross:,.0f} ≈ 平均持仓市值的 {gross/avg_val:.1f} 倍，年化换手 ≈ {turn_ann*100:,.0f}%。")
+    if alpha is not None:
+        det += f" 同期组合时间加权 {summary['curReturn']:+.1f}% vs S&P {sp:+.1f}%（超额 {alpha:+.1f}%）。"
+    det += " Thaler 指出主动交易平均跑不赢指数，高换手通常被成本与税侵蚀。"
+    add("overtrading", lvl, "过度自信 · 过度交易",
+        f"年化换手 ≈ {turn_ann*100:,.0f}% · 共 {ntrades} 笔" + (f" · 超额 {alpha:+.1f}%" if alpha is not None else ""),
+        det,
+        "给冲动加一道闸：用“观察清单”代替即时下单，设自我约束的最短持有期，并定期对照指数检查折腾是否真换来了超额收益。",
+        "Thaler 2016 · 过度自信 (p.1578,1593-94)；主动管理 (p.1587)")
+
+    # 3) Concentration — self-control / overconfidence
+    weights = sorted([(s["sym"], s["value"] / mv * 100) for s in held], key=lambda x: -x[1])
+    top = weights[0] if weights else ("—", 0)
+    top5 = sum(w for _, w in weights[:5])
+    hhi = sum((w / 100) ** 2 for _, w in weights)
+    lvl = "alert" if (top[1] > 25 or top5 > 70) else ("watch" if (top[1] > 18 or top5 > 55) else "good")
+    add("concentration", lvl, "集中度 · 自控与默认机制",
+        f"最大持仓 {top[0]} 占 {top[1]:.0f}% · 前五合计 {top5:.0f}% · HHI {hhi:.2f}",
+        f"单一标的 {top[0]} 占净值 {top[1]:.0f}%，前 5 大合计 {top5:.0f}%。集中会同时放大正确判断与单一标的的回撤。",
+        "为每个仓位设一个目标权重区间，越界即提醒再平衡——把“先定规则、到点执行”做成默认动作（Save More Tomorrow 思路），而非临场凭情绪。",
+        "Thaler 2016 · 自控/默认与承诺机制 (p.1595-96)",
+        [f"{sym} {w:.0f}%" for sym, w in weights[:5]])
+
+    # 4) Sunk-cost / loss aversion — averaging down into current losers
+    loser_map = {s["sym"]: s for s in held if s["unrealPct"] < -2}
+    ad_los = [b for b in avgdown if b["sym"] in loser_map]
+    by_sym = {}
+    for b in ad_los:
+        by_sym[b["sym"]] = by_sym.get(b["sym"], 0) + 1
+    lvl = "watch" if ad_los else "good"
+    ex = sorted(by_sym.items(), key=lambda kv: -kv[1])[:5]
+    add("sunkcost", lvl, "沉没成本 · 越跌越买",
+        (f"向浮亏仓位低于均价加仓 {len(ad_los)} 次，涉及 {len(by_sym)} 只" if ad_los else "未见明显“为摊薄成本而买入浮亏仓”的模式"),
+        ("在已经浮亏、且买价低于持仓均价时继续加仓，会把“已经投入”变成继续持有的理由。但投入的钱无论如何收不回，不应左右下一步决定。"
+         if ad_los else "当前没有明显的沉没成本加仓信号。"),
+        "做一个只看未来的检验：“若我现在空仓，会按这个价格、这个仓位重新买入它吗？”是→留；否→与已投入无关地考虑减仓。",
+        "Thaler 2016 · 沉没成本/餐厅例 (p.1585)；损失厌恶 (p.1592)",
+        [f"{sym} 加仓{n}次（现 {loser_map[sym]['unrealPct']:+.0f}%）" for sym, n in ex])
+
+    # 5) Anchoring — selling clustered at break-even
+    be_sells = [x for x in sells if x["proceeds"] > 0 and abs(x["realized"]) / x["proceeds"] < 0.02]
+    be_frac = len(be_sells) / len(sells) if sells else 0
+    lvl = "watch" if (be_frac > 0.30 and len(sells) >= 5) else "good"
+    add("anchoring", lvl, "锚定 · 回本就卖",
+        f"约 {be_frac:.0%} 的卖出在成本价附近（盈亏 < 成交额 2%），{len(be_sells)}/{len(sells)} 笔",
+        "卖出大量集中在“刚好回本”附近，常意味着把买入成本当成了决策锚——而买入价对未来涨跌其实无关。",
+        "评估默认用“当前价 / 趋势信号”这套前瞻视角，把成本只当作记账数字，不当作目标价。",
+        "Thaler 2016 · 锚定 (Kahneman & Tversky 三启发式, p.1594)")
+
+    # 6) Recency / extrapolation — buying after a sharp run-up
+    buy_high = []
+    for b in buys:
+        d = datetime.date.fromisoformat(b["date"])
+        pp = price_on(prices, b["sym"], (d - datetime.timedelta(days=20)).isoformat())
+        if pp and b["price"] > pp * 1.12:
+            buy_high.append({"sym": b["sym"], "date": b["date"], "runup": (b["price"] / pp - 1) * 100})
+    bh_frac = len(buy_high) / len(buys) if buys else 0
+    avg_runup = (sum(x["runup"] for x in buy_high) / len(buy_high)) if buy_high else 0
+    lvl = "watch" if (bh_frac > 0.25 and len(buys) >= 10) else "good"
+    bh_top = sorted(buy_high, key=lambda x: -x["runup"])[:5]
+    add("recency", lvl, "近因 · 追涨",
+        f"约 {bh_frac:.0%} 的买入发生在 20 日内涨超 12% 之后（{len(buy_high)}/{len(buys)} 笔，平均追涨 +{avg_runup:.0f}%）",
+        "在近期大涨后买入，隐含“涨的会继续涨”的外推预期——这正是 Thaler 讲的近因/外推偏差，也是泡沫的微观机制。",
+        "追高的当下提醒自己“近期表现不预测未来收益”；用分批建仓 / 定投来削弱追涨冲动。",
+        "Thaler 2016 · 外推/近因与泡沫 (p.1588-89,1593)",
+        [f"{x['sym']} {x['date']} +{x['runup']:.0f}%" for x in bh_top])
+
+    order = {"alert": 0, "watch": 1, "good": 2, "info": 3}
+    flags.sort(key=lambda f: order.get(f["level"], 9))
+    stats = {"sells": nsells, "buys": nbuys, "trades": ntrades,
+             "winSells": len(win_sells), "losSells": len(los_sells),
+             "heldWin": len(held_win), "heldLos": len(held_los),
+             "pgr": round(pgr, 3), "plr": round(plr, 3), "dispositionRatio": round(ratio, 2),
+             "turnoverAnnPct": round(turn_ann * 100, 0), "topWeight": round(top[1], 1),
+             "top5Weight": round(top5, 1), "hhi": round(hhi, 3)}
+    return {"flags": flags, "stats": stats}
 
 # ---------------------------------------------------------------- engine
 def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
@@ -452,6 +612,11 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                        "pmom": pmom})
         prevd, vprev = d, v
 
+    # portfolio-level Fibonacci: the SAME EMA ribbon / RSI / golden-death engine,
+    # run on the daily net-worth curve so the whole portfolio gets its own ribbon
+    # and crossover signals (None if <21 trading days of curve).
+    portfolio_fib = compute_fib([(p["date"], p["value"]) for p in series])
+
     held_val = sum(s["value"] for s in stocks if s["held"])
     held_unreal = sum(s["unreal"] for s in stocks if s["held"])
     last = series[-1] if series else {}
@@ -465,7 +630,9 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
                "netWorthStart": series[0]["value"] if series else 0}
-    return {"summary": summary, "stocks": stocks, "options": opts, "series": series}
+    behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
+    return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
+            "portfolioFib": portfolio_fib, "behavior": behavior}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1052,6 +1219,7 @@ function svgLines(ser,defs,opts){
  const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB);
  let el='';
  (opts.guides||[]).forEach(g=>{const y=yc(g.v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${g.color||'#2A2E36'}" stroke-dasharray="4 3"/><text x="${W-mR+4}" y="${y+4}" fill="${g.color||'#6B7079'}" font-size="10">${g.label!=null?g.label:g.v}</text>`;});
+ (opts.marks||[]).forEach(g=>{const x=xs(g.date),c=g.type==='golden'?'#4FB286':'#E5707A';el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="${c}" stroke-opacity="0.4" stroke-dasharray="2 3"/>`;});
  for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/>`;
    el+=`<text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">${opts.fmt(v)}</text>`;}
@@ -1105,7 +1273,7 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="cmp">指数对比</button><button data-seg="res">共振 · 排行</button></div>
+ <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button></div>
  <div class="seg" data-seg="nw">
  <div class="card">
    <div class="dh"><span class="t">组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
@@ -1115,12 +1283,14 @@ function renderOverview(){
    <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#4FB286">绿=强(>15)</span> / <span style="color:#E8B339">黄=中性</span> / <span style="color:#E5707A">红=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
    ${nwChart(ser)}</div>
  </div>
+ <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
  <div class="seg" data-seg="cmp" hidden>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
    <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#E8B339"></i>纳斯达克综合</span></div>
    ${svgLines(ser,[{key:'ret',color:'#E8B339'},{key:'sp500',color:'#888D96',dash:1},{key:'nasdaq',color:'#E8B339',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>
  </div>
- <div class="seg" data-seg="res" hidden>`+resonanceCard()+fibRanking()+`</div>`;
+ <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
+ <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>`;
  segWire();
 }
 function resonanceCard(){
@@ -1150,8 +1320,83 @@ function fibRanking(){
 const FIBCOL={up:'#4FB286',down:'#E5707A',range:'#888D96',mixed:'#E8B339'};
 const FIBLBL={up:'多头趋势',down:'空头趋势',range:'盘整纠缠',mixed:'转换中'};
 function momColor(m){return m>15?'#4FB286':(m<-15?'#E5707A':'#E8B339');}
-function fibChart(s){
+function fibBadges(n,signals,curLabel){
+ const sc=momColor(n.mom),rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'#e6ecf5');
+ const lastSig=(signals||[]).slice(-1)[0];
+ return [
+  [curLabel||'斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
+  ['动能强弱',`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
+  ['RSI(14)',`<span style="color:${rsiCol}">${n.rsi}</span>`],
+  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
+  ['多指标共振',n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
+ ];
+}
+function portfolioFibCard(){
+ const pf=DATA.portfolioFib,ser=DATA.series||[];
+ if(!pf||ser.length<2)return `<div class="card"><div class="dh"><span class="t">组合斐波那契</span></div><div class="note">组合净值样本不足（需 ≥21 个交易日）。</div></div>`;
+ const pseudo={sym:'组合净值',prices:ser.map(p=>[p.date,p.value]),fib:pf,curPrice:ser[ser.length-1].value,held:true};
+ const n=pf.now,fmtK=v=>'$'+(v/1000).toFixed(0)+'k';
+ const sser=ser.map((p,i)=>({date:p.date,mom:pf.mom[i],rsi:pf.rsi[i]}));
+ const badges=fibBadges(n,pf.signals,'组合趋势状态');
+ return `<div class="card">
+   <div class="dh"><span class="t">组合斐波那契</span><span class="nm">EMA 5/8/13/21 缎带 · 金叉/死叉 · RSI —— 直接计算在组合净值曲线上</span></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
+   <div class="legend">
+     <span><i style="background:#E8B339"></i>EMA5</span><span><i style="background:#C99A3A"></i>EMA8</span>
+     <span><i style="background:#8C8A6E"></i>EMA13</span><span><i style="background:#5F6168"></i>EMA21</span>
+     <span><i style="background:#4FB286"></i>金叉(5×13)</span><span><i style="background:#E5707A"></i>死叉</span>
+     <span>◎ 共振</span>
+     <span>底部带：<span style="color:#4FB286">绿=多头</span>/<span style="color:#E5707A">红=空头</span>/<span style="color:#E8B339">黄=转换</span>/<span style="color:#6B7079">灰=盘整</span></span></div>
+   ${fibChart(pseudo,fmtK)}
+   <div style="font-weight:650;margin:12px 0 2px">组合动能振荡器（−100 ~ +100）</div>
+   ${svgLines(sser,[{key:'mom',color:'#E8B339'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:pf.signals})}
+   <div style="font-weight:650;margin:12px 0 2px">组合 RSI(14)</div>
+   ${svgLines(sser,[{key:'rsi',color:'#6E9CA6'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:pf.signals})}
+   <div class="note" style="margin-top:10px"><b>怎么读：</b>把整支组合当成一只“基金”，在净值曲线上算 EMA 缎带与金叉/死叉，用来看组合整体的趋势结构与择时节奏。<b>金叉/死叉为快线 EMA5×EMA13 交叉</b>（非传统 50/200 日均线，更快也更灵敏）。竖虚线标出交叉日期。<b>技术参考，非投资建议。</b></div>
+ </div>`;
+}
+function postureOf(n){
+ const t=n.state==='up'?'多头':(n.state==='down'?'空头':(n.state==='range'?'盘整':'转换'));
+ const m=Math.abs(n.mom)>40?'动能强':(Math.abs(n.mom)>15?'动能中':'动能弱');
+ const r=n.rsi>70?' · RSI超买':(n.rsi<30?' · RSI超卖':'');
+ return `${t} · ${m}${r}`;
+}
+function positionSignalsCard(){
+ const mv=S.marketValue||1;
+ const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).map(x=>({x,w:x.value/mv*100})).sort((a,b)=>b.w-a.w);
+ if(!held.length)return'';
+ const rows=held.map(({x,w})=>{const n=x.fib.now,sig=(x.fib.signals||[]).slice(-1)[0];
+   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
+   const res=n.res==='bull'?'<span class="pos">多</span>':(n.res==='bear'?'<span class="neg">空</span>':'—');
+   const rc=n.rsi>70?'neg':(n.rsi<30?'pos':'');
+   return `<tr style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
+     <td>${w.toFixed(1)}%</td><td style="color:${FIBCOL[n.state]}">${n.label}</td>
+     <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
+     <td class="${rc}">${n.rsi}</td><td>${sigTxt}</td><td>${res}</td>
+     <td class="l">${postureOf(n)}</td></tr>`;}).join('');
+ return `<div class="card"><div class="dh"><span class="t">持仓信号一览</span><span class="nm">按权重排序 · 趋势 / 动能 / RSI / 最近金死叉 / 共振（点击看个股）</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>权重</th><th>状态</th><th>动能</th><th>RSI</th><th>最近信号</th><th>共振</th><th class="l">技术姿态</th></tr></thead>
+   <tbody>${rows}</tbody></table></div>
+   <div class="note" style="margin-top:8px">“技术姿态”只是均线/动能/RSI 的客观描述，<b>非买卖建议</b>；金叉/死叉为 EMA5×13 快线交叉。</div></div>`;
+}
+function behaviorCard(){
+ const b=DATA.behavior;if(!b||!b.flags||!b.flags.length)return'<div class="card"><div class="note">行为分析数据不足。</div></div>';
+ const LV={alert:['#E5707A','⚠ 需注意'],watch:['#E8B339','留意'],good:['#4FB286','✓ 良好'],info:['#888D96','提示']};
+ const cards=b.flags.map(f=>{const c=LV[f.level]||LV.info;
+   const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip" style="border-color:${c[0]}55">${e}</span>`).join('')}</div>`:'';
+   return `<div class="card" style="border-left:3px solid ${c[0]}">
+     <div class="dh"><span class="t">${f.title}</span><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
+     <div style="font-weight:650;color:${c[0]};margin:3px 0 6px">${f.headline}</div>
+     <div class="note" style="color:var(--txt);line-height:1.55">${f.detail}</div>${ex}
+     <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
+     <div class="note" style="margin-top:6px;opacity:.65">${f.ref}</div></div>`;}).join('');
+ return `<div class="card"><div class="dh"><span class="t">行为决策辅助</span><span class="nm">基于 Thaler《行为经济学：过去、现在与未来》(2016)</span></div>
+   <div class="note" style="margin-top:6px;line-height:1.6">以下信号由<b>你自己的真实买卖与持仓</b>计算而来，用于发现常见的行为偏差。它们是<b>“提醒”而非投资建议</b>——目的是帮你按既定逻辑决策、少受“红/绿盘”情绪左右。</div></div>${cards}`;
+}
+function fibChart(s,fmtY){
  const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';
+ const yl=fmtY||(v=>'$'+v.toFixed(0));
  const W=900,H=400,mL=58,mR=80,mT=16,mB=46,stripH=12,stripY=H-mB+24;
  const xmin=+new Date(prices[0][0]),xmax=+new Date(D1);
  let ys=[];prices.forEach((p,i)=>{ys.push(p[1],f.e5[i],f.e21[i]);});
@@ -1160,7 +1405,7 @@ function fibChart(s){
  const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB-stripH);
  let el='';
  for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
-   el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/><text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">$${v.toFixed(0)}</text>`;}
+   el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/><text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">${yl(v)}</text>`;}
  for(let i=0;i<=5;i++){const t=xmin+(xmax-xmin)*i/5,x=xs(new Date(t)),dt=new Date(t);
    el+=`<text x="${x}" y="${stripY+stripH+12}" fill="#6B7079" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
  // ribbon band fill (e5..e21) colored by per-day state
@@ -1214,10 +1459,10 @@ function renderFib(s){
    ${fibChart(s)}
    <div style="font-weight:650;margin:12px 0 2px">动能振荡器（−100 ~ +100）</div>
    ${svgLines(ser,[{key:'mom',color:'#E8B339'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),
-     guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}]})}
+     guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:f.signals})}
    <div style="font-weight:650;margin:12px 0 2px">RSI(14)</div>
    ${svgLines(ser,[{key:'rsi',color:'#6E9CA6'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
-     guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}]})}
+     guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:f.signals})}
    <div class="note" style="margin-top:10px"><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
    <b>多指标共振(◎ 圆环)：</b>同时满足「均线多头/空头排列 + 3 日内出现金叉/死叉 + RSI 未到超买/超卖」三个条件才标记——比单一信号更高确信度，能过滤掉震荡市里的假交叉。<br>
    <b>诚实说明：</b>“斐波那契周期更神奇”在学术上并无强证据——5/8/13/21 相比其它周期没有统计显著的超额收益。它真正有用的地方是<b>周期按几何级数(≈1.6 倍)递增</b>，天然形成快/中/慢分层，便于判断趋势结构；这来自间距而非数字的“神秘性”。本面板为技术分析参考，<b>非投资建议</b>。</div>
