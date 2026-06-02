@@ -491,6 +491,59 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
              "top5Weight": round(top5, 1), "hhi": round(hhi, 3)}
     return {"flags": flags, "stats": stats}
 
+# ---------------------------------------------------------------- money-weighted return
+def _xnpv(rate, flows):
+    d0 = flows[0][0]
+    return sum(a / (1 + rate) ** ((d - d0).days / 365.0) for d, a in flows)
+
+def _xnpv_deriv(rate, flows):
+    d0 = flows[0][0]
+    s = 0.0
+    for d, a in flows:
+        yf = (d - d0).days / 365.0
+        s += -yf * a / (1 + rate) ** (yf + 1)
+    return s
+
+def xirr(flows):
+    """Money-weighted (annualized) IRR for dated cash flows [(date, amount)],
+    sign convention: outflow negative, inflow positive. Newton with a bisection
+    fallback. Returns None when the IRR is undefined — <2 flows, span <14d, no
+    sign change, or no convergence — so the caller renders an em dash rather than
+    a fabricated number."""
+    flows = sorted(flows, key=lambda x: x[0])
+    if len(flows) < 2:
+        return None
+    if (flows[-1][0] - flows[0][0]).days < 14:
+        return None
+    amts = [a for _, a in flows if abs(a) > 1e-9]
+    if not amts or min(amts) >= 0 or max(amts) <= 0:
+        return None
+    r = 0.10
+    for _ in range(100):
+        f, d = _xnpv(r, flows), _xnpv_deriv(r, flows)
+        if not (math.isfinite(f) and math.isfinite(d)) or abs(d) < 1e-10:
+            break
+        r2 = r - f / d
+        if r2 <= -0.9999:
+            r2 = (r - 0.9999) / 2
+        if abs(r2 - r) < 1e-7:
+            return r2 if (-0.9999 < r2 < 10 and abs(_xnpv(r2, flows)) < 1e-4) else None
+        r = r2
+    lo, hi = -0.9999, 10.0
+    flo, fhi = _xnpv(lo, flows), _xnpv(hi, flows)
+    if not (math.isfinite(flo) and math.isfinite(fhi)) or flo * fhi > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        fm = _xnpv(mid, flows)
+        if abs(fm) < 1e-6 or (hi - lo) < 1e-8:
+            return mid
+        if flo * fm < 0:
+            hi = mid
+        else:
+            lo, flo = mid, fm
+    return (lo + hi) / 2
+
 # ---------------------------------------------------------------- risk
 def compute_risk(series, stocks):
     """Realized in-window RISK to sit beside the return gauge. Computed on the
@@ -740,10 +793,59 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
                "netWorthStart": series[0]["value"] if series else 0}
+
+    # ---- money-weighted return (equity-book XIRR) + plain-dollar bridge ----
+    # Honest metric: equity-book IRR (cash & margin balances over time aren't
+    # tracked, so an account-level IRR would be a fudge factor). Flows = −V0 at
+    # dmin + each in-window trade's signed amount + terminal equity value.
+    V0 = series[0]["value"] if series else 0.0       # equity market value at window start
+    terminal = held_val
+    bridge = None
+    summary["mwrAnnual"] = summary["mwrPeriod"] = summary["behaviorGap"] = None
+    if series:
+        # XIRR flows (equity book): −V0 at dmin + each in-window trade's signed
+        # amount (dmin trades already inside V0) + dividends + terminal value.
+        term_date = datetime.date.fromisoformat(dmax) + datetime.timedelta(days=2)
+        flows = [(datetime.date.fromisoformat(dmin), -V0)]
+        by_date = {}
+        for sym, tl in txns.items():
+            for t in tl:
+                if t["date"] > dmin:
+                    by_date[t["date"]] = by_date.get(t["date"], 0.0) + t["amount"]
+        for dd in sorted(by_date):
+            flows.append((datetime.date.fromisoformat(dd), by_date[dd]))
+        if dividends:
+            flows.append((term_date, dividends))
+        term_val = terminal if terminal > 0 else series[-1]["value"]
+        if term_val > 0:
+            flows.append((term_date, term_val))
+        rate = xirr(flows)
+        span_days = (term_date - datetime.date.fromisoformat(dmin)).days
+        if rate is not None:
+            summary["mwrPeriod"] = round(((1 + rate) ** (span_days / 365.0) - 1) * 100, 2)
+            if span_days >= 60:                            # don't annualize a sub-2-month IRR
+                summary["mwrAnnual"] = round(rate * 100, 2)
+            summary["behaviorGap"] = round(summary["curReturn"] - summary["mwrPeriod"], 2)
+        # Plain-dollar bridge. EXACT, no fudge: 持仓成本 + 未实现 = 当前市值 (broker
+        # identity). The four P&L buckets are the user's mental accounts; realized/
+        # dividends/options are cash already taken, so they're shown beside (not
+        # summed into) the holdings value. Anchors on COST, never market-value V0,
+        # to avoid double-counting pre-window embedded gains.
+        held_cost = sum(s["cost"] for s in stocks if s["held"])
+        bridge = {"heldCost": round(held_cost, 2), "terminal": round(terminal, 2),
+                  "totalPL": round(held_unreal + total_realized + dividends + opt_net, 2),
+                  "lifeDeposits": round(life_deposits, 2), "ok": rate is not None,
+                  "legs": [
+                      {"key": "unreal", "label": "未实现盈亏（持仓 vs 成本）", "amount": round(held_unreal, 2), "type": "pnl", "acc": "券商精确"},
+                      {"key": "real", "label": "已实现盈亏（窗口）", "amount": round(total_realized, 2), "type": "pnl", "acc": "含估算均价"},
+                      {"key": "div", "label": "股息", "amount": round(dividends, 2), "type": "pnl"},
+                      {"key": "opt", "label": "期权净现金流", "amount": round(opt_net, 2), "type": "pnl"},
+                  ]}
+
     behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
     risk = compute_risk(series, stocks)
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
-            "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk}
+            "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk, "bridge": bridge}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1371,6 +1473,40 @@ function nwChart(ser){
  el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#6B7079" font-size="10" text-anchor="end">组合动能</text>`;
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
+function bridgeCard(){
+ const B=DATA.bridge;if(!B||B.terminal==null)return'';
+ const g=S.behaviorGap;
+ const maxAbs=Math.max(1,...B.legs.map(l=>Math.abs(l.amount)));
+ const leg=l=>{const c=l.amount>0?'#4FB286':(l.amount<0?'#E5707A':'#888D96');
+   const wd=Math.min(Math.abs(l.amount),maxAbs)/maxAbs*50,left=l.amount>=0?50:50-wd;
+   const chip=l.acc?` <span class="chip" style="opacity:.85">${l.acc}</span>`:'';
+   return `<div class="frow"><span class="fsym">${l.label}${chip}</span>
+     <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
+     <span class="fval" style="color:${c}">${fmt(l.amount)}</span></div>`;};
+ const legsHtml=B.legs.map(leg).join('')+`<div class="frow" style="border-top:1px solid #1A1C21;margin-top:4px;padding-top:6px"><span class="fsym"><b>合计盈亏</b></span><div class="fbar"></div><span class="fval ${cls(B.totalPL)}"><b>${fmt(B.totalPL)}</b></span></div>`;
+ const badges=[['当前市值',fmt(B.terminal)],['持仓成本',fmt(B.heldCost)],
+   ['合计盈亏（美元）',`<span class="${cls(B.totalPL)}">${fmt(B.totalPL)}</span>`],
+   ['你的钱实际回报 MWR',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`]];
+ let lv,head,detail;
+ if(g==null){lv=['#888D96','提示'];head='资金加权收益暂不可用';detail='IRR 在该现金流形态下无定义（现金流未变号或未收敛），故显示破折号。';}
+ else if(g>0){lv=['#E8B339','留意'];head='你的钱表现弱于策略本身 · 典型行为缺口';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）落后于策略本身（时间加权 ${pct(S.curReturn)}）。机制上倾向在走平或下跌前加仓——这正是经典的“行为缺口”：追近期强势（过度外推）或下跌后犹豫（近视损失厌恶）。`;}
+ else if(g<0){lv=['#4FB286','良好'];head='你的钱表现优于策略本身';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）跑赢了策略本身（时间加权 ${pct(S.curReturn)}）。机制上你净在上涨前加仓，本窗口择时较好——但单一窗口是小样本，可能含运气成分，别据此过度自信。`;}
+ else {lv=['#888D96','提示'];head='加仓节奏基本中性';detail='本窗口入金时点对结果影响不大。';}
+ const tip='💡 TWR 评判你的选股 / 策略本身，MWR + 本金桥评判你的钱实际经历，指数对比看相对大盘——三者回答的是不同问题。';
+ const link=`<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;rebal&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">看到不喜欢的缺口？趁冷静先去“再平衡计划”给自己预设一条规则。</span>`;
+ const gapCard=`<div class="card" style="border-left:3px solid ${lv[0]}">
+   <div class="dh"><span class="t">${head}</span><span class="chip" style="color:${lv[0]};border-color:${lv[0]}66">${lv[1]}</span></div>
+   <div class="note" style="color:var(--txt);line-height:1.6;margin-top:4px">${detail}</div>
+   <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.6">${tip}<br>${link}</div>
+   <div class="note" style="margin-top:6px;opacity:.65">Thaler 2016 · p.1582 / p.1592</div></div>`;
+ return `<div class="card">
+   <div class="dh"><span class="t">真金白银桥</span><span class="nm">本金 → 盈亏 → 当前市值（美元口径，回避百分比错觉）</span></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
+   <div class="note" style="margin:8px 0 6px;line-height:1.6">恒等式：持仓成本 ${fmt(B.heldCost)} ＋ 未实现 ＝ 当前市值 ${fmt(B.terminal)}（券商口径，精确）。下面按<b>美元</b>拆出你的盈亏分桶（同一零线、同一刻度，等额盈亏长度相同、不放大亏损）；未实现已在当前市值里，已实现/股息/期权为已落袋现金，故并列展示、不叠加进市值。</div>
+   ${legsHtml}
+   <div class="note" style="margin-top:10px;line-height:1.6">仅股票口径（不含现金/保证金，为资金加权<b>权益账面</b> XIRR，非账户级）。未实现为券商精确，已实现为窗口内均价口径（含估算）；两者时间口径不同（未实现含建仓前浮盈，已实现仅本窗口）。累计入金约 ${fmt(B.lifeDeposits)}（净值还含“开始追踪入金前”已持有的仓位，故高于入金额）。单一窗口为小样本、描述性非预测。<b>非投资建议。</b></div>
+ </div>${gapCard}`;
+}
 function renderOverview(){
  const ser=DATA.series||[],right=document.getElementById('right');
  if(ser.length<2){right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
@@ -1378,7 +1514,11 @@ function renderOverview(){
  const cards=[
   ['当前持仓市值',fmt(S.netWorthNow)],
   ['期初持仓市值',fmt(S.netWorthStart)],
-  ['区间收益率 (时间加权)',`<span class="${cls(pr)}">${pct(pr)}</span>`],
+  ['区间收益率 · 时间加权',`<span class="${cls(pr)}">${pct(pr)}</span> <span class="note">选股策略本身</span>`],
+  ['区间收益率 · 资金加权 MWR',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span> <span class="note">你的钱实际经历</span>`],
+  ['年化资金加权 XIRR',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span>`],
+  /* gap tile colored by NEGATED gap on purpose: +gap = dollars lagged TWR -> red. Do NOT change to cls(S.behaviorGap). */
+  ['行为缺口 · 时间−资金加权',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
@@ -1392,7 +1532,7 @@ function renderOverview(){
  </div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
    <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#4FB286">绿=强(>15)</span> / <span style="color:#E8B339">黄=中性</span> / <span style="color:#E5707A">红=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
-   ${nwChart(ser)}</div>
+   ${nwChart(ser)}</div>${bridgeCard()}
  </div>
  <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
  <div class="seg" data-seg="cmp" hidden>

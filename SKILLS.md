@@ -368,10 +368,48 @@ reset the active tab). Validate: `capTargets` sums to 100 with no name > cap;
 Scoped out for now (follow-ups): editable per-name custom targets, relative-band
 mode, glide scheduler/calendar, cross-device sync, print/export.
 
+## Money-weighted return + dollar bridge (IMPLEMENTED)
+
+Added to the default **净值** overview tab (designed by an agent-team workflow
+that read the book). The user deposits heavily/irregularly (~58% of base
+mid-window), so TWR (the deposit-neutral "strategy" metric) and what their own
+dollars earned diverge — the time-weighted vs dollar-weighted **behavior gap**.
+Book grounding: putting MWR *beside* TWR is the de-bracketing move (narrow
+framing, p.1582); the dollar bridge defeats %-money-illusion on a moving base
+(p.1595) and honors mental-accounting buckets (p.1592).
+
+- **`xirr(flows)`** (pure stdlib, before `compute_risk`): Newton + bisection
+  fallback; returns `None` (caller shows "—") when undefined — <2 flows, span
+  <14d, no sign change, or non-convergence. Never fabricates.
+- **Equity-book flows** (NOT account-level — cash/margin over time untracked,
+  which would be Thaler's "fudge factor" p.1593): `−V0` at dmin (V0 =
+  `series[0].value`, equity market value at start) + each in-window trade's
+  **already-signed** amount (BUY −, SELL +; **only trades dated > dmin**, else
+  they double-count V0) + dividends + terminal (`marketValue`) at dmax+2d.
+- `summary.mwrPeriod` (period MWR), `mwrAnnual` (annualized XIRR, **suppressed if
+  span <60d**), `behaviorGap = curReturn − mwrPeriod`. Current data: TWR +10.9%,
+  MWR +16.7%, XIRR +47.5%, gap **−5.8pp** (dollars *beat* the strategy → deposits
+  were timed before up-moves; flagged "good", with a single-window-luck caveat).
+- **Tiles**: TWR / MWR / XIRR / gap, each %-with-a-note. The gap tile is colored
+  by `cls(-behaviorGap)` ON PURPOSE (+gap = dollars lagged → red); a code comment
+  says so — don't "fix" it to `cls(behaviorGap)`.
+- **`bridgeCard()` (真金白银桥)** — plain-DOLLAR, EXACT (no fudge): the identity
+  `持仓成本 + 未实现 = 当前市值` (broker-exact) plus the four P&L buckets
+  (unrealized券商精确 / realized含估算 / dividends / options) as shared-zero-scale
+  diverging bars summing to a 合计盈亏 line. Anchored on COST, never the
+  market-value V0 — anchoring on V0 double-counts pre-window embedded gains and
+  produced a misleading ~$4.9k residual; the cost anchor reconciles to the cent.
+- TWR chain is untouched (additive only). Validate: `xirr` unit cases
+  (−100→+110@1y≈0.10; no-sign-change/single/short → None); `capitalIn`-style
+  identity gates; `node --check`; mocked-DOM smoke test incl. the `behaviorGap=null`
+  em-dash path.
+
+TWR judges the *strategy*; MWR + the bridge judge *your money*; 指数对比 judges
+*vs the market* — three different questions, co-located so they can't be framed
+in isolation. Equity-only; 非投资建议.
+
 ## Extension ideas (not yet built)
 
-- Money-weighted return (IRR/XIRR) alongside TWR (heavy irregular depositor →
-  TWR and lived dollar experience diverge).
 - Include cash & option mark-to-market in net worth (needs reliable cash-balance
   history + option price history — both currently messy); would also upgrade the
   risk lens from equity-only to whole-account/leverage risk.
