@@ -491,6 +491,114 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
              "top5Weight": round(top5, 1), "hhi": round(hhi, 3)}
     return {"flags": flags, "stats": stats}
 
+# ---------------------------------------------------------------- risk
+def compute_risk(series, stocks):
+    """Realized in-window RISK to sit beside the return gauge. Computed on the
+    time-weighted-return basis (the daily `ret` series), NOT series[].value —
+    value mixes in deposits/trades and would overstate drawdown wrongly. Returns:
+      annVol/spAnnVol  annualized stdev of daily TWR (×√252), portfolio vs S&P
+      beta             cov(port, sp)/var(sp) over aligned daily returns
+      maxDrawdown      deepest peak-to-trough on the cumulative TWR curve (+dates)
+      currentUnderwater  how far below the high-water mark right now
+      uwSeries         daily underwater % (portfolio + S&P) for the red chart
+      volSeries        21-day rolling annualized vol (portfolio + S&P)
+      contrib          per-holding risk-contribution: dollar weight vs share of
+                       portfolio volatility (marginal contribution, sums to 100%)
+    Equity-only & DESCRIPTIVE (small-sample covariance — not a forecast). None if
+    <25 days of curve or no held names. Pure stdlib (no numpy) — zero-dep ethos."""
+    import statistics
+    if len(series) < 25:
+        return None
+    cum = [1 + (p.get("ret") or 0) / 100 for p in series]
+    spcum = [1 + (p.get("sp500") or 0) / 100 for p in series]
+    r = [cum[i] / cum[i - 1] - 1 for i in range(1, len(cum))]
+    spr = [spcum[i] / spcum[i - 1] - 1 for i in range(1, len(spcum))]
+    rt = 252 ** 0.5
+
+    def underwater(c):
+        peak, out = c[0], []
+        for v in c:
+            peak = max(peak, v)
+            out.append((v / peak - 1) * 100 if peak else 0.0)
+        return out
+    uw, spuw = underwater(cum), underwater(spcum)
+    uwSeries = [{"date": series[i]["date"], "uw": round(uw[i], 2), "spuw": round(spuw[i], 2)}
+                for i in range(len(series))]
+    maxdd = min(uw); mddi = uw.index(maxdd)
+    peaki = cum.index(max(cum[:mddi + 1]))
+    cur_uw = uw[-1]
+    annVol = statistics.pstdev(r) * rt * 100 if len(r) >= 2 else 0.0
+    spAnnVol = statistics.pstdev(spr) * rt * 100 if len(spr) >= 2 else 0.0
+    beta = None
+    nb = min(len(r), len(spr))
+    if nb >= 3:
+        ra, sa = r[-nb:], spr[-nb:]
+        mr, ms = sum(ra) / nb, sum(sa) / nb
+        cov = sum((ra[i] - mr) * (sa[i] - ms) for i in range(nb)) / nb
+        var = sum((sa[i] - ms) ** 2 for i in range(nb)) / nb
+        beta = cov / var if var else None
+    cumret = series[-1].get("ret") or 0
+    retVolRatio = cumret / annVol if annVol else 0.0
+
+    volSeries = []
+    for t in range(len(series)):
+        if t >= 21:
+            w, sw = r[t - 21:t], spr[t - 21:t]
+            volSeries.append({"date": series[t]["date"],
+                              "vol": round(statistics.pstdev(w) * rt * 100, 2) if len(w) >= 2 else None,
+                              "spvol": round(statistics.pstdev(sw) * rt * 100, 2) if len(sw) >= 2 else None})
+        else:
+            volSeries.append({"date": series[t]["date"], "vol": None, "spvol": None})
+
+    # per-holding risk contribution (marginal contribution to portfolio vol)
+    axis = [p["date"] for p in series]
+    held = [s for s in stocks if s["held"]]
+    tot_val = sum(s["value"] for s in held) or 1.0
+    names, excluded = [], []
+    for s in held:
+        pm = dict(s.get("prices", []))
+        overlap = sum(1 for d in axis if d in pm)
+        first = next((pm[d] for d in axis if d in pm), None)
+        if overlap < 30 or first is None:
+            excluded.append(s["sym"]); continue
+        closes, last = [], first
+        for d in axis:
+            if d in pm:
+                last = pm[d]
+            closes.append(last)
+        rr = [closes[i] / closes[i - 1] - 1 if closes[i - 1] else 0.0 for i in range(1, len(closes))]
+        names.append({"sym": s["sym"], "w": s["value"] / tot_val, "r": rr})
+
+    contrib = []
+    if names:
+        m, T = len(names), len(names[0]["r"])
+        means = [sum(nm["r"]) / T for nm in names]
+        Sigma = [[0.0] * m for _ in range(m)]
+        for a in range(m):
+            for b in range(a, m):
+                cov = sum((names[a]["r"][k] - means[a]) * (names[b]["r"][k] - means[b]) for k in range(T)) / T
+                Sigma[a][b] = Sigma[b][a] = cov
+        w = [nm["w"] for nm in names]
+        Sw = [sum(Sigma[a][b] * w[b] for b in range(m)) for a in range(m)]
+        pvar = sum(w[a] * Sw[a] for a in range(m))
+        pvol = pvar ** 0.5
+        if pvol > 0:
+            mcr = [w[a] * Sw[a] / pvol for a in range(m)]
+            tot = sum(mcr) or 1.0
+            for a in range(m):
+                rc = mcr[a] / tot * 100
+                contrib.append({"sym": names[a]["sym"], "weightPct": round(w[a] * 100, 1),
+                                "riskPct": round(rc, 1), "gap": round(rc - w[a] * 100, 1)})
+            contrib.sort(key=lambda c: -c["riskPct"])
+
+    return {"annVol": round(annVol, 1), "spAnnVol": round(spAnnVol, 1),
+            "beta": (round(beta, 2) if beta is not None else None),
+            "maxDrawdown": round(maxdd, 1), "maxDDpeak": series[peaki]["date"],
+            "maxDDtrough": series[mddi]["date"], "currentUnderwater": round(cur_uw, 2),
+            "retVolRatio": round(retVolRatio, 2), "uwSeries": uwSeries, "volSeries": volSeries,
+            "contrib": contrib, "excluded": excluded,
+            "basisNote": "equity-only TWR basis; excludes cash/margin/options"}
+
 # ---------------------------------------------------------------- engine
 def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0):
     tot_buy, tot_sell = totals
@@ -631,8 +739,9 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
                "netWorthStart": series[0]["value"] if series else 0}
     behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
+    risk = compute_risk(series, stocks)
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
-            "portfolioFib": portfolio_fib, "behavior": behavior}
+            "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1273,7 +1382,7 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button></div>
+ <div class="seg-rail"><button class="on" data-seg="nw">净值</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button></div>
  <div class="seg" data-seg="nw">
  <div class="card">
    <div class="dh"><span class="t">组合总览</span><span class="nm">持仓市值与收益率（股票部分，不含现金/期权）</span></div>
@@ -1290,7 +1399,8 @@ function renderOverview(){
    ${svgLines(ser,[{key:'ret',color:'#E8B339'},{key:'sp500',color:'#888D96',dash:1},{key:'nasdaq',color:'#E8B339',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>
  </div>
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
- <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>`;
+ <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
+ <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>`;
  segWire();
 }
 function resonanceCard(){
@@ -1393,6 +1503,38 @@ function behaviorCard(){
      <div class="note" style="margin-top:6px;opacity:.65">${f.ref}</div></div>`;}).join('');
  return `<div class="card"><div class="dh"><span class="t">行为决策辅助</span><span class="nm">基于 Thaler《行为经济学：过去、现在与未来》(2016)</span></div>
    <div class="note" style="margin-top:6px;line-height:1.6">以下信号由<b>你自己的真实买卖与持仓</b>计算而来，用于发现常见的行为偏差。它们是<b>“提醒”而非投资建议</b>——目的是帮你按既定逻辑决策、少受“红/绿盘”情绪左右。</div></div>${cards}`;
+}
+function riskCard(){
+ const R=DATA.risk;
+ if(!R)return'<div class="card"><div class="dh"><span class="t">风险</span></div><div class="note">风险数据不足（需 ≥25 个交易日）。</div></div>';
+ const volCls=R.annVol>R.spAnnVol?'neg':'pos';
+ const badges=[
+  ['年化波动率',`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol.toFixed(1)}%</span>`],
+  ['Beta β (vs S&P)',R.beta==null?'—':`<span class="${R.beta>1?'neg':'pos'}">${R.beta.toFixed(2)}</span>`],
+  ['最大回撤',`<span class="neg">${R.maxDrawdown.toFixed(1)}%</span>`],
+  ['当前回撤',`<span class="${cls(R.currentUnderwater)}">${R.currentUnderwater.toFixed(1)}%</span>`],
+  ['收益/波动比',`${R.retVolRatio.toFixed(2)} <span class="note">(rf=0)</span>`],
+ ];
+ const rows=(R.contrib||[]).map(c=>{const g=c.gap,gc=g>0?'#E5707A':'#4FB286',w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
+   return `<tr style="cursor:pointer" onclick="sel='${c.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+     <td class="l">${c.sym}</td><td>${c.weightPct.toFixed(1)}%</td><td>${c.riskPct.toFixed(1)}%</td>
+     <td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td>
+     <td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}</td></tr>`;}).join('');
+ const exNote=(R.excluded&&R.excluded.length)?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险分解：${R.excluded.join('、')}</div>`:'';
+ return `<div class="card">
+   <div class="dh"><span class="t">风险</span><span class="nm">回撤 · 波动率 · Beta · 风险贡献（股票部分，不含现金/保证金/期权）</span></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>
+ <div class="card"><div style="font-weight:650;margin-bottom:4px">水下回撤曲线（相对历史高点回撤 %）</div>
+   <div class="legend"><span><i style="background:#E5707A"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span>0 = 创新高；越深 = 离高点越远（你真正“感受到”的亏损维度）</span></div>
+   ${svgLines(R.uwSeries,[{key:'uw',color:'#E5707A'},{key:'spuw',color:'#888D96',dash:1}],{zero:true,area:true,fmt:v=>v.toFixed(0)+'%'})}
+   <div class="note" style="margin-top:6px">最大回撤 <span class="neg">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
+ <div class="card"><div style="font-weight:650;margin-bottom:4px">21 日滚动年化波动率</div>
+   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span></div>
+   ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339'},{key:'spvol',color:'#888D96',dash:1}],{fmt:v=>v.toFixed(0)+'%'})}</div>
+ <div class="card"><div class="dh"><span class="t">风险贡献分解</span><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th></tr></thead>
+   <tbody>${rows}</tbody></table></div>${exNote}
+   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。<b>非投资建议。</b></div></div>`;
 }
 function fibChart(s,fmtY){
  const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';

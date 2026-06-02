@@ -295,13 +295,52 @@ smoke test (stub `document`/`MutationObserver`, then call `portfolioFibCard()`,
 `positionSignalsCard()`, `behaviorCard()`, `renderOverview()`, `renderFib()`) to
 catch ReferenceErrors that `node --check` can't.
 
+## Risk lens (IMPLEMENTED)
+
+`compute_risk(series, stocks)` → `payload["risk"]`, drawn in the overview "风险"
+tab. Adds the gauge the dashboard structurally lacked: **how much risk** earned
+the return. Grounded in Thaler 2016 — myopic loss aversion / equity-premium
+puzzle (p.1594-95) and the loss-averse value function (p.1592): drawdown frames
+performance against the high-water reference the user actually feels, and giving
+risk equal visual billing fixes the salience asymmetry (return was loud, risk
+silent → overconfidence).
+
+- **Basis = the TWR `ret` series, NOT `series[].value`.** value mixes in
+  deposits/trades; using it would report the wrong drawdown (−8.2% vs the correct
+  TWR −11.1%). Daily returns are reconstructed from cumulative `ret`:
+  `cum_i = 1+ret_i/100`, `r_i = cum_i/cum_{i-1}−1`. (Mirrors the TWR rationale in
+  CLAUDE.md — never use value_today/value_yesterday.)
+- **Metrics**: annualized vol (`pstdev(r)·√252`) vs S&P, beta (`cov/var` vs S&P),
+  max drawdown + peak/trough dates, current underwater %, naive return/vol (rf=0).
+- **Underwater curve** (portfolio + S&P) via `svgLines(..., {zero:true,area:true})`
+  — the area+zero support already in svgLines gives the red underwater shape free.
+- **21-day rolling annualized vol** (portfolio + S&P).
+- **Risk-contribution table** (the centerpiece): each holding's *dollar weight*
+  vs its *share of portfolio volatility* (marginal contribution `w·(Σw)/√(wΣw)`,
+  normalized to sum 100%). Surfaces that **weight ≠ risk** — e.g. on the Jun-01
+  data NVDA 24%→30% risk (+5.4), **MU 6%→14% risk (+8.2, a hidden driver)**, VOO
+  18%→9% risk (−9.0, the diversifier). Covariance is pure-stdlib (no numpy);
+  names with <30 days of price overlap are excluded + footnoted.
+- **Scope (state it in the card)**: equity-only & DESCRIPTIVE of realized
+  in-window risk — not a forecast, and it excludes cash/margin/options so it
+  **understates** true leveraged risk. `None` if <25 days or no holdings.
+
+Validate: `compute_risk` sanity gates — `Σ riskPct ≈ 100`, `maxDrawdown ≤
+currentUnderwater ≤ 0`; then the standard `node --check` + mocked-DOM smoke test
+(`riskCard()`, `renderOverview()`).
+
 ## Extension ideas (not yet built)
 
+- **Rebalancing planner / target weight bands** — the natural next step now that
+  risk-weight exists: a Thaler "commitment device" (defaults / Save More
+  Tomorrow) that lets the user pre-set per-name bands and nudges on drift.
+- Money-weighted return (IRR/XIRR) alongside TWR (heavy irregular depositor →
+  TWR and lived dollar experience diverge).
 - Include cash & option mark-to-market in net worth (needs reliable cash-balance
-  history + option price history — both currently messy).
-- Money-weighted return (IRR/XIRR) as an alternative to TWR.
+  history + option price history — both currently messy); would also upgrade the
+  risk lens from equity-only to whole-account/leverage risk.
 - Export per-stock chart to PNG, or full data to Excel.
-- Sector grouping / allocation treemap.
+- Sector grouping / allocation treemap (needs sector metadata — not fetched yet).
 - True realized P&L if a full-history export (from inception) becomes available
   — then drop the legacy-estimate seeding entirely.
 
