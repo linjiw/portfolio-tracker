@@ -647,6 +647,37 @@ passive listener; `updateCtx()` called from both render fns + segWire). **Presen
 --check` + a mocked-DOM smoke test (`bindCharts` once-guard + idempotency,
 `CHARTREG` populates dates+rows and resets per render, `updateCtx`).
 
+## Full-dashboard audit + design system (canonical)
+
+A 7-agent workflow walked every section/tab/panel for consistency + correctness
+and scored it **7.5/10** ("a high-floor product one cleanup pass from 8.5–9").
+**Canonical "Graphite Atelier" system — keep every new panel inside it:**
+- Surfaces `--bg/--bg2/--panel/--panel2`; lines `--line/--hair`; text
+  `--txt/--mut/--faint`. ONE chromatic accent `--accent` #E8B339 (amber),
+  rationed for live/active/you-are-here. `--green/--red` reserved STRICTLY for
+  P&L sign / good-bad — **cash & $0 / −0 are neutral (`--mut`), never green**.
+- Fonts: `--f-disp` titles/symbols, `--f-ui` labels/body/notes, `--f-mono` every
+  numeral. Components: `.card`+`.dh(.t/.nm)`, `.badges/.badge`, `.scroll>table`,
+  `.frow`+`.fbar/.z/.p`, `.chip`, `.note`, `.legend`, `.seg-rail`, `.gl`+`#tt`.
+- Units: excess-vs-benchmark = **percentage points via `ppf()`** everywhere
+  (`+4.54pp`), never `%`; `pct()`/`fmt()` are null-safe (`—`).
+- **Foot-gun**: `.card>div[style*="font-weight:650"]` is a substring caption
+  normalizer — real hero/severity figures use `.hero-fig`/`.flag-head` (no inline
+  `font-weight:650`) to escape it; use `.cap` for new captions.
+
+Bugs fixed from the audit: option expiry/assignment legs (side `?`) now tag
+**到期/行权** (were mislabeled 卖出); the `<21`-price-day 斐波那契 tab renders a
+**fallback note** (was blank); the normalizer no longer shrinks the 期权毛敞口
+hero or strips behavior-flag colors; `$0`/`−0` no longer render green; scorecard
+rows are keyboard-operable; disclaimer wording unified to 非投资建议.
+
+**Gap vs the Investor-Maturity-Cockpit vision** (9 exist / 5 partial / 2 missing):
+strong on truth/risk-before-return/behavior/plain-language/no-advice/TWR-MWR-index/
+concentration/rebalance-rules. Partial: whole-account hero clarity, spread-aware
+options, single-system enforcement, a11y parity. **Missing (next worth building):
+an entry-time trade journal (thesis + emotion + plan-adherence — the Edgewonk/
+TradeZella differentiator) and benchmark breadth (factor/sector/peer).**
+
 ## Extension ideas (not yet built)
 
 - Export per-stock chart to PNG, or full data to Excel.

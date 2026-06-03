@@ -1409,11 +1409,18 @@ body.ready .row.sel .pnl,body.ready .row.sel .meta{animation:dataFlick .26s ease
 .dh .nm{font-family:var(--f-ui); color:var(--mut); font-size:11.5px; font-weight:400}
 
 /* a section caption helper to replace inline font-weight:650 divs (structural_changes #3) */
+/* NOTE: legacy caption normalizer — matches by inline-style substring, a foot-gun.
+   Real hero/severity figures (.hero-fig, .flag-head) deliberately drop the
+   "font-weight:650" inline token so they DON'T match this rule. Prefer .cap for
+   new section captions; do not add new inline font-weight:650 hero text. */
 .card>div[style*="font-weight:650"]{
   font-family:var(--f-ui)!important; font-size:11px!important;
   font-weight:600!important; text-transform:uppercase; letter-spacing:.07em;
   color:var(--mut)!important; padding-bottom:6px; border-bottom:1px solid var(--hair);
 }
+/* hero figure + flag headline opt OUT of the caption normalizer above (they must not match its [style*="font-weight:650"] selector) */
+.hero-fig{font-family:var(--f-mono); font-size:23px; font-weight:600; color:var(--txt); letter-spacing:-.01em}
+.flag-head{font-weight:650}
 
 /* ============================== BADGES ============================== */
 .badges{display:flex; gap:28px; row-gap:14px; flex-wrap:wrap; margin:18px 0 8px}
@@ -1694,7 +1701,8 @@ details[open] summary::before{content:"▾ "}
 const DATA = __DATA__;
 const fmt=(n,d=2)=>n==null?'—':(n<0?'-$':'$')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmtN=(n,d=0)=>n==null?'—':n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:Math.max(d,2)});
-const pct=n=>(n>=0?'+':'')+n.toFixed(2)+'%';
+const pct=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(2)+'%';
+const ppf=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(2)+'pp';   // percentage-point difference (excess vs benchmark) — one canonical unit everywhere
 const cls=n=>n>0?'pos':(n<0?'neg':'');
 const S=DATA.summary, D0=S.dateRange[0], D1=S.dateRange[1];
 document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</b> · 价格来自 Yahoo Finance · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
@@ -1703,7 +1711,7 @@ const kpis=[
  ['股票市值 (不含现金/期权)',fmt(S.marketValue),''],
  ['未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
  ['区间收益 (时间加权)',pct(S.curReturn),cls(S.curReturn)],
- ['超额 vs 标普',(S.spReturn==null?'—':(S.curReturn-S.spReturn>=0?'+':'')+(S.curReturn-S.spReturn).toFixed(1)+'pp'),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
+ ['超额 vs 标普',(S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
  ['期权毛敞口',(S.optMarkGross?fmt(S.optMarkGross)+' <span class="note">≈权益 '+S.optPctEquity+'%</span>':'—'),''],
  ['已实现盈亏 (窗口内·含估算)',fmt(S.realized),cls(S.realized)],
  ['期权净现金流',fmt(S.optNet),cls(S.optNet)],
@@ -1853,7 +1861,7 @@ function structureCard(){
  // Card 1: asset-class structure (always-on floor)
  const acRows=X.byAssetClass.map(b=>{const w=Math.min(b.weightPct,100);
    return `<div class="frow"><span class="fsym" style="width:130px">${b.bucket}</span>
-     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'#4FB286':'#E8B339'}"></div></div>
+     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'#888D96':'#E8B339'}"></div></div>
      <span style="width:60px;text-align:right">${b.weightPct.toFixed(1)}%</span>
      <span class="note" style="width:96px;text-align:right">${fmt(b.value)}</span></div>`;}).join('');
  const card1=`<div class="card"><div class="dh"><span class="t">资产类别结构</span><span class="nm">个股 vs 宽基ETF vs 主题ETF vs 杠杆 vs 商品 vs 现金 · 零额外数据，总是可得</span></div>${acRows}</div>`;
@@ -1907,7 +1915,7 @@ function scorecardCard(){
    if(d){const g=d.drift,gc=g>0?'#E5707A':'#4FB286',bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
      driftCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
    const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">${attn}</span>`:'<span class="note">—</span>';
-   const html=`<tr style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
      <td>${fmt(x.value)} <span class="note">${w.toFixed(1)}%</span></td>
      <td class="${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</td>
@@ -1928,13 +1936,13 @@ function wholeAccountCard(){
  const tiles=[['全账户净值',fmt(A.netWorthWhole)],['股票',fmt(A.equity)],['现金',fmt(A.cashTotal)],
    ['期权净·市价',`<span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span>`],['待结算',fmt(A.pending)]];
  const W=A.netWorthWhole||1,seg=(amt,c)=>amt>0?`<div style="width:${amt/W*100}%;background:${c}"></div>`:'';
- const bar=`<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin:10px 0 6px">${seg(A.equity,'#E8B339')}${seg(A.cashTotal,'#4FB286')}${seg(Math.max(0,A.optMarkNet),'#7F8794')}${seg(A.pending,'#555A63')}</div>`;
+ const bar=`<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin:10px 0 6px">${seg(A.equity,'#E8B339')}${seg(A.cashTotal,'#888D96')}${seg(Math.max(0,A.optMarkNet),'#7F8794')}${seg(A.pending,'#555A63')}</div>`;
  const cashRows=A.cash.map(c=>`<tr><td class="l">${c.acct}</td><td class="l">${c.sym}</td><td style="text-align:right">${fmt(c.value)}</td></tr>`).join('');
  return `<div class="card">
    <div class="dh"><span class="t">全账户净值</span><span class="nm">截至 ${A.asOf} · 股票＋现金＋期权按市价＋待结算（券商精确美元口径，非敞口/杠杆口径）</span></div>
    <div class="badges">${tiles.map(t=>`<div class="badge"><div class="l">${t[0]}</div><div class="v">${t[1]}</div></div>`).join('')}</div>
    ${bar}
-   <div class="legend"><span><i style="background:#E8B339"></i>股票</span><span><i style="background:#4FB286"></i>现金</span><span><i style="background:#7F8794"></i>期权净</span><span><i style="background:#555A63"></i>待结算</span></div>
+   <div class="legend"><span><i style="background:#E8B339"></i>股票</span><span><i style="background:#888D96"></i>现金</span><span><i style="background:#7F8794"></i>期权净</span><span><i style="background:#555A63"></i>待结算</span></div>
    <div class="note" style="line-height:1.6;margin-top:6px">恒等式：股票 ${fmt(A.equity)} ＋ 现金 ${fmt(A.cashTotal)} ＋ 期权净市价 ${fmt(A.optMarkNet)} ＋ 待结算 ${fmt(A.pending)} ＝ 全账户净值 ${fmt(A.netWorthWhole)}（四项皆券商当前价值，逐项相加，精确）。这是“净值”口径，不是“敞口/杠杆”口径——后者本导出无法计算（见下方期权敞口卡片）。</div>
    <div class="scroll" style="margin-top:8px"><table><thead><tr><th class="l">账户</th><th class="l">货币基金</th><th style="text-align:right">当前价值</th></tr></thead><tbody>${cashRows}<tr style="border-top:1px solid #1A1C21"><td class="l"><b>合计</b></td><td></td><td style="text-align:right"><b>${fmt(A.cashTotal)}</b></td></tr></tbody></table></div>
    <div class="note" style="margin-top:6px">现金仅含 Fidelity 货币基金核心(正)余额；<b>保证金借记(margin debit)余额不在本导出中</b>——若存在借记，本净值可能高估你的可动用现金。<b>非投资建议。</b></div>
@@ -1951,7 +1959,7 @@ function optionsExposureCard(){
  const tbl=`<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th class="l">数量</th><th style="text-align:right">当前市价</th><th class="l">账户</th></tr></thead><tbody>${legs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name}</td><td class="l">${fmtN(l.qty,0)}</td><td style="text-align:right" class="${cls(l.mark)}">${fmt(l.mark)}</td><td class="l">${l.type||'—'}</td></tr>`).join('')}</tbody></table></div>`;
  return `<div class="card" style="border-left:3px solid #E8B339">
    <div class="dh"><span class="t">期权敞口（隐藏杠杆）</span><span class="chip" style="color:#E8B339;border-color:#E8B33966">留意</span></div>
-   <div style="font-size:23px;font-weight:650;margin:6px 0 2px">期权总市值 GROSS ${fmt(A.optMarkGross)} <span style="font-size:13px;color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
+   <div class="hero-fig" style="margin:6px 0 2px">期权总市值（毛额/GROSS） ${fmt(A.optMarkGross)} <span style="font-size:13px;color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
    <div class="note" style="margin-bottom:8px">净市价仅 <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> —— 这是<b>盈亏口径</b>，不是你的敞口（小净值会掩盖大总额，Thaler p.1582）。</div>
    ${legsHtml}${tbl}
    <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。四条期权腿均在<b>保证金(Margin)账户</b>。<b>非投资建议。</b></div>
@@ -1996,7 +2004,7 @@ function insightBanner(){
  const guide=dismissed?`<span class="ib-lk" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
  const A=DATA.account,X=DATA.alloc,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
  const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" onclick="ovGo('${seg}')">${t} →</span>`;
- const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${al>=0?'+':''}${al.toFixed(1)}pp`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
+ const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
  const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
  const tr=(DATA.risk&&DATA.risk.contrib&&DATA.risk.contrib[0])?DATA.risk.contrib[0].sym:null;
  const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%，毛额·市价口径，净≈${fmt(A.optMarkNet)}，非 Delta/名义），未计入上方市值`:'';
@@ -2024,7 +2032,7 @@ function renderOverview(){
   ['择时帮了还是拖了 ('+gl('gap','行为缺口')+')',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
-  ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
+  ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${ppf(pr-sp)}</span>`],
  ];
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=onboardStrip()+insightBanner();
  right.innerHTML=`
@@ -2137,7 +2145,7 @@ function positionSignalsCard(){
  return `<div class="card"><div class="dh"><span class="t">持仓信号一览</span><span class="nm">按权重排序 · 趋势 / 动能 / RSI / 最近金死叉 / 共振（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>权重</th><th>状态</th><th>动能</th><th>RSI</th><th>最近信号</th><th>共振</th><th class="l">技术姿态</th></tr></thead>
    <tbody>${rows}</tbody></table></div>
-   <div class="note" style="margin-top:8px">“技术姿态”只是均线/动能/RSI 的客观描述，<b>非买卖建议</b>；金叉/死叉为 EMA5×13 快线交叉。</div></div>`;
+   <div class="note" style="margin-top:8px">“技术姿态”只是均线/动能/RSI 的客观描述，<b>非投资建议</b>；金叉/死叉为 EMA5×13 快线交叉。</div></div>`;
 }
 function behaviorCard(){
  const b=DATA.behavior;if(!b||!b.flags||!b.flags.length)return'<div class="card"><div class="note">行为分析数据不足。</div></div>';
@@ -2146,7 +2154,7 @@ function behaviorCard(){
    const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip" style="border-color:${c[0]}55">${e}</span>`).join('')}</div>`:'';
    return `<div class="card" style="border-left:3px solid ${c[0]}">
      <div class="dh"><span class="t">${f.title}</span><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
-     <div style="font-weight:650;color:${c[0]};margin:3px 0 6px">${f.headline}</div>
+     <div class="flag-head" style="color:${c[0]};margin:3px 0 6px">${f.headline}</div>
      <div class="note" style="color:var(--txt);line-height:1.55">${f.detail}</div>${ex}
      <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
      <div class="note" style="margin-top:6px;opacity:.65">${f.ref}</div></div>`;}).join('');
@@ -2313,7 +2321,7 @@ function fibChart(s,fmtY){
  return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function renderFib(s){
- const f=s.fib;if(!f)return'';
+ const f=s.fib;if(!f)return`<div class="card"><div class="dh"><span class="t">斐波那契动能分析</span><span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div><div class="note">价格数据不足（需 ≥21 个交易日），无法计算该股的斐波那契指标。新建仓或上市不久的标的会出现这种情况。</div></div>`;
  const n=f.now,sc=momColor(n.mom);
  const rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'#e6ecf5');
  const lastSig=(f.signals||[]).slice(-1)[0];
@@ -2471,7 +2479,7 @@ function bindCharts(){
 }
 function renderOptions(){
  if(!DATA.options.length)return'';
- const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':'<span class="tag s">卖出</span>'}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td class="${t.amount<0?'':'pos'}">${fmt(t.amount)}</td></tr>`).join('');
+ const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">到期/行权</span>')}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td class="${t.amount>0?'pos':''}">${fmt(t.amount)}</td></tr>`).join('');
    return `<details><summary>${o.sym} · 净现金流 <span class="${cls(o.net)}">${fmt(o.net)}</span></summary>
      <table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>合约</th><th>权利金</th><th>金额</th></tr></thead><tbody>${tr}</tbody></table></details>`;}).join('');
  return `<div class="card"><div style="font-weight:650;margin-bottom:6px">期权交易（净现金流合计 <span class="${cls(S.optNet)}">${fmt(S.optNet)}</span>）</div>${rows}</div>`;
