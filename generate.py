@@ -2036,7 +2036,7 @@ function renderOverview(){
  ];
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=onboardStrip()+insightBanner();
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
+ <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
  <div class="card">
@@ -2057,8 +2057,9 @@ function renderOverview(){
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
  <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
  <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
+ <div class="seg" data-seg="journal" hidden>`+journalCard()+`</div>
  <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
- segWire();wireRebal();restoreSeg('ov');bindCharts();updateCtx();
+ segWire();wireRebal();wireJournalTab();restoreSeg('ov');bindCharts();updateCtx();
 }
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
@@ -2280,6 +2281,138 @@ function wireRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');
  const sv=seg.querySelector('#rebSave');if(sv)sv.onclick=()=>{rebalSave();rerenderRebal();};
  const cl=seg.querySelector('#rebClear');if(cl)cl.onclick=()=>{if(rebalDraft.setOn&&!confirm('清除已保存的规则、退回建议默认？'))return;rebalClear();rerenderRebal();};}
 function rerenderRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(seg){seg.innerHTML=rebalancePlanner();wireRebal();}}
+/* ===== Trade Journal + Investor-Maturity layer (per-position, localStorage) ===== */
+let journalState=null, journalDraft=null;
+const J_DESTRUCT=['FOMO追高','报复','无聊'], J_CONSTRUCT=['冷静','坚定','纪律'];
+const jToday=()=>new Date().toISOString().slice(0,10);
+const jesc=s=>(s||'').replace(/</g,'&lt;');
+function journalLoad(){if(journalState)return journalState;try{const s=JSON.parse(localStorage.getItem('ptrak.journal.v1'));if(s&&s.entries&&typeof s.entries==='object'){journalState={v:1,entries:s.entries};return journalState;}}catch(e){}journalState={v:1,entries:{}};return journalState;}
+function journalEntry(sym){return journalLoad().entries[sym]||null;}
+function journalSaveEntry(sym,e){const st=journalLoad();e.updatedAt=jToday();st.entries[sym]=Object.assign({},st.entries[sym],e);journalState=st;try{localStorage.setItem('ptrak.journal.v1',JSON.stringify(st));}catch(err){}}
+function journalClearEntry(sym){const st=journalLoad();delete st.entries[sym];journalState=st;try{localStorage.setItem('ptrak.journal.v1',JSON.stringify(st));}catch(err){}}
+function isoWeek(d){d=new Date(Date.UTC(d.getFullYear(),d.getMonth(),d.getDate()));const day=d.getUTCDay()||7;d.setUTCDate(d.getUTCDate()+4-day);const y0=new Date(Date.UTC(d.getUTCFullYear(),0,1));const wk=Math.ceil(((d-y0)/86400000+1)/7);return d.getUTCFullYear()+'-W'+String(wk).padStart(2,'0');}
+function reviewLoad(){try{const s=JSON.parse(localStorage.getItem('ptrak.review.v1'));if(s&&s.weeks)return s;}catch(e){}return{v:1,weeks:{}};}
+function reviewGet(wk){return reviewLoad().weeks[wk]||null;}
+function reviewSave(wk,r){const st=reviewLoad();r.savedOn=jToday();st.weeks[wk]=Object.assign({},st.weeks[wk],r);try{localStorage.setItem('ptrak.review.v1',JSON.stringify(st));}catch(e){}}
+function reviewClear(wk){const st=reviewLoad();delete st.weeks[wk];try{localStorage.setItem('ptrak.review.v1',JSON.stringify(st));}catch(e){}}
+function journalComponents(){
+ const J=journalLoad().entries, held=stocks.filter(x=>x.held), ent=sym=>J[sym], vals=Object.keys(J).map(k=>J[k]);
+ const cnt=(arr,f)=>arr.filter(f).length;
+ // COVERAGE rates use the HELD denominator (a gap SHOULD drag the score down — anti-vanity).
+ const thesisCov={val:held.length?cnt(held,x=>ent(x.sym)&&ent(x.sym).thesis&&ent(x.sym).thesis.trim())/held.length:null,n:held.length,key:'thesisCov',label:'论点覆盖率'};
+ const jrnCov={val:held.length?cnt(held,x=>!!ent(x.sym))/held.length:null,n:held.length,key:'jrnCov',label:'日志覆盖率'};
+ // BEHAVIOR rates use the JOURNALED denominator (PENDING until the owner has tagged that field — don't punish unreached fields). Maintainer: do NOT "fix" this asymmetry.
+ const adhDen=cnt(vals,e=>e.adherence!=null), planAdh={val:adhDen?cnt(vals,e=>e.adherence==='在计划内')/adhDen:null,n:adhDen,key:'padh',label:'计划遵守率'};
+ const ckDen=cnt(vals,e=>e.checklist!=null), checklist={val:ckDen?cnt(vals,e=>e.checklist==='是')/ckDen:null,n:ckDen,key:'ckl',label:'清单完成率'};
+ const emoDen=cnt(vals,e=>e.emotion!=null), emoDisc={val:emoDen?1-cnt(vals,e=>J_DESTRUCT.indexOf(e.emotion)>=0)/emoDen:null,n:emoDen,key:'emo',label:'情绪纪律'};
+ return [thesisCov,planAdh,checklist,jrnCov,emoDisc];
+}
+function maturityScore(){const all=journalComponents(),c=all.filter(x=>x.val!=null);const anyEntry=Object.keys(journalLoad().entries).length>0;if(!anyEntry||!c.length)return{score:null,comps:all,weak:null};const score=Math.round(c.reduce((a,x)=>a+x.val,0)/c.length*100);const weak=c.slice().sort((a,b)=>a.val-b.val)[0];return{score,comps:all,weak};}
+function maturityBand(s){return s==null?'起步':(s>=90?'纪律化':(s>=75?'稳健':(s>=60?'成型中':(s>=40?'易受情绪左右':'主要靠运气'))));}
+function maturityCard(){
+ const m=maturityScore();
+ const bars=m.comps.map(c=>{const w=c.val==null?0:c.val*100;
+   return `<div class="frow"><span class="fsym" style="width:auto;min-width:120px">${gl(c.key,c.label)}</span>
+     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:#E8B339"></div></div>
+     <span class="fval" style="color:var(--txt)">${c.val==null?'待补':(c.val*100).toFixed(0)+'%'}</span>
+     <span class="fst">n=${c.n}</span></div>`;}).join('');
+ const weakLine=m.score==null?'记录第一条论点即可点亮评分。':(m.weak&&m.weak.val<0.9?`你的最大短板：${m.weak.label} 仅 ${(m.weak.val*100).toFixed(0)}%（n=${m.weak.n}）`:'流程很扎实，保持记录的连贯性即可。');
+ return `<div class="card" style="border-left:3px solid #E8B339">
+   <div class="dh"><span class="t">投资成熟度评分</span><span class="nm">只衡量你能控制的「流程」，与盈亏无关</span></div>
+   <div class="hero-fig" style="color:var(--txt);margin:4px 0 2px">${m.score==null?'起步':m.score}<span style="font-size:14px;color:var(--mut)">${m.score==null?' · 尚无足够日志':' / 100'}</span> <span class="chip" style="color:var(--mut);border-color:#2A2E36">${maturityBand(m.score)}</span></div>
+   <div class="note" style="margin:2px 0 8px">高分=流程纪律好，与赚不赚钱无关；一笔靠运气赚到的钱不会提高这个分数。<b>${weakLine}</b></div>
+   ${bars}</div>`;
+}
+function meanBy(arr,f){const xs=arr.map(f).filter(v=>v!=null&&isFinite(v));return xs.length?xs.reduce((a,b)=>a+b,0)/xs.length:null;}
+function killerStatCard(){
+ const J=journalLoad().entries, held=stocks.filter(x=>x.held);
+ const grp=tag=>held.filter(x=>J[x.sym]&&J[x.sym].adherence===tag);
+ const inn=grp('在计划内'), out=grp('计划外'), base=meanBy(held,x=>x.unrealPct);
+ if(!inn.length&&!out.length)return `<div class="card"><div class="dh"><span class="t">计划遵守 → 结果</span><span class="nm">在计划内 vs 计划外的平均结果</span></div><div class="note">给持仓标上「在计划内 / 计划外」后，这里会对比两组的平均结果。</div></div>`;
+ const bar=(label,g)=>{const m=meanBy(g,x=>x.unrealPct),small=g.length<3;const c=small?'#888D96':(m>=base?'#4FB286':'#E5707A');
+   const wd=m==null?0:Math.min(Math.abs(m-base),30)/30*50,left=(m!=null&&m>=base)?50:50-wd;
+   return `<div class="frow"><span class="fsym" style="width:auto;min-width:96px">${label}</span>
+     <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
+     <span class="fval" style="color:${c}">${m==null?'—':(m>=0?'+':'')+m.toFixed(1)+'%'}</span>
+     <span class="fst">n=${g.length}${small?' 样本不足':''}</span></div>`;};
+ return `<div class="card"><div class="dh"><span class="t">计划遵守 → 结果</span><span class="nm">${gl('killer','在计划内 vs 计划外')}的平均未实现%（基线=全部持仓均值 ${base==null?'—':(base>=0?'+':'')+base.toFixed(1)+'%'}）</span></div>
+   ${bar('在计划内',inn)}${bar('计划外',out)}
+   <div class="note" style="margin-top:8px">这是你自己过去交易的记录，不是买卖建议；任一组 n&lt;3 仅描述、不下结论。</div></div>`;
+}
+function emotionOutcomeCard(){
+ const J=journalLoad().entries, held=stocks.filter(x=>x.held);
+ const tags=J_DESTRUCT.concat(J_CONSTRUCT).filter(t=>held.some(x=>J[x.sym]&&J[x.sym].emotion===t));
+ if(!tags.length)return '';
+ const rows=tags.map(t=>{const g=held.filter(x=>J[x.sym]&&J[x.sym].emotion===t),m=meanBy(g,x=>x.unrealPct),small=g.length<3,dc=J_DESTRUCT.indexOf(t)>=0?'#E5707A':'#4FB286';
+   return `<tr style="${small?'color:var(--mut)':''}"><td class="l"><span style="color:${dc}">●</span> ${t}</td><td class="${small?'':cls(m)}">${m==null?'—':(m>=0?'+':'')+m.toFixed(1)+'%'}</td><td class="note">n=${g.length}${small?' 样本不足':''}</td></tr>`;}).join('');
+ return `<div class="card"><div class="dh"><span class="t">${gl('emoOut','情绪 → 结果')}</span><span class="nm">各情绪标签下持仓的平均未实现%</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">情绪</th><th>平均未实现%</th><th>样本</th></tr></thead><tbody>${rows}</tbody></table></div>
+   <div class="note" style="margin-top:8px">看到报复/追涨平均更差，不代表下次必然——小样本，仅描述你已有的交易。<b>非投资建议。</b></div></div>`;
+}
+function unjournaledWorklist(){
+ const J=journalLoad().entries, mv=S.marketValue||1;
+ const held=stocks.filter(x=>x.held).sort((a,b)=>b.value-a.value);
+ const todo=held.filter(x=>!J[x.sym]);
+ if(!todo.length)return `<div class="card"><div class="dh"><span class="t">待写日志</span></div><div class="note">✓ 所有持仓都已写下论点。保持下去。</div></div>`;
+ const rows=todo.map(x=>`<div class="frow jwork" data-jsym="${x.sym}" style="cursor:pointer"><span class="fsym">${x.sym}</span><span class="fval">${(x.value/mv*100).toFixed(1)}%</span><span class="fst">${fmt(x.value)}</span></div>`).join('');
+ return `<div class="card"><div class="dh"><span class="t">待写日志 · ${todo.length} 只</span><span class="nm">按权重排序（点开写论点）</span></div>${rows}
+   <div class="note" style="margin-top:8px">先给这些持仓写下论点，最能提高你的日志覆盖率。</div></div>`;
+}
+function weeklyReview(){
+ const wk=isoWeek(new Date()), r=reviewGet(wk)||{}, mv=S.marketValue, topH=stocks.filter(x=>x.held).sort((a,b)=>b.value-a.value)[0];
+ const heldN=stocks.filter(x=>x.held).length, cov=stocks.filter(x=>x.held&&journalEntry(x.sym)).length;
+ const facts=[['本周市值',fmt(mv)],['区间收益',pct(S.curReturn)],['超额 vs 标普',S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)],
+   ['最大回撤',DATA.risk?(DATA.risk.maxDrawdown.toFixed(1)+'%'):'—'],['行为缺口',S.behaviorGap==null?'—':(S.behaviorGap>0?'+':'')+S.behaviorGap.toFixed(2)+'pp'],
+   ['最大持仓',topH?topH.sym+' '+(topH.value/mv*100).toFixed(0)+'%':'—'],['本周日志覆盖',cov+'/'+heldN]];
+ const ta=(id,lbl,v)=>`<div style="margin:8px 0 2px;font-size:12px;color:var(--mut)">${lbl}</div><textarea id="${id}" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical">${jesc(v)}</textarea>`;
+ const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">本周复盘 · 保存于 ${r.savedOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">本周尚未复盘</span>`;
+ return `<div class="card"><div class="dh"><span class="t">每周复盘 · ${wk}</span><span class="nm">把复盘做成每周默认动作</span> ${stamp}</div>
+   <div class="badges">${facts.map(f=>`<div class="badge"><div class="l">${f[0]}</div><div class="v">${f[1]}</div></div>`).join('')}</div>
+   <div class="note" style="margin:6px 0">事实由面板自动带入——你无法事后改写，只能据此反思。</div>
+   ${ta('rvBest','本周最好的决策',r.best)}${ta('rvWorst','本周最差的决策',r.worst)}${ta('rvLesson','学到了什么',r.lesson)}${ta('rvDo','下周要做',r.doNext)}${ta('rvAvoid','下周要避免',r.avoidNext)}
+   <div style="margin-top:8px;display:flex;gap:8px"><button id="rvSave" style="padding:6px 14px;border-radius:7px;border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存本周复盘</button><button id="rvClear" style="padding:6px 14px;border-radius:7px;border:1px solid #2A2E36;background:transparent;color:#cfd3da;cursor:pointer">清除本周</button></div></div>`;
+}
+function journalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">怎么读 · 边界说明</summary>
+ <div class="note" style="margin-top:8px;line-height:1.65">成熟度评分<b>只看流程、不看盈亏</b>——靠运气赚的钱不会加分。小样本仅描述、非预测（任一分组 n&lt;3 不显示颜色结论）。<b>结果 ≠ 决策质量</b>：别用结果回头改写当时的论点（updatedAt 已标注写作日期；复盘与论点分两个字段正是为此）。不做多维交叉切片（避免在 情绪×周期×信念 里凑出偶然结论）。别过度记录：日志是为了执行计划，不是替代交易。日志与复盘<b>只存在本浏览器本设备</b>，不跨设备、不上传。<b>非投资建议。</b></div></details></div>`;}
+function journalCard(){return weeklyReview()+maturityCard()+killerStatCard()+emotionOutcomeCard()+unjournaledWorklist()+journalHonesty();}
+function wireJournalTab(){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg)return;
+ seg.querySelectorAll('.jwork').forEach(r=>r.onclick=()=>{const sym=r.dataset.jsym;try{localStorage.setItem('ptrak.seg.stk','journal');}catch(e){}sel=sym;renderList();window.scrollTo({top:0,behavior:'smooth'});});
+ const wk=isoWeek(new Date());
+ const sv=seg.querySelector('#rvSave');if(sv)sv.onclick=()=>{const g=id=>{const el=seg.querySelector('#'+id);return el?el.value:'';};
+   reviewSave(wk,{best:g('rvBest'),worst:g('rvWorst'),lesson:g('rvLesson'),doNext:g('rvDo'),avoidNext:g('rvAvoid'),
+     facts:{marketValue:S.marketValue,curReturn:S.curReturn,spReturn:S.spReturn,behaviorGap:S.behaviorGap,maxDrawdown:DATA.risk?DATA.risk.maxDrawdown:null}});
+   rerenderJournalTab();};
+ const cl=seg.querySelector('#rvClear');if(cl)cl.onclick=()=>{if(reviewGet(wk)&&!confirm('清除本周复盘？'))return;reviewClear(wk);rerenderJournalTab();};}
+function rerenderJournalTab(){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=journalCard();wireJournalTab();}}
+function positionJournalEditor(s){
+ if(journalDraft===null)journalDraft=Object.assign({},journalEntry(s.sym)||{});
+ const d=journalDraft;
+ const chip=(field,val,active)=>`<button data-jf="${field}" data-jv="${val}" style="padding:5px 11px;border-radius:7px;border:1px solid ${active?'#E8B339':'#2A2E36'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':'#cfd3da'};cursor:pointer;font-size:12px;margin:0 6px 6px 0">${val}</button>`;
+ const row=(lbl,body)=>`<div style="margin:9px 0"><div style="font-size:12px;color:var(--mut);margin-bottom:5px">${lbl}</div>${body}</div>`;
+ const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${v==null?'':v}" placeholder="${ph}" style="width:90px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:4px 7px;margin-right:8px">`;
+ const ck=(d.adherence==='计划外'&&((DATA.behavior&&DATA.behavior.biasBySym&&DATA.behavior.biasBySym[s.sym])||[]).some(b=>b.id==='disposition'))?`<div class="note" style="margin:6px 0;color:#E5707A">⚠ 处置效应 + 计划外卖出 = 信号叠加，值得复盘。</div>`:'';
+ const ck2=(d.conviction>=4&&d.planStop==null)?`<div class="note" style="margin:6px 0;color:#E8B339">⚠ 高信念却未设失效条件（“看到再说”反模式）。</div>`:'';
+ const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">论点写于 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">尚未记录 · 未保存</span>`;
+ return `<div class="card">
+   <div class="dh"><span class="t">交易日志 · ${s.sym}</span><span class="nm">大多是点选，目标 &lt; 1 分钟</span> ${stamp}</div>
+   ${row('论点（为什么买/持有）',`<textarea id="jThesis" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="buy 时写下卖出条件，让卖出由逻辑驱动而非红绿驱动">${jesc(d.thesis)}</textarea>`)}
+   ${row('计划（入场 · 目标 · 止损/失效）',num('jEntry',d.planEntry,'入场')+num('jTarget',d.planTarget,'目标')+num('jStop',d.planStop,'止损/失效'))}
+   ${row('信念',[1,2,3,4,5].map(v=>chip('conviction',v,d.conviction===v)).join(''))}
+   ${row('时间维度',['日内','波段','核心多年'].map(v=>chip('horizon',v,d.horizon===v)).join(''))}
+   ${row('情绪',J_CONSTRUCT.concat(J_DESTRUCT).map(v=>chip('emotion',v,d.emotion===v)).join(''))}
+   ${row('是否按计划',['在计划内','计划外'].map(v=>chip('adherence',v,d.adherence===v)).join(''))}
+   ${row('清单：若我现在空仓，会按这个价格、这个仓位重新买入它吗？',['是','否'].map(v=>chip('checklist',v,d.checklist===v)).join(''))}
+   ${ck}${ck2}
+   ${row('复盘（事后反思，独立于上面的论点）',`<textarea id="jLesson" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="别因为亏了就把当时合理的逻辑判成错的；判断决策看当时信息，不看结果。">${jesc(d.lesson)}</textarea>`)}
+   <div style="margin-top:8px;display:flex;gap:8px"><button id="jSave" style="padding:6px 14px;border-radius:7px;border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存日志</button><button id="jClear" style="padding:6px 14px;border-radius:7px;border:1px solid #2A2E36;background:transparent;color:#cfd3da;cursor:pointer">清除</button></div>
+   <div class="note" style="margin-top:8px">日志只存在本浏览器本设备，不跨设备同步。判断决策看当时信息、不看结果。<b>非投资建议。</b></div></div>`;
+}
+function wireJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg||!s)return;
+ seg.querySelectorAll('[data-jf]').forEach(b=>b.onclick=()=>{const f=b.dataset.jf;let v=b.dataset.jv;if(f==='conviction')v=+v;journalDraft[f]=(journalDraft[f]===v)?null:v;rerenderJournalEditor(s);});
+ [['jEntry','planEntry'],['jTarget','planTarget'],['jStop','planStop']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.onchange=()=>{journalDraft[f]=el.value===''?null:+el.value;};});
+ const sv=seg.querySelector('#jSave');if(sv)sv.onclick=()=>{const t=seg.querySelector('#jThesis'),l=seg.querySelector('#jLesson');if(t)journalDraft.thesis=t.value;if(l)journalDraft.lesson=l.value;journalSaveEntry(s.sym,journalDraft);journalDraft=Object.assign({},journalEntry(s.sym));rerenderJournalEditor(s);};
+ const cl=seg.querySelector('#jClear');if(cl)cl.onclick=()=>{if(journalEntry(s.sym)&&!confirm('清除这只持仓的日志？'))return;journalClearEntry(s.sym);journalDraft={};rerenderJournalEditor(s);};}
+function rerenderJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=positionJournalEditor(s);wireJournalEditor(s);}}
 function fibChart(s,fmtY){
  const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';
  const yl=fmtY||(v=>'$'+v.toFixed(0));
@@ -2359,7 +2492,7 @@ function renderFib(s){
 }
 function renderDetail(){
  if(sel==='__OV__'){renderOverview();return;}
- CHARTREG={};
+ CHARTREG={};journalDraft=null;   // per-symbol journal draft must not leak across stocks
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML='';   // banner is overview-only
  const s=stocks.find(x=>x.sym===sel);if(!s){document.getElementById('right').innerHTML='';return;}
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
@@ -2371,7 +2504,7 @@ function renderDetail(){
     <td class="${t.amount<0?'':'pos'}">${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
     <td class="${cls(t.realized)}">${t.realized==null?'—':fmt(t.realized)}</td></tr>`;}).join('');
  document.getElementById('right').innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button></div>
+ <div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button><button data-seg="journal" title="给这只持仓写下论点、计划与情绪（目标 <1 分钟）">日志</button></div>
  <div class="seg" data-seg="price">
  <div class="card">
    <div class="dh"><span class="t">${s.sym}</span><span class="nm">${s.name}</span>
@@ -2386,8 +2519,9 @@ function renderDetail(){
    <div class="scroll"><table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>数量</th><th>成交价</th><th>金额</th><th>持仓后</th><th>均价后</th><th>已实现</th></tr></thead>
    <tbody>${rows}</tbody></table></div></div>
  </div>
- <div class="seg" data-seg="fib" hidden>`+renderFib(s)+`</div>`;
- bindMarkers();segWire();restoreSeg('stk');bindCharts();updateCtx();
+ <div class="seg" data-seg="fib" hidden>`+renderFib(s)+`</div>
+ <div class="seg" data-seg="journal" hidden>`+positionJournalEditor(s)+`</div>`;
+ bindMarkers();segWire();restoreSeg('stk');bindCharts();updateCtx();wireJournalEditor(s);
 }
 function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail').forEach(rail=>rail.setAttribute('role','tablist'));
@@ -2406,6 +2540,13 @@ function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onbo
    <span style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var o=document.getElementById('onboard');if(o)o.remove()">不再显示 ✕</span></div>`;}
 /* ===== plain-language glossary: hover/tap any .gl term -> reuse the #tt tooltip ===== */
 const GLOSS={
+ thesisCov:'论点覆盖率：写了买入逻辑的持仓 ÷ 全部持仓。没论点的仓位无法事后复盘，会拉低成熟度评分。',
+ padh:'计划遵守率：标记“在计划内”的笔数 ÷ 有标记的笔数。衡量冷静时的计划有没有被上头时推翻。',
+ ckl:'清单完成率：下单前过了“若空仓今天还会买吗”这条检查的比例。',
+ jrnCov:'日志覆盖率：写过任何日志的持仓 ÷ 全部持仓。赚钱但没记录的一周会降低覆盖率、从而降低评分（反虚荣）。',
+ emo:'情绪纪律：1 − 破坏性情绪（FOMO追高/报复/无聊）占比。下单时少被情绪驱动的程度。',
+ killer:'计划遵守 → 结果：按计划 vs 拍脑袋两组的平均结果差。这是你自己的记录，不是买卖信号；小样本仅描述。',
+ emoOut:'情绪 → 结果：各情绪标签下持仓的平均未实现%。看见报复/追涨平均更差，但小样本不预测未来。',
  TWR:'时间加权收益率：剔除你出入金时点的影响，衡量选股 / 策略本身的好坏。',
  MWR:'资金加权收益率：把你真实的出入金时点算进去，是你的钱实际经历的回报。',
  XIRR:'按真实出入金现金流求出的年化资金加权收益率（仅股票账面口径）。',

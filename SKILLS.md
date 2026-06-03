@@ -368,6 +368,72 @@ reset the active tab). Validate: `capTargets` sums to 100 with no name > cap;
 Scoped out for now (follow-ups): editable per-name custom targets, relative-band
 mode, glide scheduler/calendar, cross-device sync, print/export.
 
+## Trade Journal + Investor-Maturity engine (IMPLEMENTED)
+
+A behavioral "maturity engine": per-position thesis/plan/emotion tags, plan-
+adherence analytics, a process-not-profit **maturity score**, and a weekly
+review. Two surfaces — Overview "交易日志" tab (the cockpit) and each stock's
+"日志" tab (the 1-minute editor). Designed by an agent-team workflow that read
+Thaler; grounded in Edgewonk/TradeZella plan-adherence + emotion tagging.
+
+- **Decision quality ≠ outcome quality** (the core anti-vanity move): the score
+  measures *process* (did you write a thesis, set a plan, follow it, stay calm,
+  use a checklist) — never P&L. The hero number is `var(--txt)`, bars are amber
+  `#E8B339` ONLY. Green/red (`--green`/`--red`) is forbidden anywhere on the
+  score — they stay reserved STRICTLY for P&L sign elsewhere. (Enforced by a
+  smoke-test assertion that no `#4FB286`/`#E5707A`/`var(--green|red)` appears
+  near `hero-fig`.)
+- **Five components**, mean of the non-pending ones ×100 → `maturityScore()`:
+  `thesisCov` (论点覆盖), `jrnCov` (日志覆盖), `padh` (计划遵守率), `ckl`
+  (检查清单), `emo` (情绪克制). **Deliberate asymmetric denominators** (see the
+  maintainer comment): *coverage* uses the **held** denominator (you can't get
+  credit for un-journaled positions), but *behavior rates* use the **journaled**
+  denominator (only judge what you actually logged). The lowest non-pending
+  component is surfaced as the "最弱一环" to improve next.
+- **No fake 0/100** (no-data honesty): with zero entries `maturityScore()`
+  returns `null` and the card renders a "起步" state — never a discouraging fake
+  0 before the user has begun. `maturityBand()` labels 主要靠运气 / 成型中 /
+  成熟 / 大师 once there's data.
+- **Killer stat** (`killerStatCard()`): mean `unrealPct` of **在计划内** vs
+  **计划外** decisions, against the held-mean baseline — the single number that
+  shows whether following your own plan paid. **n<3 per bucket → suppressed**
+  (shows a "样本不足" note, never a noisy 1-sample claim).
+- **Emotion → outcome** (`emotionOutcomeCard()`): groups entries by emotion tag
+  (destructive FOMO追高/报复/无聊 vs constructive 冷静/坚定/纪律) and shows mean
+  outcome per tag — makes "报复性交易亏钱" visible in your *own* data.
+- **Converging-evidence nudges** (in `positionJournalEditor()`): a soft chip
+  fires only when two signals agree (e.g. disposition pattern + 计划外, or
+  conviction≥4 with no stop set) — never a single-signal alarm.
+- **Weekly review** (`weeklyReview()`, `ptrak.review.v1` keyed by ISO week): auto
+  facts (`.badges`) + 5 free-text prompts (best/worst/lesson/do/avoid). Thaler:
+  scheduled reflection counters hindsight bias.
+- **Un-journaled worklist** (`unjournaledWorklist()`): held names with no entry,
+  each a `.jwork` row that jumps to that stock's editor (sets `ptrak.seg.stk=
+  'journal'`, selects the symbol, re-renders) — closing the coverage gap is one
+  click.
+
+Storage: **per-position, localStorage, single-device** — `ptrak.journal.v1`
+(entries keyed by symbol) + `ptrak.review.v1` (weekly notes). State this to the
+user: the journal does **not** sync across devices/browsers and is not in git.
+`journalLoad`/`journalSaveEntry`/`journalClearEntry` + `reviewGet`/`reviewSave`
+mirror the rebal persistence pattern. Wiring re-renders **only** its own seg
+(`wireJournalTab`/`rerenderJournalTab` on Overview, `wireJournalEditor(s)`/
+`rerenderJournalEditor(s)` per stock) — never `renderOverview`/`renderDetail`
+(which would reset the active tab). `renderDetail()` resets `journalDraft=null`
+so a per-symbol draft never leaks across stocks.
+
+**ZERO Python / payload footprint** — pure presentation over the existing
+payload, so the equity verification gate stays byte-stable. Validate: `node
+--check`; mocked-DOM smoke (`localStorage` stub) that `journalCard`,
+`positionJournalEditor(s)`, `maturityScore` (empty→null, post-save→number),
+`killerStatCard` (n<3 suppressed) render without throwing and no P&L color leaks
+onto the score. Plain-Chinese GLOSS tooltips: `thesisCov, jrnCov, padh, ckl,
+emo, killer, emoOut`.
+
+Scoped out (v1.1 follow-ups): conviction→outcome split, journaled-vs-unjournaled
+performance split, a past-weeks history browser, surfacing orphan entries (logged
+for a name no longer held), cross-device sync.
+
 ## Money-weighted return + dollar bridge (IMPLEMENTED)
 
 Added to the default **净值** overview tab (designed by an agent-team workflow
@@ -563,8 +629,11 @@ sync.py equity gate is untouched.** Six tiers, each independently revertible:
 6. **Hygiene** — friendlier empty state (names the query), plainer search
    placeholder, dropped a decorative glyph.
 
-localStorage keys are namespaced `ptrak.*` and independent of `ptrak.rebal.v1`;
-all reads/writes are try/catch (private-mode degrades to today's behavior).
+localStorage keys are namespaced `ptrak.*` and mutually independent —
+`ptrak.seg.ov`/`ptrak.seg.stk` (active sub-tab), `ptrak.onboard.v1` (onboarding
+dismissed), `ptrak.rebal.v1` (rebalance rule), `ptrak.journal.v1` (per-position
+trade journal), `ptrak.review.v1` (weekly review); all reads/writes are try/catch
+(private-mode degrades to today's behavior).
 **Do NOT** soften/remove any 非投资建议 line, "怎么读" note, or Thaler citation —
 friendliness = surfacing meaning on demand, never deleting honesty. Validate with
 `node --check` on the extracted `<script>` after every change (nested template
