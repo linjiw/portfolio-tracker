@@ -572,6 +572,40 @@ literals — a stray backtick breaks silently) plus a mocked-DOM smoke test of
 `onboardStrip()/restoreSeg()/ovGo()/renderOverview()` and the keydown/glossary
 handlers.
 
+## Interactive charts & web-design pass (IMPLEMENTED)
+
+The marquee interaction upgrade — every hand-rolled SVG line chart is now
+hoverable (the charts were static except trade dots). Architecture (agent-team
+design): each builder (`svgLines`/`chart`/`nwChart`/`fibChart`) keeps ALL its
+`xs()/yc()` geometry and additionally (1) stamps the root `<svg>` with
+`id`+`class="xh"`+`data-x0/x1/ml/pw` (the linear x-map in user units), (2) appends
+a hidden `<g class="xg">` crosshair (`.cx` line + `.cxd` dot) and a transparent
+`<rect class="xhit">`, and (3) registers `CHARTREG[id]={dates:[epochs],
+rows:[prebuilt innerHTML]}`. ONE delegated controller **`bindCharts()`** (registered
+ONCE via `window.__xhWired` — both render fns re-run on every nav) does
+pointer→nearest-date inversion (`getBoundingClientRect` + `viewBox.baseVal.width`
++ the data-*), moves the crosshair, and writes the readout into the **existing
+`#tt`** element. Critical guards: `CHARTREG={}` is reset at the TOP of
+`renderOverview`/`renderDetail` (but **CHARTID never resets** → globally-unique ids,
+no mid-transition collision); `place()` early-returns on `e.target.closest('.mk')`
+so the trade-dot tooltip keeps sole ownership on the price chart; it calls
+`tt.classList.remove('gl-tt')` before writing so it never collides with the
+glossary controller; the Esc handler already defers to a visible `#tt`.
+
+The readouts **pre-compute the comparison** (Thaler p.1582 — do the arithmetic for
+the user): the index chart shows "超额 vs S&P", net-worth shows "较起点 +$X (%)" +
+组合动能, fib shows price/EMA5/EMA21/state. `svgLines` defs take `label` and opts
+take `delta:{a,b,label}`.
+
+Also in this pass (all reuse the Graphite-Atelier vars, no theme fork): responsive
+chart-text bump under 560px (CSS overrides the baked `font-size` attr — no risky
+attr→class swap); coarse-pointer trade-dot radius; a sticky **`#ctx`** context pill
+(组合总览 · <tab>) + **`#totop`** back-to-top button (shown on scroll via one
+passive listener; `updateCtx()` called from both render fns + segWire). **Presentation
+-only — no payload/summary change, equity gate stays green.** Validate: `node
+--check` + a mocked-DOM smoke test (`bindCharts` once-guard + idempotency,
+`CHARTREG` populates dates+rows and resets per render, `updateCtx`).
+
 ## Extension ideas (not yet built)
 
 - Export per-stock chart to PNG, or full data to Excel.

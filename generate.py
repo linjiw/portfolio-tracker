@@ -1452,6 +1452,21 @@ svg text{font-family:var(--f-mono); font-variant-numeric:tabular-nums slashed-ze
 .tt.gl-tt{pointer-events:auto; max-width:min(280px,80vw); white-space:normal; line-height:1.55; font-family:var(--f-ui)}
 .tt.gl-tt .gk{font-family:var(--f-disp); font-weight:600; color:var(--accent); display:block; margin-bottom:3px}
 .row:focus-visible,.seg-rail button:focus-visible,.tabs button:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-chip)}
+/* interactive charts: crosshair + readout rows */
+svg.xh{cursor:crosshair}
+svg .cx{stroke:var(--accent); stroke-width:1; stroke-opacity:.55; pointer-events:none}
+svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:none}
+.tt .xr{display:block; white-space:nowrap; line-height:1.5}
+.tt .xr i{display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; vertical-align:middle}
+.tt .xr.xd{margin-top:3px; padding-top:3px; border-top:1px solid var(--hair); font-weight:600}
+@media (max-width:560px){ svg text{font-size:13px} }
+/* sticky context pill + back-to-top */
+.ctx{position:fixed; top:64px; left:50%; transform:translateX(-50%); z-index:18; display:flex; align-items:center; gap:8px; padding:5px 12px; background:color-mix(in srgb,var(--panel2) 95%,transparent); border:1px solid var(--line); border-radius:var(--r-pill); font:600 11px/1 var(--f-ui); color:var(--mut); box-shadow:var(--sh-tt); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px)}
+.ctx[hidden]{display:none}
+.ctx-tick{width:3px; height:11px; border-radius:1px; background:var(--accent); box-shadow:0 0 8px var(--accent-line)}
+.totop{position:fixed; right:22px; bottom:22px; z-index:18; width:42px; height:42px; border-radius:var(--r-pill); border:1px solid var(--line); background:var(--panel2); color:var(--accent); font-size:18px; cursor:pointer; box-shadow:var(--sh-lift)}
+.totop[hidden]{display:none}
+@media (pointer:coarse){ .totop{width:48px; height:48px} svg .cx{stroke-width:1.6} }
 
 /* ============================== TABLES (print-ledger) ============================== */
 table{width:100%; border-collapse:collapse; font-size:12px; margin-top:8px}
@@ -1622,6 +1637,8 @@ details[open] summary::before{content:"▾ "}
  <div class="right" id="right"></div>
 </div>
 <div class="tt" id="tt"></div>
+<div id="ctx" class="ctx" hidden><span class="ctx-tick"></span><span id="ctxt"></span></div>
+<button id="totop" class="totop" aria-label="回到顶部" hidden>↑</button>
 <script>
 const DATA = __DATA__;
 const fmt=(n,d=2)=>n==null?'—':(n<0?'-$':'$')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -1669,6 +1686,8 @@ function renderList(){
  document.querySelectorAll('.row').forEach(r=>{r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();};r.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();r.click();}};});
  renderDetail();
 }
+/* ===== interactive charts: registry + one delegated crosshair controller ===== */
+var CHARTREG={},CHARTID=0;
 function chart(s){
  const W=900,H=420,mL=58,mR=120,mT=18,mB=42;
  const prices=s.prices,txns=s.txns;
@@ -1699,12 +1718,16 @@ function chart(s){
  if(s.curPrice&&s.held){const y=yc(s.curPrice);
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#E8B339" stroke-width="1.3" stroke-dasharray="2 3"/>`;
    el+=`<text x="${W-mR+6}" y="${y+4}" fill="#E8B339" font-size="11">现价 $${s.curPrice}</text>`;}
+ const cid='c'+(++CHARTID);
+ CHARTREG[cid]={dates:prices.map(p=>+new Date(p[0])),rows:prices.map(p=>{const dt=new Date(p[0]);return '<b>'+s.sym+' '+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#6B7079"></i>价格 '+fmt(p[1])+'</span>'+((s.held&&s.curPrice)?'<span class="xr"><i style="background:#E8B339"></i>现价 '+fmt(s.curPrice)+'</span>':'');})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
  const amts=txns.filter(t=>t.side!=='OPEN').map(t=>Math.abs(t.amount)),amax=Math.max(...amts,1);
+ const RMIN=(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches)?7:4;
  txns.forEach((t,idx)=>{const dd=t.date[0]==='≤'?D0:t.date,x=xs(dd),y=yc(t.price);
-   const r=t.side==='OPEN'?5:Math.max(4,Math.min(15,4+11*Math.sqrt(Math.abs(t.amount)/amax)));
+   const r=t.side==='OPEN'?5:Math.max(RMIN,Math.min(15,4+11*Math.sqrt(Math.abs(t.amount)/amax)));
    const col=t.side==='BUY'?'#4FB286':(t.side==='SELL'?'#E5707A':'#6B7079');
    el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="0.55" stroke="${col}" stroke-width="1.4" data-i="${idx}" data-sym="${s.sym}" class="mk" style="cursor:pointer"/>`;});
- return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function svgLines(ser,defs,opts){
  const W=900,H=opts.h||340,mL=66,mR=70,mT=16,mB=40;
@@ -1732,7 +1755,10 @@ function svgLines(ser,defs,opts){
    el+=`<polyline points="${pts}" fill="none" stroke="${d.color}" stroke-width="2.1" ${d.dash?'stroke-dasharray="5 3"':''}/>`;
    const last=f[f.length-1];
    if(last)el+=`<text x="${xs(last.date)+5}" y="${yc(last[d.key])+4}" fill="${d.color}" font-size="11" font-weight="700">${opts.fmt(last[d.key])}</text>`;});
- return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ const cid='c'+(++CHARTID),fv=opts.fmt;
+ CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),rows:ser.map(p=>{const dt=new Date(p.date);const parts=defs.map(d=>{const v=p[d.key];return '<span class="xr"><i style="background:'+d.color+'"></i>'+(d.label||d.key)+' '+(v==null?'—':fv(v))+'</span>';}).join('');let extra='';if(opts.delta&&p[opts.delta.a]!=null&&p[opts.delta.b]!=null){const dv=p[opts.delta.a]-p[opts.delta.b];extra='<span class="xr xd '+(dv>=0?'pos':'neg')+'">'+opts.delta.label+' '+(dv>=0?'+':'')+dv.toFixed(1)+'pp</span>';}return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br>'+parts+extra;})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
+ return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function nwChart(ser){
  const W=900,H=330,mL=64,mR=22,mT=16,mB=40,stripH=11,stripY=H-mB+22;
@@ -1756,7 +1782,10 @@ function nwChart(ser){
  for(let i=1;i<ser.length;i++){const x0=xs(ser[i-1].date),x1=xs(ser[i].date);
    el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${col(ser[i].pmom)}" fill-opacity="0.9"/>`;}
  el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#6B7079" font-size="10" text-anchor="end">组合动能</text>`;
- return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ const cid='c'+(++CHARTID),v0=ser[0].value,mw=m=>m>15?'强':(m<-15?'弱':'中性');
+ CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),rows:ser.map(p=>{const dt=new Date(p.date),d=p.value-v0;return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#E8B339"></i>净值 $'+(p.value/1000).toFixed(1)+'k</span><span class="xr '+(d>=0?'pos':'neg')+'">较起点 '+(d>=0?'+':'')+fmt(d)+' ('+(v0?(d/v0*100).toFixed(1):'0')+'%)</span><span class="xr" style="color:'+col(p.pmom)+'">组合动能 '+mw(p.pmom)+'</span>';})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
+ return `<svg id="${cid}" class="xh draw" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function rebalDriftMap(){
  const uni=rebalUniverse(),volMap=rebalVolMap(),rule=(typeof rebalDraft!=='undefined'&&rebalDraft)?rebalDraft:rebalLoad();
@@ -1909,6 +1938,7 @@ function bridgeCard(){
  </div>${gapCard}`;
 }
 function renderOverview(){
+ CHARTREG={};
  const ser=DATA.series||[],right=document.getElementById('right');
  if(ser.length<2){right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
  const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn;
@@ -1940,14 +1970,14 @@ function renderOverview(){
  <div class="seg" data-seg="cmp" hidden>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
    <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#E8B339"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#E8B339'},{key:'sp500',color:'#888D96',dash:1},{key:'nasdaq',color:'#E8B339',dash:1}],{zero:true,fmt:v=>v.toFixed(0)+'%'})}</div>
+   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#E8B339',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}</div>
  </div>
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
  <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
  <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
  <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
- segWire();wireRebal();restoreSeg('ov');
+ segWire();wireRebal();restoreSeg('ov');bindCharts();updateCtx();
 }
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
@@ -2005,9 +2035,9 @@ function portfolioFibCard(){
      <span>底部带：<span style="color:#4FB286">绿=多头</span>/<span style="color:#E5707A">红=空头</span>/<span style="color:#E8B339">黄=转换</span>/<span style="color:#6B7079">灰=盘整</span></span></div>
    ${fibChart(pseudo,fmtK)}
    <div style="font-weight:650;margin:12px 0 2px">组合动能振荡器（−100 ~ +100）</div>
-   ${svgLines(sser,[{key:'mom',color:'#E8B339'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:pf.signals})}
+   ${svgLines(sser,[{key:'mom',color:'#E8B339',label:'动能'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:pf.signals})}
    <div style="font-weight:650;margin:12px 0 2px">组合 RSI(14)</div>
-   ${svgLines(sser,[{key:'rsi',color:'#6E9CA6'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:pf.signals})}
+   ${svgLines(sser,[{key:'rsi',color:'#6E9CA6',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:pf.signals})}
    <div class="note" style="margin-top:10px"><b>怎么读：</b>把整支组合当成一只“基金”，在净值曲线上算 EMA 缎带与金叉/死叉，用来看组合整体的趋势结构与择时节奏。<b>金叉/死叉为快线 EMA5×EMA13 交叉</b>（非传统 50/200 日均线，更快也更灵敏）。竖虚线标出交叉日期。<b>技术参考，非投资建议。</b></div>
  </div>`;
 }
@@ -2072,11 +2102,11 @@ function riskCard(){
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">水下回撤曲线（相对历史高点回撤 %）</div>
    <div class="legend"><span><i style="background:#E5707A"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span>0 = 创新高；越深 = 离高点越远（你真正“感受到”的亏损维度）</span></div>
-   ${svgLines(R.uwSeries,[{key:'uw',color:'#E5707A'},{key:'spuw',color:'#888D96',dash:1}],{zero:true,area:true,fmt:v=>v.toFixed(0)+'%'})}
+   ${svgLines(R.uwSeries,[{key:'uw',color:'#E5707A',label:'我的回撤'},{key:'spuw',color:'#888D96',dash:1,label:'S&P回撤'}],{zero:true,area:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'uw',b:'spuw',label:'相对 S&P'}})}
    <div class="note" style="margin-top:6px">最大回撤 <span class="neg">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">21 日滚动年化波动率</div>
    <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span></div>
-   ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339'},{key:'spvol',color:'#888D96',dash:1}],{fmt:v=>v.toFixed(0)+'%'})}</div>
+   ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339',label:'我的波动'},{key:'spvol',color:'#888D96',dash:1,label:'S&P波动'}],{fmt:v=>v.toFixed(0)+'%'})}</div>
  <div class="card"><div class="dh"><span class="t">风险贡献分解</span><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th></tr></thead>
    <tbody>${rows}</tbody></table></div>${exNote}
@@ -2204,7 +2234,10 @@ function fibChart(s,fmtY){
  for(let i=1;i<prices.length;i++){const x0=xs(prices[i-1][0]),x1=xs(prices[i][0]);
    el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${FIBCOL[f.state[i]]}" fill-opacity="0.85"/>`;}
  el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#6B7079" font-size="10" text-anchor="end">状态</text>`;
- return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ const cid='c'+(++CHARTID),SW={up:'多头',down:'空头',range:'盘整',mixed:'转换'};
+ CHARTREG[cid]={dates:prices.map(p=>+new Date(p[0])),rows:prices.map((p,i)=>{const dt=new Date(p[0]);return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#6B7079"></i>价格 '+yl(p[1])+'</span><span class="xr"><i style="background:#E8B339"></i>EMA5 '+yl(f.e5[i])+'</span><span class="xr"><i style="background:#5F6168"></i>EMA21 '+yl(f.e21[i])+'</span><span class="xr" style="color:'+(FIBCOL[f.state[i]]||'#888D96')+'">状态 '+(SW[f.state[i]]||f.state[i])+'</span>';})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
+ return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function renderFib(s){
  const f=s.fib;if(!f)return'';
@@ -2233,10 +2266,10 @@ function renderFib(s){
    </div>
    ${fibChart(s)}
    <div style="font-weight:650;margin:12px 0 2px">动能振荡器（−100 ~ +100）</div>
-   ${svgLines(ser,[{key:'mom',color:'#E8B339'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),
+   ${svgLines(ser,[{key:'mom',color:'#E8B339',label:'动能'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),
      guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:f.signals})}
    <div style="font-weight:650;margin:12px 0 2px">RSI(14)</div>
-   ${svgLines(ser,[{key:'rsi',color:'#6E9CA6'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
+   ${svgLines(ser,[{key:'rsi',color:'#6E9CA6',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
      guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:f.signals})}
    <div class="note" style="margin-top:10px"><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
    <b>多指标共振(◎ 圆环)：</b>同时满足「均线多头/空头排列 + 3 日内出现金叉/死叉 + RSI 未到超买/超卖」三个条件才标记——比单一信号更高确信度，能过滤掉震荡市里的假交叉。<br>
@@ -2245,6 +2278,7 @@ function renderFib(s){
 }
 function renderDetail(){
  if(sel==='__OV__'){renderOverview();return;}
+ CHARTREG={};
  const s=stocks.find(x=>x.sym===sel);if(!s){document.getElementById('right').innerHTML='';return;}
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
   ['现价',fmt(s.curPrice)],['市值',s.held?fmt(s.value):'—'],
@@ -2271,13 +2305,13 @@ function renderDetail(){
    <tbody>${rows}</tbody></table></div></div>
  </div>
  <div class="seg" data-seg="fib" hidden>`+renderFib(s)+`</div>`;
- bindMarkers();segWire();restoreSeg('stk');
+ bindMarkers();segWire();restoreSeg('stk');bindCharts();updateCtx();
 }
 function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail button').forEach(b=>b.onclick=()=>{
   r.querySelectorAll('.seg-rail button').forEach(x=>x.classList.toggle('on',x===b));
   r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
-  try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}});}
+  try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}updateCtx();});}
 function restoreSeg(ctx){try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(!want)return;var r=document.getElementById('right'),btn=r.querySelector('.seg-rail [data-seg="'+want+'"]');if(btn&&!btn.classList.contains('on'))btn.click();}catch(e){}}
 function ovGo(seg){var b=document.querySelector('.seg-rail [data-seg="'+seg+'"]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'});}
 function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}if(done)return'';
@@ -2332,6 +2366,32 @@ function bindMarkers(){
      tt.innerHTML=`<b>${m.dataset.sym} · ${side}</b><br>${t.date}<br>数量 ${fmtN(t.qty,0)} @ ${fmt(t.price)}<br>金额 ${fmt(t.amount)}${t.realized!=null?'<br>已实现 <span class="'+cls(t.realized)+'">'+fmt(t.realized)+'</span>':''}`;};
    m.onmouseleave=()=>tt.style.display='none';});
 }
+function bindCharts(){
+ if(window.__xhWired)return;window.__xhWired=1;
+ const tt=document.getElementById('tt');if(!tt)return;
+ function place(svg,e){
+   if(e.target.closest&&e.target.closest('.mk'))return;          // defer to trade-dot tooltip
+   const reg=CHARTREG[svg.id];if(!reg||!reg.dates.length)return;
+   const x0=+svg.dataset.x0,x1=+svg.dataset.x1,ml=+svg.dataset.ml,pw=+svg.dataset.pw;
+   const box=svg.getBoundingClientRect();if(!box.width)return;
+   const vbW=(svg.viewBox&&svg.viewBox.baseVal&&svg.viewBox.baseVal.width)||900;
+   const ux=(e.clientX-box.left)/box.width*vbW;
+   if(ux<ml-4||ux>ml+pw+4){clear(svg);return;}
+   const epoch=x0+((ux-ml)/(pw||1))*((x1-x0)||1);
+   let lo=0,hi=reg.dates.length-1;while(lo<hi){const mid=(lo+hi)>>1;if(reg.dates[mid]<epoch)lo=mid+1;else hi=mid;}
+   if(lo>0&&Math.abs(reg.dates[lo-1]-epoch)<Math.abs(reg.dates[lo]-epoch))lo--;
+   const cx=ml+((reg.dates[lo]-x0)/((x1-x0)||1))*pw;
+   const g=svg.querySelector('.xg');
+   if(g){const ln=g.querySelector('.cx'),dot=g.querySelector('.cxd');ln.setAttribute('x1',cx);ln.setAttribute('x2',cx);dot.setAttribute('cx',cx);dot.setAttribute('cy',ln.getAttribute('y1'));g.style.display='';}
+   tt.classList.remove('gl-tt');tt.innerHTML=reg.rows[lo];tt.style.display='block';
+   const w=tt.offsetWidth||180;let L=e.clientX+14;if(L+w>window.innerWidth-8)L=window.innerWidth-w-8;if(L<8)L=8;
+   tt.style.left=L+'px';tt.style.top=(e.clientY+14)+'px';
+ }
+ function clear(svg){const g=svg&&svg.querySelector('.xg');if(g)g.style.display='none';if(!tt.classList.contains('gl-tt'))tt.style.display='none';}
+ document.addEventListener('mousemove',e=>{const svg=e.target.closest&&e.target.closest('svg.xh');if(svg)place(svg,e);});
+ document.addEventListener('mouseout',e=>{const svg=e.target.closest&&e.target.closest('svg.xh');if(svg&&!svg.contains(e.relatedTarget))clear(svg);});
+ document.addEventListener('touchmove',e=>{const t=e.touches[0],el=t&&document.elementFromPoint(t.clientX,t.clientY),s=el&&el.closest&&el.closest('svg.xh');if(s){place(s,t);e.preventDefault();}},{passive:false});
+}
 function renderOptions(){
  if(!DATA.options.length)return'';
  const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':'<span class="tag s">卖出</span>'}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td class="${t.amount<0?'':'pos'}">${fmt(t.amount)}</td></tr>`).join('');
@@ -2350,6 +2410,9 @@ document.addEventListener('keydown',e=>{
  if(e.key==='Escape'){const tt=document.getElementById('tt');if(tt&&tt.style.display==='block')return;if(sel!=='__OV__'){sel='__OV__';renderList();renderDetail();}return;}
  if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&a.parentElement.classList.contains('seg-rail')){
    const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}}});
+function updateCtx(){var c=document.getElementById('ctx'),t=document.getElementById('ctxt');if(!c||!t)return;var on=document.querySelector('#right .seg-rail button.on');var name=(typeof sel!=='undefined'&&sel!=='__OV__')?sel:'组合总览';t.textContent=name+(on?' · '+on.textContent.trim():'');}
+window.addEventListener('scroll',function(){var y=window.scrollY||0,c=document.getElementById('ctx'),t=document.getElementById('totop');if(c)c.hidden=y<300;if(t)t.hidden=y<600;},{passive:true});
+(function(){var b=document.getElementById('totop');if(b)b.onclick=function(){window.scrollTo({top:0,behavior:'smooth'});};})();
 renderList();
 requestAnimationFrame(()=>document.body.classList.add('ready'));
 setTimeout(()=>document.body.classList.add('done'),1500);
