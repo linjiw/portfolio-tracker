@@ -590,8 +590,28 @@ presentation-only, computed from existing payload):
 - XIRR tile labeled "数月年化·非预测" inline (not hover-only) so +48% isn't
   misread as a forecast; 指数对比 gave 纳斯达克 its own color (#6E9CA6) — it shared
   amber with 我的组合, an unreadable two-line clash.
-Deferred (bigger/riskier): tab regrouping 9→~5, card-ify the 12-col table on phone,
-disclaimer/citation de-dup. Validate: sync gate + node --check + mocked-DOM render.
+Validate: sync gate + node --check + mocked-DOM render.
+
+**Follow-up pass (mobile-first + the deferred items + a second agent's advice).**
+A re-test scored it **5 → 7.5 (mobile 4 → 7.5)**; the one high-severity miss it
+caught: `#kpis` is a DOM sibling ABOVE `.wrap`, so `.right{order}` couldn't lift
+the banner above the KPI ledger on a phone. Fixed by moving the banner to a
+**top-level `#insight` slot above `#kpis`** — `renderOverview()` populates it,
+`renderDetail()` clears it (`#insight:empty{display:none}`) — so the plain-language
+answer is the literal first paint on every viewport. Also: phone trims `#kpis` to
+the 5 essentials (`.kpi:nth-child(n+6){display:none}`) and the 12-col 决策一览 to
+5 priority columns + sticky ticker col; the 9-tab rail **wraps** on a phone (no
+hidden tabs); `#insight`/overview ordered before the holdings rail; a11y
+(role=tablist/tab + aria-selected via `segWire`, aria-labels); the two longest
+怎么读 walls folded into `<details>`; hero relabeled "股票市值 (不含现金/期权)";
+banner gained a "下一步 → 最该看一眼 <top-risk> / 看再平衡动作清单" line, a
+"显示新手指南" restore link, a gross-option qualifier (毛额·市价·净≈…), and a
+verdict-word timing line (no confusing raw −pp). Softened tab/heading to
+"斐波那契·技术".
+
+Still deferred (genuinely new functionality, not polish): true nested 9→5 tabs,
+desktop column-priority + show-all toggle, multi-holding compare, sortable headers,
+chart zoom/brush, export, URL deep-links, trade-dot touch tooltips.
 
 ## Interactive charts & web-design pass (IMPLEMENTED)
 

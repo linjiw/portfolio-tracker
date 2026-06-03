@@ -1474,6 +1474,8 @@ svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:no
 .totop[hidden]{display:none}
 @media (pointer:coarse){ .totop{width:48px; height:48px} svg .cx{stroke-width:1.6} }
 /* first-glance insight banner */
+#insight{margin:18px 28px 0}
+#insight:empty{display:none}
 .ib{border-left:3px solid var(--accent)}
 .ib-row{line-height:1.7; margin:5px 0; font-size:13.5px; color:var(--txt)}
 .ib-lk{cursor:pointer; color:var(--accent); border-bottom:1px dotted var(--accent-line); margin-left:6px; font-size:12px; white-space:nowrap}
@@ -1650,6 +1652,9 @@ details[open] summary::before{content:"▾ "}
   .seg[data-seg="score"] table th:nth-child(11),.seg[data-seg="score"] table td:nth-child(11){display:none}
   .ib-row{font-size:13px}
   .ctx{display:none}
+  #insight{margin:12px 12px 0}
+  /* phone KPI strip: keep the 5 essentials (市值/未实现/区间收益/超额/期权毛敞口), drop the dollar-ledger tail */
+  .kpi:nth-child(n+6){display:none}
 }
 </style>
 </head>
@@ -1658,6 +1663,7 @@ details[open] summary::before{content:"▾ "}
  <h1>投资组合时间线</h1>
  <span class="sub" id="rangelbl"></span>
 </header>
+<div id="insight"></div>
 <div class="kpis" id="kpis"></div>
 <div class="wrap">
  <div class="left">
@@ -1992,14 +1998,15 @@ function insightBanner(){
  const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" onclick="ovGo('${seg}')">${t} →</span>`;
  const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${al>=0?'+':''}${al.toFixed(1)}pp`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
  const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
- const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%），未计入上方市值`:'';
- const l4=(gap!=null)?`择时 → 资金加权 ${pct(S.mwrPeriod)} vs 策略 ${pct(pr)}，本期${gap<0?'<b class="pos">略帮了忙</b>':(gap>0?'<b class="neg">略拖后腿</b>':'基本中性')}（行为缺口 ${gap>0?'+':''}${gap.toFixed(1)}pp）`:'';
+ const tr=(DATA.risk&&DATA.risk.contrib&&DATA.risk.contrib[0])?DATA.risk.contrib[0].sym:null;
+ const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%，毛额·市价口径，净≈${fmt(A.optMarkNet)}，非 Delta/名义），未计入上方市值`:'';
+ const l4=(gap!=null)?`择时 → 本期${gap<0?'<b class="pos">略帮了忙 ✓</b>':(gap>0?'<b class="neg">略拖了后腿</b>':'基本中性')}（你的钱 ${pct(S.mwrPeriod)} ${gap<0?'≥':(gap>0?'<':'≈')} 策略 ${pct(pr)}）`:'';
  return `<div class="card ib"><div class="dh"><span class="t">今日要点</span><span class="nm">一眼看懂：赚了多少 · 最大风险 · 隐藏杠杆 · 择时（点链接看详情）</span>${guide}</div>
    <div class="ib-row">${l1} ${lk('nw','净值')}${lk('cmp','指数对比')}</div>
    ${l2?`<div class="ib-row">${l2} ${lk('struct','结构')}</div>`:''}
    ${l3?`<div class="ib-row">${l3} ${lk('nw','期权敞口')}</div>`:''}
    ${l4?`<div class="ib-row">${l4} ${lk('beh','行为决策')}</div>`:''}
-   <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${lk('score','按红旗数看该关注谁')}${lk('rebal','看再平衡动作清单')}</div>
+   <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${tr?`最该看一眼 <b>${tr}</b>（最大风险贡献）　`:''}${lk('score','按红旗数排序')}${lk('rebal','看再平衡动作清单')}</div>
    <div class="note" style="margin-top:4px">所有指标为技术 / 描述性参考，<b>非投资建议</b>。</div></div>`;
 }
 function renderOverview(){
@@ -2019,7 +2026,8 @@ function renderOverview(){
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
   ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
- right.innerHTML=onboardStrip()+insightBanner()+`
+ const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=onboardStrip()+insightBanner();
+ right.innerHTML=`
  <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
@@ -2090,7 +2098,7 @@ function portfolioFibCard(){
  const sser=ser.map((p,i)=>({date:p.date,mom:pf.mom[i],rsi:pf.rsi[i]}));
  const badges=fibBadges(n,pf.signals,'组合趋势状态');
  return `<div class="card">
-   <div class="dh"><span class="t">组合斐波那契</span><span class="nm">EMA 5/8/13/21 缎带 · 金叉/死叉 · RSI —— 直接计算在组合净值曲线上</span></div>
+   <div class="dh"><span class="t">组合斐波那契 · 技术参考</span><span class="nm">EMA 5/8/13/21 缎带 · 金叉/死叉 · RSI —— 直接计算在组合净值曲线上（非投资建议）</span></div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="legend">
      <span><i style="background:#E8B339"></i>EMA5</span><span><i style="background:#C99A3A"></i>EMA8</span>
@@ -2344,6 +2352,7 @@ function renderFib(s){
 function renderDetail(){
  if(sel==='__OV__'){renderOverview();return;}
  CHARTREG={};
+ const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML='';   // banner is overview-only
  const s=stocks.find(x=>x.sym===sel);if(!s){document.getElementById('right').innerHTML='';return;}
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
   ['现价',fmt(s.curPrice)],['市值',s.held?fmt(s.value):'—'],
