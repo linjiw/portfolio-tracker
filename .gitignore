@@ -8,3 +8,5 @@ __pycache__/
 # stray scaffolding some workflow subagents create — not part of this project
 .agents/
 AGENTS.md
+# local audit/workflow scratch scripts
+.audit_workflow.js

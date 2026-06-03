@@ -747,6 +747,49 @@ options, single-system enforcement, a11y parity. **Missing (next worth building)
 an entry-time trade journal (thesis + emotion + plan-adherence — the Edgewonk/
 TradeZella differentiator) and benchmark breadth (factor/sector/peer).**
 
+**Second audit pass (post-journal) + cleanup — scored 7.5 → ~9.** A larger
+review→adversarial-verify→synthesize workflow (85 agents) walked every tab/panel
+(incl. the new journal) and confirmed 59 real findings; all 35 prioritized fixes
+landed, every one presentation-only (equity gate stayed byte-stable). Highlights:
+- **P0** — both rebalance result banners were direct `.card>div[style*="font-weight:650"]`
+  children, so the caption-normalizer silently greyed/shrank the sanctioned green
+  "无需操作" / red "越界" signal. Fixed by moving them to `.flag-head` (the documented
+  opt-out). This is the canonical example of the foot-gun; the nw/cmp captions were
+  also migrated to the now-real `.cap` class.
+- **P1** — per-stock journal textareas (论点/复盘) only synced to `journalDraft` on
+  Save, so tapping any chip (which rebuilds the editor) wiped typed text → added live
+  `oninput` sync. The 今日要点 banner showed Nasdaq's absolute return instead of the
+  `ppf(pr−nq)` gap. The default 决策一览 tab rendered blank for data-poor portfolios
+  → graceful 数据不足 note.
+- **Green/red discipline** (the through-line): de-greened cash-flow columns (逐笔/期权
+  金额), the dividend KPI, behavior example chips, the emotion-outcome dot, the killer-stat
+  numeral, zero-value risk/drift gaps (`g===0`→`--mut`), maxDrawdown (`cls()`), the
+  net-worth momentum band (amber-intensity ramp, NOT the technical FIBCOL), and the
+  rebalance over/under bars (amber=越界 / grey=区间内). Green/red now means **only**
+  P&L sign / good-bad, nowhere else.
+- **System hygiene** — killed off-palette ghost hexes (#e6ecf5/#cfd3da/#6E9CA6/#15171B/
+  #2A2E36 → tokens), 7px/8px radii → `--r-ctl`/`--r-card`, Nasdaq/RSI teal → in-system
+  greys, dead `.kpi .spark` CSS removed, `.cap` actually defined, gap columns get the
+  `pp` unit.
+- **a11y** — `role=tabpanel`/`aria-controls` linkage in `segWire`, all drill-in rows +
+  resonance chips keyboard-operable, holdings-filter `tablist`, journal chips `aria-pressed`,
+  form controls `aria-label`, above-the-fold links keyboard + `.ib-lk` keydown, SVG
+  `role=img`. **Mobile** — asset-class bars made fluid (`.acrow`, no collapse at 390px),
+  trade markers tappable + SELL now a hollow ring (colorblind-safe, shape not hue alone).
+- **Vision add (the audit's #1 "build next"):** a **盈亏贡献 (contribution) card** in the
+  指数对比 tab — `contributionCard()` ranks held names by |unrealized $| (= value−cost,
+  broker-exact), diverging amber/green/red bars by P&L sign, share-% shown only when the
+  net dominates the largest single name. Explicitly framed as **dollar-P&L share, NOT a
+  TWR attribution** (true per-name TWR needs daily weights the export can't rebuild).
+  Answers the brief's #1 question ("which holdings produced my return"). Pure presentation.
+
+Still deferred (v1.1 vision, not yet built): a "本周该练的一件事" focus line in the
+maturity card; numeric gap values beside the scorecard's bar-only columns; a
+journaled-vs-unjournaled / conviction→outcome performance split; a past-weeks review
+browser. Explicitly out of scope (conflict with the static, CSV-fed, equity-gated
+architecture): live broker APIs, MCP server, options Greeks/probability-ITM, real-time
+quotes, tax-lot/wash-sale engines, factor/style data, cross-device sync.
+
 ## Extension ideas (not yet built)
 
 - Export per-stock chart to PNG, or full data to Excel.

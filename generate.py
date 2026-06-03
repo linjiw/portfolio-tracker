@@ -1197,7 +1197,7 @@ body{
   font-variant-numeric:tabular-nums slashed-zero;
 }
 ::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-thumb{background:#2A2E36;border-radius:8px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
 ::-webkit-scrollbar-thumb:hover{background:#363B45}
 ::-webkit-scrollbar-track{background:transparent}
 
@@ -1284,9 +1284,6 @@ header .sub b,header .sub .mono{
 body.ready .kpi:first-child .l::after{
   animation:tickIn .55s var(--ease) .35s forwards;
 }
-/* optional inline net-worth sparkline lives to the right of the hero value (structural_changes #5) */
-.kpi .spark{display:block;margin-top:9px;width:100%;height:24px;opacity:.95}
-.kpi .spark polyline{fill:none;stroke:var(--accent);stroke-width:1.4;vector-effect:non-scaling-stroke}
 
 /* ============================== TWO-COLUMN SHELL ============================== */
 .wrap{
@@ -1421,6 +1418,10 @@ body.ready .row.sel .pnl,body.ready .row.sel .meta{animation:dataFlick .26s ease
 /* hero figure + flag headline opt OUT of the caption normalizer above (they must not match its [style*="font-weight:650"] selector) */
 .hero-fig{font-family:var(--f-mono); font-size:23px; font-weight:600; color:var(--txt); letter-spacing:-.01em}
 .flag-head{font-weight:650}
+/* the documented caption component (no !important — a real class need not fight inline styles) */
+.cap{font-family:var(--f-ui); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--mut); padding-bottom:6px; border-bottom:1px solid var(--hair)}
+/* amber focus ring on journal/rebal form controls (matches :focus-visible elsewhere) */
+.seg input:focus,.seg textarea:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft)}
 
 /* ============================== BADGES ============================== */
 .badges{display:flex; gap:28px; row-gap:14px; flex-wrap:wrap; margin:18px 0 8px}
@@ -1487,6 +1488,7 @@ svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:no
 .ib-row{line-height:1.7; margin:5px 0; font-size:13.5px; color:var(--txt)}
 .ib-lk{cursor:pointer; color:var(--accent); border-bottom:1px dotted var(--accent-line); margin-left:6px; font-size:12px; white-space:nowrap}
 .ib-lk:hover{border-bottom-style:solid}
+.ib-lk:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
 
 /* ============================== TABLES (print-ledger) ============================== */
 table{width:100%; border-collapse:collapse; font-size:12px; margin-top:8px}
@@ -1535,6 +1537,11 @@ details[open] summary::before{content:"▾ "}
 }
 .frow:hover{background:var(--panel2)}
 .frow .fsym{width:72px; font-family:var(--f-disp); font-weight:600; font-size:13px; display:flex; align-items:center; gap:6px}
+/* asset-class rows: fluid widths so bars never collapse / overflow on phones */
+.acrow .fsym{width:auto; min-width:0; flex:0 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.acrow .fbar{flex:1 1 0; min-width:34px}
+.acrow .acpct{flex:0 0 auto; width:54px; text-align:right; font-family:var(--f-mono)}
+.acrow .acval{flex:0 0 auto; width:auto; min-width:78px; text-align:right; white-space:nowrap}
 .frow .fsym>span:first-child{font-size:10px}
 .frow .fval{width:50px; text-align:right; font-family:var(--f-mono); font-weight:500}
 .frow .fst{width:62px; font-family:var(--f-ui); font-size:10.5px; color:var(--mut)}
@@ -1684,10 +1691,10 @@ details[open] summary::before{content:"▾ "}
        <option value="fibmom">按斐波那契动能</option>
        <option value="sym">按代码字母</option>
      </select>
-     <div class="tabs">
-       <button data-f="held" class="on">持有中</button>
-       <button data-f="exited">已清仓</button>
-       <button data-f="all">全部</button>
+     <div class="tabs" role="tablist" aria-label="持仓筛选">
+       <button data-f="held" class="on" role="tab" aria-selected="true">持有中</button>
+       <button data-f="exited" role="tab" aria-selected="false">已清仓</button>
+       <button data-f="all" role="tab" aria-selected="false">全部</button>
      </div>
    </div>
    <div class="list" id="list"></div>
@@ -1718,7 +1725,7 @@ const kpis=[
  ['窗口内净买入',fmt(S.netInvested),''],
  ['现金转入 (窗口内)',fmt(S.deposits),''],
  ['累计入金 (开户至今)',fmt(S.lifeDeposits||S.deposits),''],
- ['股息收入',fmt(S.dividends||0),(S.dividends>0?'pos':'')],
+ ['股息收入',fmt(S.dividends||0),''],
 ];
 document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div class="l">${k[0]}</div><div class="v ${k[2]}">${k[1]}</div></div>`).join('');
 
@@ -1767,7 +1774,7 @@ function chart(s){
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/>`;
    el+=`<text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">$${v.toFixed(0)}</text>`;}
  for(let i=0;i<=5;i++){const t=xmin+(xmax-xmin)*i/5,x=xs(new Date(t)),dt=new Date(t);
-   el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="#15171B"/>`;
+   el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="var(--bg2)"/>`;
    el+=`<text x="${x}" y="${H-mB+18}" fill="#6B7079" font-size="11" text-anchor="middle">${(dt.getMonth()+1)}/${dt.getDate()}</text>`;}
  if(prices.length){const pts=prices.map(p=>`${xs(p[0]).toFixed(1)},${yc(p[1]).toFixed(1)}`).join(' ');
    el+=`<polyline points="${pts}" fill="none" stroke="#6B7079" stroke-width="1.6" stroke-opacity="0.9"/>`;}
@@ -1788,8 +1795,9 @@ function chart(s){
  txns.forEach((t,idx)=>{const dd=t.date[0]==='≤'?D0:t.date,x=xs(dd),y=yc(t.price);
    const r=t.side==='OPEN'?5:Math.max(RMIN,Math.min(15,4+11*Math.sqrt(Math.abs(t.amount)/amax)));
    const col=t.side==='BUY'?'#4FB286':(t.side==='SELL'?'#E5707A':'#6B7079');
-   el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="0.55" stroke="${col}" stroke-width="1.4" data-i="${idx}" data-sym="${s.sym}" class="mk" style="cursor:pointer"/>`;});
- return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+   const fo=t.side==='SELL'?0:0.55,sw=t.side==='SELL'?2.4:1.4;   // SELL = hollow ring so buy/sell differ by shape, not hue alone (colorblind-safe)
+   el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="${fo}" stroke="${col}" stroke-width="${sw}" data-i="${idx}" data-sym="${s.sym}" class="mk" style="cursor:pointer"/>`;});
+ return `<svg id="${cid}" class="xh" role="img" aria-label="数据图表 · 关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function svgLines(ser,defs,opts){
  const W=900,H=opts.h||340,mL=66,mR=70,mT=16,mB=40;
@@ -1801,7 +1809,7 @@ function svgLines(ser,defs,opts){
  const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
  const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB);
  let el='';
- (opts.guides||[]).forEach(g=>{const y=yc(g.v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${g.color||'#2A2E36'}" stroke-dasharray="4 3"/><text x="${W-mR+4}" y="${y+4}" fill="${g.color||'#6B7079'}" font-size="10">${g.label!=null?g.label:g.v}</text>`;});
+ (opts.guides||[]).forEach(g=>{const y=yc(g.v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${g.color||'var(--line)'}" stroke-dasharray="4 3"/><text x="${W-mR+4}" y="${y+4}" fill="${g.color||'#6B7079'}" font-size="10">${g.label!=null?g.label:g.v}</text>`;});
  (opts.marks||[]).forEach(g=>{const x=xs(g.date),c=g.type==='golden'?'#4FB286':'#E5707A';el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="${c}" stroke-opacity="0.4" stroke-dasharray="2 3"/>`;});
  for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/>`;
@@ -1809,7 +1817,7 @@ function svgLines(ser,defs,opts){
  const n=ser.length;
  for(let i=0;i<=5;i++){const idx=Math.round((n-1)*i/5),p=ser[idx],x=xs(p.date),dt=new Date(p.date);
    el+=`<text x="${x}" y="${H-mB+18}" fill="#6B7079" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
- if(opts.zero){const y=yc(0);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#2A2E36" stroke-dasharray="3 3"/>`;}
+ if(opts.zero){const y=yc(0);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="var(--line)" stroke-dasharray="3 3"/>`;}
  defs.forEach(d=>{const f=ser.filter(p=>p[d.key]!=null);
    const pts=f.map(p=>`${xs(p.date).toFixed(1)},${yc(p[d.key]).toFixed(1)}`).join(' ');
    if(opts.area&&f.length){const base=yc(Math.max(ymin,0));
@@ -1820,7 +1828,7 @@ function svgLines(ser,defs,opts){
  const cid='c'+(++CHARTID),fv=opts.fmt;
  CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),rows:ser.map(p=>{const dt=new Date(p.date);const parts=defs.map(d=>{const v=p[d.key];return '<span class="xr"><i style="background:'+d.color+'"></i>'+(d.label||d.key)+' '+(v==null?'—':fv(v))+'</span>';}).join('');let extra='';if(opts.delta&&p[opts.delta.a]!=null&&p[opts.delta.b]!=null){const dv=p[opts.delta.a]-p[opts.delta.b];extra='<span class="xr xd '+(dv>=0?'pos':'neg')+'">'+opts.delta.label+' '+(dv>=0?'+':'')+dv.toFixed(1)+'pp</span>';}return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br>'+parts+extra;})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
- return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ return `<svg id="${cid}" class="xh" role="img" aria-label="数据图表 · 关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function nwChart(ser){
  const W=900,H=330,mL=64,mR=22,mT=16,mB=40,stripH=11,stripY=H-mB+22;
@@ -1829,7 +1837,7 @@ function nwChart(ser){
  const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
  const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
  const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB-stripH);
- const base=yc(ymin),col=m=>m>15?'#4FB286':(m<-15?'#E5707A':'#E8B339');
+ const base=yc(ymin),col=m=>m>15?'#E8B339':(m<-15?'#6B7079':'#9A8A4A');   // amber-intensity ramp on the $ surface — green/red reserved for P&L sign (FIBCOL in technical panels keeps its own convention)
  let el='';
  for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/><text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">$${(v/1000).toFixed(0)}k</text>`;}
@@ -1847,7 +1855,7 @@ function nwChart(ser){
  const cid='c'+(++CHARTID),v0=ser[0].value,mw=m=>m>15?'强':(m<-15?'弱':'中性');
  CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),rows:ser.map(p=>{const dt=new Date(p.date),d=p.value-v0;return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#E8B339"></i>净值 $'+(p.value/1000).toFixed(1)+'k</span><span class="xr '+(d>=0?'pos':'neg')+'">较起点 '+(d>=0?'+':'')+fmt(d)+' ('+(v0?(d/v0*100).toFixed(1):'0')+'%)</span><span class="xr" style="color:'+col(p.pmom)+'">组合动能 '+mw(p.pmom)+'</span>';})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
- return `<svg id="${cid}" class="xh draw" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ return `<svg id="${cid}" class="xh draw" role="img" aria-label="组合净值曲线 · 关键数值见上方与表格" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function rebalDriftMap(){
  const uni=rebalUniverse(),volMap=rebalVolMap(),rule=(typeof rebalDraft!=='undefined'&&rebalDraft)?rebalDraft:rebalLoad();
@@ -1860,25 +1868,25 @@ function structureCard(){
  if(!X||(!X.byAssetClass.length&&!X.byTheme.length))return '<div class="card"><div class="dh"><span class="t">结构</span></div><div class="note">结构数据不足。</div></div>';
  // Card 1: asset-class structure (always-on floor)
  const acRows=X.byAssetClass.map(b=>{const w=Math.min(b.weightPct,100);
-   return `<div class="frow"><span class="fsym" style="width:130px">${b.bucket}</span>
+   return `<div class="frow acrow"><span class="fsym">${b.bucket}</span>
      <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'#888D96':'#E8B339'}"></div></div>
-     <span style="width:60px;text-align:right">${b.weightPct.toFixed(1)}%</span>
-     <span class="note" style="width:96px;text-align:right">${fmt(b.value)}</span></div>`;}).join('');
+     <span class="acpct">${b.weightPct.toFixed(1)}%</span>
+     <span class="note acval">${fmt(b.value)}</span></div>`;}).join('');
  const card1=`<div class="card"><div class="dh"><span class="t">资产类别结构</span><span class="nm">个股 vs 宽基ETF vs 主题ETF vs 杠杆 vs 商品 vs 现金 · 零额外数据，总是可得</span></div>${acRows}</div>`;
  // Card 2: theme/sector structure (weight vs risk)
  const lt=X.largestTheme;
- const callout=lt?`<div class="note" style="margin:4px 0 10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.6"><b>最大主题集中：${lt.theme}</b> · ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?` / ${lt.riskPct.toFixed(0)}% 风险`:''} · ${lt.n} 只标的。${lt.n>1?`这 ${lt.n} 只高度相关，名义上分散、实为一笔约 ${lt.weightPct.toFixed(0)}% 的单一主题押注。`:''}</div>`:'';
+ const callout=lt?`<div class="note" style="margin:4px 0 10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.6"><b>最大主题集中：${lt.theme}</b> · ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?` / ${lt.riskPct.toFixed(0)}% 风险`:''} · ${lt.n} 只标的。${lt.n>1?`这 ${lt.n} 只高度相关，名义上分散、实为一笔约 ${lt.weightPct.toFixed(0)}% 的单一主题押注。`:''}</div>`:'';
  const tRows=X.byTheme.map(t=>{const grey=t.theme==='未分类'?'color:var(--mut)':'';
    let riskCell='<td>—</td>',gapCell='<td></td><td>—</td>';
-   if(t.riskPct!=null){const g=t.gap,gc=g>0?'#E5707A':'#4FB286',w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
+   if(t.riskPct!=null){const g=t.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
      riskCell=`<td>${t.riskPct.toFixed(1)}%</td>`;
-     gapCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td><td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}</td>`;}
+     gapCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td><td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}pp</td>`;}
    return `<tr style="${grey}"><td class="l">${t.theme}</td><td><span class="chip">${t.src}</span></td>
      <td>${t.weightPct.toFixed(1)}%</td>${riskCell}${gapCell}<td class="note">${t.n}</td></tr>`;}).join('');
  const ex=(DATA.risk&&DATA.risk.excluded)||[];
  const exNote=ex.length?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险贡献（故各主题风险占比之和可能 <100%）：${ex.join('、')}</div>`:'';
  const card2=`<div class="card"><div class="dh"><span class="t">主题 / 行业结构</span><span class="nm">把相关标的合成一个敞口 · 资金占比 vs 风险占比（复用风险贡献，零重算）</span></div>${callout}
-   <div class="scroll"><table><thead><tr><th class="l">主题</th><th>来源</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th><th>只数</th></tr></thead><tbody>${tRows}</tbody></table></div>${exNote}</div>`;
+   <div class="scroll"><table><thead><tr><th class="l">主题</th><th>来源</th><th>资金权重</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该主题风险占比减资金占比；正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th>只数</th></tr></thead><tbody>${tRows}</tbody></table></div>${exNote}</div>`;
  // Card 3: concentration / effective-N
  const c=X.conc;let badges=[];
  if(c){badges=[['名义持仓数',c.nominalN+' 只'],['集中度指数 '+gl('HHI','HHI')+'（资金）',c.hhiWeight!=null?c.hhiWeight.toFixed(2):'—'],['约等于几个独立押注 ('+gl('effN','有效持仓数')+'·资金)',c.effNWeight!=null?('≈ '+c.effNWeight.toFixed(1)):'—']];
@@ -1890,6 +1898,23 @@ function structureCard(){
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>${howto}</div>`;
  return card1+card2+card3;
 }
+function contributionCard(){
+ // pure presentation over the existing payload: per-name unrealized $ = value − cost (broker-exact). NOT a TWR attribution.
+ const held=stocks.filter(x=>x.held&&x.unreal!=null);
+ if(!held.length)return '<div class="card"><div class="dh"><span class="t">盈亏贡献</span></div><div class="note">暂无持仓未实现盈亏数据。非投资建议。</div></div>';
+ const ranked=held.slice().sort((a,b)=>Math.abs(b.unreal)-Math.abs(a.unreal));
+ const totUn=held.reduce((a,x)=>a+x.unreal,0);
+ const maxAbs=Math.max.apply(null,held.map(x=>Math.abs(x.unreal)))||1;
+ const showShare=Math.abs(totUn)>maxAbs;   // only show % when the net dominates the largest single name (else share is sign-mixed nonsense)
+ const rows=ranked.slice(0,10).map(x=>{const hw=Math.min(Math.abs(x.unreal)/maxAbs,1)*50,left=x.unreal>=0?50:50-hw,c=x.unreal>0?'#4FB286':(x.unreal<0?'#E5707A':'var(--mut)');
+   const share=showShare?`<span class="fst" style="color:${c}">${(x.unreal/totUn*100).toFixed(0)}%</span>`:'<span class="fst"></span>';
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})"><span class="fsym">${x.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${hw}%;background:${c}"></div></div><span class="fval" style="color:${c}">${fmt(x.unreal)}</span>${share}</div>`;}).join('');
+ const shareNote=showShare?'右列=占组合未实现盈亏净额的比例。':'各仓盈亏方向不一、净额较小，占比无意义，故只看绝对金额（条形）。';
+ return `<div class="card"><div class="dh"><span class="t">盈亏贡献 · 谁在拉高 / 拉低</span><span class="nm">按未实现盈亏绝对额排序（点击看个股）</span></div>
+   <div class="legend"><span><i style="background:#4FB286"></i>拉高</span><span><i style="background:#E5707A"></i>拉低</span><span class="note">条形=相对最大贡献的金额</span></div>
+   ${rows}
+   <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>这是<b>未实现盈亏的“金额”贡献</b>（每只 = 当前市值 − 成本），看谁在把组合拉高、谁在拖累。${shareNote}<b>这不是时间加权(TWR)归因</b>——真正的 TWR 拆解需要每日持仓权重，本导出无法重建，故此处只用金额。<b>非投资建议。</b></div></div>`;
+}
 function scorecardCard(){
  const mv=S.marketValue||1;
  const bias=(DATA.behavior&&DATA.behavior.biasBySym)||{};
@@ -1897,7 +1922,7 @@ function scorecardCard(){
  const dm=rebalDriftMap();
  const BL={concentration:'集中',disposition:'浮亏持有',sunkcost:'越跌越买',recency:'追涨',anchoring:'回本卖'};
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now);
- if(!held.length)return'';
+ if(!held.length)return'<div class="card"><div class="dh"><span class="t">决策一览</span></div><div class="note">暂无可汇总的持仓信号：每只持仓需 ≥21 个交易日的价格样本才能计算技术姿态。新加入的持仓会在样本积累后出现于此。本表为客观汇总，非投资建议。</div></div>';
  const data=held.map(x=>{
    const w=x.value/mv*100,n=x.fib.now,sig=(x.fib.signals||[]).slice(-1)[0],c=rc[x.sym],bl=bias[x.sym]||[],d=dm.map[x.sym];
    let attn=0;
@@ -1908,11 +1933,11 @@ function scorecardCard(){
    const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
    const rsiCls=n.rsi>70?'neg':(n.rsi<30?'pos':'');
    let riskCell='<td>—</td><td>—</td>';
-   if(c){const g=c.gap,gc=g>0?'#E5707A':'#4FB286',bw=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-bw;
+   if(c){const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-bw;
      riskCell=`<td>${c.riskPct.toFixed(1)}%</td><td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
    const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#E8B339';return `<span class="chip" style="color:${col};border-color:${col}66">${BL[b.id]||b.id}</span>`;}).join(' '):'<span class="note">—</span>';
    let driftCell='<td>—</td>';
-   if(d){const g=d.drift,gc=g>0?'#E5707A':'#4FB286',bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
+   if(d){const g=d.drift,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
      driftCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
    const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">${attn}</span>`:'<span class="note">—</span>';
    const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
@@ -1962,7 +1987,7 @@ function optionsExposureCard(){
    <div class="hero-fig" style="margin:6px 0 2px">期权总市值（毛额/GROSS） ${fmt(A.optMarkGross)} <span style="font-size:13px;color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
    <div class="note" style="margin-bottom:8px">净市价仅 <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> —— 这是<b>盈亏口径</b>，不是你的敞口（小净值会掩盖大总额，Thaler p.1582）。</div>
    ${legsHtml}${tbl}
-   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。四条期权腿均在<b>保证金(Margin)账户</b>。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。四条期权腿均在<b>保证金(Margin)账户</b>。<b>非投资建议。</b></div>
    <div class="note" style="margin-top:6px;opacity:.65">Thaler 2016 · p.1582 / p.1589 / p.1594</div>
  </div>`;}
 function bridgeCard(){
@@ -1989,7 +2014,7 @@ function bridgeCard(){
  const gapCard=`<div class="card" style="border-left:3px solid ${lv[0]}">
    <div class="dh"><span class="t">${head}</span><span class="chip" style="color:${lv[0]};border-color:${lv[0]}66">${lv[1]}</span></div>
    <div class="note" style="color:var(--txt);line-height:1.6;margin-top:4px">${detail}</div>
-   <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.6">${tip}<br>${link}</div>
+   <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.6">${tip}<br>${link}</div>
    <div class="note" style="margin-top:6px;opacity:.65">Thaler 2016 · p.1582 / p.1592</div></div>`;
  return `<div class="card">
    <div class="dh"><span class="t">真金白银桥</span><span class="nm">本金 → 盈亏 → 当前市值（美元口径，回避百分比错觉）</span></div>
@@ -2001,10 +2026,10 @@ function bridgeCard(){
 }
 function insightBanner(){
  let dismissed=false;try{dismissed=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}
- const guide=dismissed?`<span class="ib-lk" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
+ const guide=dismissed?`<span class="ib-lk" role="button" tabindex="0" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
  const A=DATA.account,X=DATA.alloc,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
- const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" onclick="ovGo('${seg}')">${t} →</span>`;
- const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
+ const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" onclick="ovGo('${seg}')">${t} →</span>`;
+ const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${ppf(pr-nq)}`:''}）`;
  const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
  const tr=(DATA.risk&&DATA.risk.contrib&&DATA.risk.contrib[0])?DATA.risk.contrib[0].sym:null;
  const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%，毛额·市价口径，净≈${fmt(A.optMarkNet)}，非 Delta/名义），未计入上方市值`:'';
@@ -2020,7 +2045,7 @@ function insightBanner(){
 function renderOverview(){
  CHARTREG={};
  const ser=DATA.series||[],right=document.getElementById('right');
- if(ser.length<2){right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
+ if(ser.length<2){const _ins0=document.getElementById('insight');if(_ins0)_ins0.innerHTML=onboardStrip();right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
  const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn;
  const cards=[
   ['当前持仓市值',fmt(S.netWorthNow)],
@@ -2043,15 +2068,17 @@ function renderOverview(){
    <div class="dh"><span class="t">组合总览</span><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部“全账户”卡片）</span></div>
    <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
  </div>
- <div class="card"><div style="font-weight:650;margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
-   <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#4FB286">绿=强(>15)</span> / <span style="color:#E8B339">黄=中性</span> / <span style="color:#E5707A">红=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
+ <div class="card"><div class="cap" style="margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
+   <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#E8B339">琥珀=强(>15)</span> / <span style="color:#9A8A4A">浅琥珀=中性</span> / <span style="color:#6B7079">灰=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
    ${nwChart(ser)}</div>${bridgeCard()}
  </div>
  <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
  <div class="seg" data-seg="cmp" hidden>
- <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
-   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#6E9CA6"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#6E9CA6',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}</div>
+ <div class="card"><div class="cap" style="margin-bottom:4px">累计收益率对比（%，时间加权）</div>
+   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#B6BAC1"></i>纳斯达克综合</span></div>
+   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#B6BAC1',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}
+   <div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这三条都是<b>时间加权(TWR)</b>——只评判选股 / 策略本身，<b>剔除了你出入金的时点</b>，所以 ≠ 你的钱实际赚到的回报（你的钱真实经历看“净值”里的 <b>MWR</b>）。虚线为基准，<b>悬停看超额(pp)</b>，即我的组合(琥珀)与 S&P(灰虚线)之间的差距。<b>非投资建议。</b></div></div>
+ `+contributionCard()+`
  </div>
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
@@ -2064,7 +2091,7 @@ function renderOverview(){
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
  const bear=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bear');
- const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
+ const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
  return `<div class="card"><div class="dh"><span class="t">今日多指标共振</span><span class="nm">趋势排列 + 3日内金/死叉 + RSI 未极端 → 高确信度</span></div>
    <div style="margin-top:10px"><div class="l" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px;font-weight:600">多头共振 · ${bull.length}</div>
    <div style="display:flex;gap:8px;flex-wrap:wrap">${bull.map(x=>chip(x,'#4FB286')).join('')||'<span class="note">无</span>'}</div></div>
@@ -2076,7 +2103,7 @@ function fibRanking(){
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
  if(!held.length)return'';
  const rows=held.map(x=>{const m=x.fib.now.mom,c=momColor(m),w=Math.abs(m)/100*50,left=m>=0?50:50-w;
-   return `<div class="frow" style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <span class="fsym"><span style="color:${FIBCOL[x.fib.now.state]}">●</span> ${x.sym}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${m>0?'+':''}${m}</span>
@@ -2089,7 +2116,7 @@ const FIBCOL={up:'#4FB286',down:'#E5707A',range:'#888D96',mixed:'#E8B339'};
 const FIBLBL={up:'多头趋势',down:'空头趋势',range:'盘整纠缠',mixed:'转换中'};
 function momColor(m){return m>15?'#4FB286':(m<-15?'#E5707A':'#E8B339');}
 function fibBadges(n,signals,curLabel){
- const sc=momColor(n.mom),rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'#e6ecf5');
+ const sc=momColor(n.mom),rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'var(--txt)');
  const lastSig=(signals||[]).slice(-1)[0];
  return [
   [curLabel||'斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
@@ -2119,7 +2146,7 @@ function portfolioFibCard(){
    <div style="font-weight:650;margin:12px 0 2px">组合动能振荡器（−100 ~ +100）</div>
    ${svgLines(sser,[{key:'mom',color:'#E8B339',label:'动能'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:pf.signals})}
    <div style="font-weight:650;margin:12px 0 2px">组合 RSI(14)</div>
-   ${svgLines(sser,[{key:'rsi',color:'#6E9CA6',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:pf.signals})}
+   ${svgLines(sser,[{key:'rsi',color:'#888D96',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:pf.signals})}
    <div class="note" style="margin-top:10px"><b>怎么读：</b>把整支组合当成一只“基金”，在净值曲线上算 EMA 缎带与金叉/死叉，用来看组合整体的趋势结构与择时节奏。<b>金叉/死叉为快线 EMA5×EMA13 交叉</b>（非传统 50/200 日均线，更快也更灵敏）。竖虚线标出交叉日期。<b>技术参考，非投资建议。</b></div>
  </div>`;
 }
@@ -2137,7 +2164,7 @@ function positionSignalsCard(){
    const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
    const res=n.res==='bull'?'<span class="pos">多</span>':(n.res==='bear'?'<span class="neg">空</span>':'—');
    const rc=n.rsi>70?'neg':(n.rsi<30?'pos':'');
-   return `<tr style="cursor:pointer" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
      <td>${w.toFixed(1)}%</td><td style="color:${FIBCOL[n.state]}">${n.label}</td>
      <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
@@ -2152,12 +2179,12 @@ function behaviorCard(){
  const b=DATA.behavior;if(!b||!b.flags||!b.flags.length)return'<div class="card"><div class="note">行为分析数据不足。</div></div>';
  const LV={alert:['#E5707A','⚠ 需注意'],watch:['#E8B339','留意'],good:['#4FB286','✓ 良好'],info:['#888D96','提示']};
  const cards=b.flags.map(f=>{const c=LV[f.level]||LV.info;
-   const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip" style="border-color:${c[0]}55">${e}</span>`).join('')}</div>`:'';
+   const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip">${e}</span>`).join('')}</div>`:'';
    return `<div class="card" style="border-left:3px solid ${c[0]}">
      <div class="dh"><span class="t">${f.title}</span><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
      <div class="flag-head" style="color:${c[0]};margin:3px 0 6px">${f.headline}</div>
      <div class="note" style="color:var(--txt);line-height:1.55">${f.detail}</div>${ex}
-     <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
+     <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
      <div class="note" style="margin-top:6px;opacity:.65">${f.ref}</div></div>`;}).join('');
  return `<div class="card"><div class="dh"><span class="t">行为决策辅助</span><span class="nm">基于 Thaler《行为经济学：过去、现在与未来》(2016)</span></div>
    <div class="note" style="margin-top:6px;line-height:1.6">以下信号由<b>你自己的真实买卖与持仓</b>计算而来，用于发现常见的行为偏差。它们是<b>“提醒”而非投资建议</b>——目的是帮你按既定逻辑决策、少受“红/绿盘”情绪左右。</div></div>${cards}`;
@@ -2167,17 +2194,17 @@ function riskCard(){
  if(!R)return'<div class="card"><div class="dh"><span class="t">风险</span></div><div class="note">风险数据不足（需 ≥25 个交易日）。</div></div>';
  const volCls=R.annVol>R.spAnnVol?'neg':'pos';
  const badges=[
-  ['年化波动率',`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol.toFixed(1)}%</span>`],
+  [gl('vol','年化波动率'),`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol.toFixed(1)}%</span>`],
   [gl('beta','Beta β (vs S&P)'),R.beta==null?'—':`<span class="${R.beta>1?'neg':'pos'}">${R.beta.toFixed(2)}</span>`],
-  [gl('dd','最大回撤'),`<span class="neg">${R.maxDrawdown.toFixed(1)}%</span>`],
+  [gl('dd','最大回撤'),`<span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>`],
   ['当前回撤',`<span class="${cls(R.currentUnderwater)}">${R.currentUnderwater.toFixed(1)}%</span>`],
   ['收益/波动比',`${R.retVolRatio.toFixed(2)} <span class="note">(rf=0)</span>`],
  ];
- const rows=(R.contrib||[]).map(c=>{const g=c.gap,gc=g>0?'#E5707A':'#4FB286',w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
-   return `<tr style="cursor:pointer" onclick="sel='${c.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+ const rows=(R.contrib||[]).map(c=>{const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${c.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <td class="l">${c.sym}</td><td>${c.weightPct.toFixed(1)}%</td><td>${c.riskPct.toFixed(1)}%</td>
      <td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td>
-     <td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}</td></tr>`;}).join('');
+     <td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}pp</td></tr>`;}).join('');
  const exNote=(R.excluded&&R.excluded.length)?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险分解：${R.excluded.join('、')}</div>`:'';
  return `<div class="card">
    <div class="dh"><span class="t">风险</span><span class="nm">回撤 · 波动率 · Beta · 风险贡献（股票部分，不含现金/保证金/期权）</span></div>
@@ -2185,12 +2212,12 @@ function riskCard(){
  <div class="card"><div style="font-weight:650;margin-bottom:4px">水下回撤曲线（相对历史高点回撤 %）</div>
    <div class="legend"><span><i style="background:#E5707A"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span>0 = 创新高；越深 = 离高点越远（你真正“感受到”的亏损维度）</span></div>
    ${svgLines(R.uwSeries,[{key:'uw',color:'#E5707A',label:'我的回撤'},{key:'spuw',color:'#888D96',dash:1,label:'S&P回撤'}],{zero:true,area:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'uw',b:'spuw',label:'相对 S&P'}})}
-   <div class="note" style="margin-top:6px">最大回撤 <span class="neg">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
+   <div class="note" style="margin-top:6px">最大回撤 <span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">21 日滚动年化波动率</div>
    <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span></div>
    ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339',label:'我的波动'},{key:'spvol',color:'#888D96',dash:1,label:'S&P波动'}],{fmt:v=>v.toFixed(0)+'%'})}</div>
  <div class="card"><div class="dh"><span class="t">风险贡献分解</span><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
-   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th></tr></thead>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该标的风险占比减资金占比；正(红)=波动放大器、负(绿)=分散器">风险−资金</th></tr></thead>
    <tbody>${rows}</tbody></table></div>${exNote}
    <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
 }
@@ -2224,7 +2251,7 @@ function rebalancePlanner(){
  const rule=rebalDraft,uni=rebalUniverse(),volMap=rebalVolMap();
  if(!uni.u.length)return '<div class="card"><div class="dh"><span class="t">再平衡计划</span></div><div class="note">暂无持仓可用于再平衡。</div></div>';
  const invvolOk=DATA.risk&&uni.u.every(x=>volMap[x.sym]>0);
- const bt=(active,attrs,lbl,dis)=>`<button ${attrs} ${dis?'disabled':''} style="padding:5px 11px;border-radius:7px;border:1px solid ${active?'#E8B339':'#2A2E36'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':(dis?'#555':'#cfd3da')};cursor:${dis?'not-allowed':'pointer'};font-size:12px;margin-right:6px">${lbl}</button>`;
+ const bt=(active,attrs,lbl,dis)=>`<button ${attrs} ${dis?'disabled':''} style="padding:5px 11px;border-radius:var(--r-ctl);border:1px solid ${dis?'var(--line)':(active?'#E8B339':'var(--line)')};background:${dis?'transparent':(active?'rgba(232,179,57,.12)':'transparent')};color:${dis?'#555':(active?'#E8B339':'var(--txt)')};cursor:${dis?'not-allowed':'pointer'};font-size:12px;margin-right:6px">${lbl}</button>`;
  const pol=(k,lbl,dis)=>bt(rule.policy===k,`data-reb="pol" data-v="${k}"`,lbl,dis);
  const gl=(k,lbl)=>bt(rule.glide===k,`data-reb="glide" data-v="${k}"`,lbl,false);
  const stamp=rule.setOn?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">规则设定于 ${rule.setOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">建议默认 · 未保存</span>`;
@@ -2233,8 +2260,8 @@ function rebalancePlanner(){
    <div class="dh"><span class="t">再平衡计划</span><span class="nm">现在冷静时定下规则，之后由面板替你执行（Thaler 的 planner / doer 两个自我）</span></div>
    <div class="note" style="margin:2px 0 8px;line-height:1.6">规则存在本浏览器、跨刷新有效，替你扛住情绪上头的那一刻。你是<b>接受/微调默认</b>，而非从零搭建。 ${stamp}</div>
    ${row('策略',pol('cap','限制集中度')+pol('equal','等权')+pol('invvol','反波动·风险平价',!invvolOk))}
-   ${rule.policy==='cap'?row('单一上限',`<input id="rebCap" type="number" min="5" max="50" step="1" value="${rule.cap}" style="width:60px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:3px 6px"> %`):''}
-   ${row('触发区间 ±',`<input id="rebBand" type="number" min="1" max="20" step="0.5" value="${rule.band}" style="width:60px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:3px 6px"> pp <span class="note">（落在带内就什么都不做）</span>`)}
+   ${rule.policy==='cap'?row('单一上限',`<input id="rebCap" type="number" min="5" max="50" step="1" value="${rule.cap}" aria-label="单一上限（百分比 %）" style="width:60px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:3px 6px"> %`):''}
+   ${row('触发区间 ±',`<input id="rebBand" type="number" min="1" max="20" step="0.5" value="${rule.band}" aria-label="触发区间 ±（百分点 pp）" style="width:60px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:3px 6px"> pp <span class="note">（落在带内就什么都不做）</span>`)}
    ${row('回归方式',gl('edge','回到区间边缘')+gl('center','回到目标中心'))}
    <div style="margin-top:6px;display:flex;gap:8px">${bt(true,'id="rebSave"','确认并保存规则',false)}${bt(false,'id="rebClear"','清除规则',false)}</div></div>`;
  return controls+`<div id="rebalOut">`+rebalOutput(rule,uni,volMap)+`</div>`+rebalHonesty();
@@ -2254,25 +2281,25 @@ function rebalOutput(rule,uni,volMap){
  const top=rows[0],topT=Math.max.apply(null,tn);
  const top5n=wn.slice(0,5).reduce((a,b)=>a+b,0),top5t=tn.slice().sort((a,b)=>b-a).slice(0,5).reduce((a,b)=>a+b,0);
  let banner;
- if(!out.length)banner=`<div class="card" style="border-left:3px solid #4FB286"><div style="font-weight:650;color:#4FB286">✓ 全部在区间内 · 无需操作</div><div class="note" style="margin-top:4px">在带内什么都不做，才是纪律所在——也直接对冲你的高换手。这是纪律的胜利。</div></div>`;
- else banner=`<div class="card" style="border-left:3px solid #E5707A"><div style="font-weight:650;color:#E5707A">你预先设定的规则触发了：${out.length} 只标的越界</div><div class="note" style="margin-top:4px">这不是“市场动了快行动”，而是你冷静时定下的 ±${band}pp 带宽到点了。${tt.note?'<br>'+tt.note:''}</div></div>`;
+ if(!out.length)banner=`<div class="card" style="border-left:3px solid #4FB286"><div class="flag-head" style="color:#4FB286;margin:0 0 2px">✓ 全部在区间内 · 无需操作</div><div class="note" style="margin-top:4px">在带内什么都不做，才是纪律所在——也直接对冲你的高换手。这是纪律的胜利。</div></div>`;
+ else banner=`<div class="card" style="border-left:3px solid #E5707A"><div class="flag-head" style="color:#E5707A;margin:0 0 2px">你预先设定的规则触发了：${out.length} 只标的越界</div><div class="note" style="margin-top:4px">这不是“市场动了快行动”，而是你冷静时定下的 ±${band}pp 带宽到点了。${tt.note?'<br>'+tt.note:''}</div></div>`;
  const badges=[['最大持仓',`${top.sym} ${top.w.toFixed(0)}% → ${topT.toFixed(0)}%`],['前五合计',`${top5n.toFixed(0)}% → ${top5t.toFixed(0)}%`],
    ['HHI 集中度',`${hhi(wn).toFixed(2)} → ${hhi(tn).toFixed(2)}`],['越界标的',`${out.length} / ${rows.length}`],['双向成交额',`≈ ${fmt(sells+buys)}`]];
- const bars=rows.map(r=>{const c=r.inB?'#888D96':(r.drift>0?'#E5707A':'#4FB286'),wd=Math.min(Math.abs(r.drift),20)/20*50,left=r.drift>=0?50:50-wd;
-   return `<div class="frow" style="cursor:pointer" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+ const bars=rows.map(r=>{const c=r.inB?'#888D96':'#E8B339',wd=Math.min(Math.abs(r.drift),20)/20*50,left=r.drift>=0?50:50-wd;
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <span class="fsym">${r.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</span><span class="fst">${r.inB?'区间内':(r.drift>0?'超配':'低配')}</span></div>`;}).join('');
  const arows=out.map(r=>{const sh=r.sh==null?'<span class="note">缺价</span>':((r.d$<0?'−':'+')+Math.abs(r.sh)+'股'),edge=rule.glide==='center'?'目标':(r.drift>0?'上沿':'下沿');
-   return `<tr style="cursor:pointer" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
      <td class="l">${r.sym}</td><td>${r.w.toFixed(1)}%</td><td>${r.lo.toFixed(0)}–${(r.t+band).toFixed(0)}%</td>
-     <td style="color:${r.drift>0?'#E5707A':'#4FB286'}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</td>
+     <td style="color:${r.inB?'#888D96':'#E8B339'}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</td>
      <td class="l">${sh} <span class="note">(${fmt(Math.abs(r.d$))})</span> 拉回${edge}</td></tr>`;}).join('');
  const actionTable=out.length?`<div class="card"><div class="dh"><span class="t">动作清单</span><span class="nm">仅越界标的 · 你的规则触发</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>当前</th><th>目标区间</th><th>偏离pp</th><th class="l">动作</th></tr></thead><tbody>${arows}</tbody></table></div>
    <div class="note" style="margin-top:8px">卖出释放 ${fmt(sells)} · 买入部署 ${fmt(buys)} · 净${net>=0?'需追加':'释放'} ${fmt(Math.abs(net))}（股数已取整，带内标的不动）。</div></div>`:'';
  return banner+`<div class="card"><div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>`
    +`<div class="card"><div style="font-weight:650;margin-bottom:4px">权重偏离目标（pp）· 颜色 = 方向</div>
-      <div class="legend"><span><i style="background:#E5707A"></i>超配</span><span><i style="background:#4FB286"></i>低配</span><span><i style="background:#888D96"></i>区间内·无需操作</span></div>${bars}</div>`+actionTable;
+      <div class="legend"><span><i style="background:#E8B339"></i>越界·需操作</span><span><i style="background:#888D96"></i>区间内·无需操作</span><span class="note">方向（超配/低配）见每行标签</span></div>${bars}</div>`+actionTable;
 }
 function wireRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(!seg)return;
  seg.querySelectorAll('[data-reb]').forEach(b=>b.onclick=()=>{if(b.disabled)return;const k=b.dataset.reb,v=b.dataset.v;if(k==='pol')rebalDraft.policy=v;if(k==='glide')rebalDraft.glide=v;rerenderRebal();});
@@ -2319,7 +2346,7 @@ function maturityCard(){
  const weakLine=m.score==null?'记录第一条论点即可点亮评分。':(m.weak&&m.weak.val<0.9?`你的最大短板：${m.weak.label} 仅 ${(m.weak.val*100).toFixed(0)}%（n=${m.weak.n}）`:'流程很扎实，保持记录的连贯性即可。');
  return `<div class="card" style="border-left:3px solid #E8B339">
    <div class="dh"><span class="t">投资成熟度评分</span><span class="nm">只衡量你能控制的「流程」，与盈亏无关</span></div>
-   <div class="hero-fig" style="color:var(--txt);margin:4px 0 2px">${m.score==null?'起步':m.score}<span style="font-size:14px;color:var(--mut)">${m.score==null?' · 尚无足够日志':' / 100'}</span> <span class="chip" style="color:var(--mut);border-color:#2A2E36">${maturityBand(m.score)}</span></div>
+   <div class="hero-fig" style="color:var(--txt);margin:4px 0 2px">${m.score==null?'起步':m.score}<span style="font-size:14px;color:var(--mut)">${m.score==null?' · 尚无足够日志':' / 100'}</span> <span class="chip" style="color:var(--mut);border-color:var(--line)">${maturityBand(m.score)}</span></div>
    <div class="note" style="margin:2px 0 8px">高分=流程纪律好，与赚不赚钱无关；一笔靠运气赚到的钱不会提高这个分数。<b>${weakLine}</b></div>
    ${bars}</div>`;
 }
@@ -2333,7 +2360,7 @@ function killerStatCard(){
    const wd=m==null?0:Math.min(Math.abs(m-base),30)/30*50,left=(m!=null&&m>=base)?50:50-wd;
    return `<div class="frow"><span class="fsym" style="width:auto;min-width:96px">${label}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
-     <span class="fval" style="color:${c}">${m==null?'—':(m>=0?'+':'')+m.toFixed(1)+'%'}</span>
+     <span class="fval" style="color:var(--txt)">${m==null?'—':(m>=0?'+':'')+m.toFixed(1)+'%'}</span>
      <span class="fst">n=${g.length}${small?' 样本不足':''}</span></div>`;};
  return `<div class="card"><div class="dh"><span class="t">计划遵守 → 结果</span><span class="nm">${gl('killer','在计划内 vs 计划外')}的平均未实现%（基线=全部持仓均值 ${base==null?'—':(base>=0?'+':'')+base.toFixed(1)+'%'}）</span></div>
    ${bar('在计划内',inn)}${bar('计划外',out)}
@@ -2343,7 +2370,7 @@ function emotionOutcomeCard(){
  const J=journalLoad().entries, held=stocks.filter(x=>x.held);
  const tags=J_DESTRUCT.concat(J_CONSTRUCT).filter(t=>held.some(x=>J[x.sym]&&J[x.sym].emotion===t));
  if(!tags.length)return '';
- const rows=tags.map(t=>{const g=held.filter(x=>J[x.sym]&&J[x.sym].emotion===t),m=meanBy(g,x=>x.unrealPct),small=g.length<3,dc=J_DESTRUCT.indexOf(t)>=0?'#E5707A':'#4FB286';
+ const rows=tags.map(t=>{const g=held.filter(x=>J[x.sym]&&J[x.sym].emotion===t),m=meanBy(g,x=>x.unrealPct),small=g.length<3,dc='var(--mut)';   // dot is neutral — green/red stays for P&L sign only; the emotion label itself names destructive vs constructive
    return `<tr style="${small?'color:var(--mut)':''}"><td class="l"><span style="color:${dc}">●</span> ${t}</td><td class="${small?'':cls(m)}">${m==null?'—':(m>=0?'+':'')+m.toFixed(1)+'%'}</td><td class="note">n=${g.length}${small?' 样本不足':''}</td></tr>`;}).join('');
  return `<div class="card"><div class="dh"><span class="t">${gl('emoOut','情绪 → 结果')}</span><span class="nm">各情绪标签下持仓的平均未实现%</span></div>
    <div class="scroll"><table><thead><tr><th class="l">情绪</th><th>平均未实现%</th><th>样本</th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -2354,7 +2381,7 @@ function unjournaledWorklist(){
  const held=stocks.filter(x=>x.held).sort((a,b)=>b.value-a.value);
  const todo=held.filter(x=>!J[x.sym]);
  if(!todo.length)return `<div class="card"><div class="dh"><span class="t">待写日志</span></div><div class="note">✓ 所有持仓都已写下论点。保持下去。</div></div>`;
- const rows=todo.map(x=>`<div class="frow jwork" data-jsym="${x.sym}" style="cursor:pointer"><span class="fsym">${x.sym}</span><span class="fval">${(x.value/mv*100).toFixed(1)}%</span><span class="fst">${fmt(x.value)}</span></div>`).join('');
+ const rows=todo.map(x=>`<div class="frow jwork" data-jsym="${x.sym}" style="cursor:pointer"><span class="fsym">${x.sym}</span><div class="fbar"><div class="p" style="left:0;width:${Math.min(x.value/mv*100,100)}%;background:#E8B339"></div></div><span class="fval">${(x.value/mv*100).toFixed(1)}%</span><span class="fst" style="width:auto;min-width:80px;text-align:right">${fmt(x.value)}</span></div>`).join('');
  return `<div class="card"><div class="dh"><span class="t">待写日志 · ${todo.length} 只</span><span class="nm">按权重排序（点开写论点）</span></div>${rows}
    <div class="note" style="margin-top:8px">先给这些持仓写下论点，最能提高你的日志覆盖率。</div></div>`;
 }
@@ -2364,16 +2391,16 @@ function weeklyReview(){
  const facts=[['本周市值',fmt(mv)],['区间收益',pct(S.curReturn)],['超额 vs 标普',S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)],
    ['最大回撤',DATA.risk?(DATA.risk.maxDrawdown.toFixed(1)+'%'):'—'],['行为缺口',S.behaviorGap==null?'—':(S.behaviorGap>0?'+':'')+S.behaviorGap.toFixed(2)+'pp'],
    ['最大持仓',topH?topH.sym+' '+(topH.value/mv*100).toFixed(0)+'%':'—'],['本周日志覆盖',cov+'/'+heldN]];
- const ta=(id,lbl,v)=>`<div style="margin:8px 0 2px;font-size:12px;color:var(--mut)">${lbl}</div><textarea id="${id}" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical">${jesc(v)}</textarea>`;
+ const ta=(id,lbl,v)=>`<div style="margin:8px 0 2px;font-size:12px;color:var(--mut)">${lbl}</div><textarea id="${id}" rows="2" aria-label="${lbl}" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical">${jesc(v)}</textarea>`;
  const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">本周复盘 · 保存于 ${r.savedOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">本周尚未复盘</span>`;
  return `<div class="card"><div class="dh"><span class="t">每周复盘 · ${wk}</span><span class="nm">把复盘做成每周默认动作</span> ${stamp}</div>
    <div class="badges">${facts.map(f=>`<div class="badge"><div class="l">${f[0]}</div><div class="v">${f[1]}</div></div>`).join('')}</div>
    <div class="note" style="margin:6px 0">事实由面板自动带入——你无法事后改写，只能据此反思。</div>
    ${ta('rvBest','本周最好的决策',r.best)}${ta('rvWorst','本周最差的决策',r.worst)}${ta('rvLesson','学到了什么',r.lesson)}${ta('rvDo','下周要做',r.doNext)}${ta('rvAvoid','下周要避免',r.avoidNext)}
-   <div style="margin-top:8px;display:flex;gap:8px"><button id="rvSave" style="padding:6px 14px;border-radius:7px;border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存本周复盘</button><button id="rvClear" style="padding:6px 14px;border-radius:7px;border:1px solid #2A2E36;background:transparent;color:#cfd3da;cursor:pointer">清除本周</button></div></div>`;
+   <div style="margin-top:8px;display:flex;gap:8px"><button id="rvSave" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存本周复盘</button><button id="rvClear" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid var(--line);background:transparent;color:var(--txt);cursor:pointer">清除本周</button></div></div>`;
 }
 function journalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">怎么读 · 边界说明</summary>
- <div class="note" style="margin-top:8px;line-height:1.65">成熟度评分<b>只看流程、不看盈亏</b>——靠运气赚的钱不会加分。小样本仅描述、非预测（任一分组 n&lt;3 不显示颜色结论）。<b>结果 ≠ 决策质量</b>：别用结果回头改写当时的论点（updatedAt 已标注写作日期；复盘与论点分两个字段正是为此）。不做多维交叉切片（避免在 情绪×周期×信念 里凑出偶然结论）。别过度记录：日志是为了执行计划，不是替代交易。日志与复盘<b>只存在本浏览器本设备</b>，不跨设备、不上传。<b>非投资建议。</b></div></details></div>`;}
+ <div class="note" style="margin-top:8px;line-height:1.65">成熟度评分<b>只看流程、不看盈亏</b>——靠运气赚的钱不会加分。小样本仅描述、非预测（任一分组 n&lt;3 不显示颜色结论）。<b>结果 ≠ 决策质量</b>：别用结果回头改写当时的论点（updatedAt 已标注更新日期；复盘与论点分两个字段正是为此）。不做多维交叉切片（避免在 情绪×周期×信念 里凑出偶然结论）。别过度记录：日志是为了执行计划，不是替代交易。日志与复盘<b>只存在本浏览器本设备</b>，不跨设备、不上传。<b>非投资建议。</b></div></details></div>`;}
 function journalCard(){return weeklyReview()+maturityCard()+killerStatCard()+emotionOutcomeCard()+unjournaledWorklist()+journalHonesty();}
 function wireJournalTab(){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg)return;
  seg.querySelectorAll('.jwork').forEach(r=>r.onclick=()=>{const sym=r.dataset.jsym;try{localStorage.setItem('ptrak.seg.stk','journal');}catch(e){}sel=sym;renderList();window.scrollTo({top:0,behavior:'smooth'});});
@@ -2387,15 +2414,15 @@ function rerenderJournalTab(){const seg=document.querySelector('.seg[data-seg="j
 function positionJournalEditor(s){
  if(journalDraft===null)journalDraft=Object.assign({},journalEntry(s.sym)||{});
  const d=journalDraft;
- const chip=(field,val,active)=>`<button data-jf="${field}" data-jv="${val}" style="padding:5px 11px;border-radius:7px;border:1px solid ${active?'#E8B339':'#2A2E36'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':'#cfd3da'};cursor:pointer;font-size:12px;margin:0 6px 6px 0">${val}</button>`;
+ const chip=(field,val,active)=>`<button data-jf="${field}" data-jv="${val}" aria-pressed="${active?'true':'false'}" style="padding:5px 11px;border-radius:var(--r-ctl);border:1px solid ${active?'#E8B339':'var(--line)'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':'var(--txt)'};cursor:pointer;font-size:12px;margin:0 6px 6px 0">${val}</button>`;
  const row=(lbl,body)=>`<div style="margin:9px 0"><div style="font-size:12px;color:var(--mut);margin-bottom:5px">${lbl}</div>${body}</div>`;
- const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${v==null?'':v}" placeholder="${ph}" style="width:90px;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:4px 7px;margin-right:8px">`;
+ const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${v==null?'':v}" placeholder="${ph}" aria-label="${ph}" style="width:90px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-right:8px">`;
  const ck=(d.adherence==='计划外'&&((DATA.behavior&&DATA.behavior.biasBySym&&DATA.behavior.biasBySym[s.sym])||[]).some(b=>b.id==='disposition'))?`<div class="note" style="margin:6px 0;color:#E5707A">⚠ 处置效应 + 计划外卖出 = 信号叠加，值得复盘。</div>`:'';
  const ck2=(d.conviction>=4&&d.planStop==null)?`<div class="note" style="margin:6px 0;color:#E8B339">⚠ 高信念却未设失效条件（“看到再说”反模式）。</div>`:'';
- const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">论点写于 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">尚未记录 · 未保存</span>`;
+ const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">上次更新 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">尚未记录 · 未保存</span>`;
  return `<div class="card">
    <div class="dh"><span class="t">交易日志 · ${s.sym}</span><span class="nm">大多是点选，目标 &lt; 1 分钟</span> ${stamp}</div>
-   ${row('论点（为什么买/持有）',`<textarea id="jThesis" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="buy 时写下卖出条件，让卖出由逻辑驱动而非红绿驱动">${jesc(d.thesis)}</textarea>`)}
+   ${row('论点（为什么买/持有）',`<textarea id="jThesis" rows="2" aria-label="论点（为什么买/持有）" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="买入时就写下卖出条件，让卖出由逻辑驱动、而非红绿驱动">${jesc(d.thesis)}</textarea>`)}
    ${row('计划（入场 · 目标 · 止损/失效）',num('jEntry',d.planEntry,'入场')+num('jTarget',d.planTarget,'目标')+num('jStop',d.planStop,'止损/失效'))}
    ${row('信念',[1,2,3,4,5].map(v=>chip('conviction',v,d.conviction===v)).join(''))}
    ${row('时间维度',['日内','波段','核心多年'].map(v=>chip('horizon',v,d.horizon===v)).join(''))}
@@ -2403,13 +2430,14 @@ function positionJournalEditor(s){
    ${row('是否按计划',['在计划内','计划外'].map(v=>chip('adherence',v,d.adherence===v)).join(''))}
    ${row('清单：若我现在空仓，会按这个价格、这个仓位重新买入它吗？',['是','否'].map(v=>chip('checklist',v,d.checklist===v)).join(''))}
    ${ck}${ck2}
-   ${row('复盘（事后反思，独立于上面的论点）',`<textarea id="jLesson" rows="2" style="width:100%;background:#15171B;color:#e6ecf5;border:1px solid #2A2E36;border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="别因为亏了就把当时合理的逻辑判成错的；判断决策看当时信息，不看结果。">${jesc(d.lesson)}</textarea>`)}
-   <div style="margin-top:8px;display:flex;gap:8px"><button id="jSave" style="padding:6px 14px;border-radius:7px;border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存日志</button><button id="jClear" style="padding:6px 14px;border-radius:7px;border:1px solid #2A2E36;background:transparent;color:#cfd3da;cursor:pointer">清除</button></div>
+   ${row('复盘（事后反思，独立于上面的论点）',`<textarea id="jLesson" rows="2" aria-label="复盘（事后反思，独立于上面的论点）" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="别因为亏了就把当时合理的逻辑判成错的；判断决策看当时信息，不看结果。">${jesc(d.lesson)}</textarea>`)}
+   <div style="margin-top:8px;display:flex;gap:8px"><button id="jSave" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存日志</button><button id="jClear" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid var(--line);background:transparent;color:var(--txt);cursor:pointer">清除</button></div>
    <div class="note" style="margin-top:8px">日志只存在本浏览器本设备，不跨设备同步。判断决策看当时信息、不看结果。<b>非投资建议。</b></div></div>`;
 }
 function wireJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg||!s)return;
  seg.querySelectorAll('[data-jf]').forEach(b=>b.onclick=()=>{const f=b.dataset.jf;let v=b.dataset.jv;if(f==='conviction')v=+v;journalDraft[f]=(journalDraft[f]===v)?null:v;rerenderJournalEditor(s);});
  [['jEntry','planEntry'],['jTarget','planTarget'],['jStop','planStop']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.onchange=()=>{journalDraft[f]=el.value===''?null:+el.value;};});
+ [['jThesis','thesis'],['jLesson','lesson']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.oninput=()=>{journalDraft[f]=el.value;};});   // sync textareas live so a chip click (which rebuilds the editor) can't wipe typed text
  const sv=seg.querySelector('#jSave');if(sv)sv.onclick=()=>{const t=seg.querySelector('#jThesis'),l=seg.querySelector('#jLesson');if(t)journalDraft.thesis=t.value;if(l)journalDraft.lesson=l.value;journalSaveEntry(s.sym,journalDraft);journalDraft=Object.assign({},journalEntry(s.sym));rerenderJournalEditor(s);};
  const cl=seg.querySelector('#jClear');if(cl)cl.onclick=()=>{if(journalEntry(s.sym)&&!confirm('清除这只持仓的日志？'))return;journalClearEntry(s.sym);journalDraft={};rerenderJournalEditor(s);};}
 function rerenderJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=positionJournalEditor(s);wireJournalEditor(s);}}
@@ -2451,16 +2479,16 @@ function fibChart(s,fmtY){
  const cid='c'+(++CHARTID),SW={up:'多头',down:'空头',range:'盘整',mixed:'转换'};
  CHARTREG[cid]={dates:prices.map(p=>+new Date(p[0])),rows:prices.map((p,i)=>{const dt=new Date(p[0]);return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#6B7079"></i>价格 '+yl(p[1])+'</span><span class="xr"><i style="background:#E8B339"></i>EMA5 '+yl(f.e5[i])+'</span><span class="xr"><i style="background:#5F6168"></i>EMA21 '+yl(f.e21[i])+'</span><span class="xr" style="color:'+(FIBCOL[f.state[i]]||'#888D96')+'">状态 '+(SW[f.state[i]]||f.state[i])+'</span>';})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
- return `<svg id="${cid}" class="xh" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ return `<svg id="${cid}" class="xh" role="img" aria-label="数据图表 · 关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function renderFib(s){
  const f=s.fib;if(!f)return`<div class="card"><div class="dh"><span class="t">斐波那契动能分析</span><span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div><div class="note">价格数据不足（需 ≥21 个交易日），无法计算该股的斐波那契指标。新建仓或上市不久的标的会出现这种情况。</div></div>`;
  const n=f.now,sc=momColor(n.mom);
- const rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'#e6ecf5');
+ const rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'var(--txt)');
  const lastSig=(f.signals||[]).slice(-1)[0];
  const ser=s.prices.map((p,i)=>({date:p[0],mom:f.mom[i],rsi:f.rsi[i]}));
- const resChip=n.res==='bull'?'<span class="chip" style="color:#4FB286;border-color:#1f5a40;background:rgba(61,220,151,.1)">⚡ 多头共振</span>'
-   :(n.res==='bear'?'<span class="chip" style="color:#E5707A;border-color:#5a1f1f;background:rgba(255,107,107,.1)">⚡ 空头共振</span>':'');
+ const resChip=n.res==='bull'?'<span class="chip" style="color:#4FB286;border-color:#1f5a40;background:rgba(79,178,134,.1)">⚡ 多头共振</span>'
+   :(n.res==='bear'?'<span class="chip" style="color:#E5707A;border-color:#5a1f1f;background:rgba(229,112,122,.1)">⚡ 空头共振</span>':'');
  const badges=[
   ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
   [gl('mom','动能强弱'),`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
@@ -2483,7 +2511,7 @@ function renderFib(s){
    ${svgLines(ser,[{key:'mom',color:'#E8B339',label:'动能'}],{zero:true,h:200,fixed:[-105,105],fmt:v=>v.toFixed(0),
      guides:[{v:15,color:'#2f6b4f',label:'强多'},{v:-15,color:'#6b2f2f',label:'强空'}],marks:f.signals})}
    <div style="font-weight:650;margin:12px 0 2px">RSI(14)</div>
-   ${svgLines(ser,[{key:'rsi',color:'#6E9CA6',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
+   ${svgLines(ser,[{key:'rsi',color:'#888D96',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
      guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:f.signals})}
    <details class="note" style="margin-top:10px"><summary style="cursor:pointer">怎么读 · 诚实说明</summary><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
    <b>多指标共振(◎ 圆环)：</b>同时满足「均线多头/空头排列 + 3 日内出现金叉/死叉 + RSI 未到超买/超卖」三个条件才标记——比单一信号更高确信度，能过滤掉震荡市里的假交叉。<br>
@@ -2501,7 +2529,7 @@ function renderDetail(){
   ['已实现盈亏(窗口)',`<span class="${cls(s.realized)}">${fmt(s.realized)}</span>`]];
  const rows=s.txns.map(t=>{const tag=t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">期初底仓</span>');
    return `<tr><td class="l">${t.date}</td><td class="l">${tag}</td><td>${fmtN(t.qty,0)}</td><td>${fmt(t.price)}</td>
-    <td class="${t.amount<0?'':'pos'}">${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
+    <td>${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
     <td class="${cls(t.realized)}">${t.realized==null?'—':fmt(t.realized)}</td></tr>`;}).join('');
  document.getElementById('right').innerHTML=`
  <div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button><button data-seg="journal" title="给这只持仓写下论点、计划与情绪（目标 <1 分钟）">日志</button></div>
@@ -2511,7 +2539,7 @@ function renderDetail(){
      ${s.hasLegacy?'<span class="legacychip">含 '+D0+' 前旧底仓 · 成本按当日市价估算</span>':''}</div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="legend"><span><i style="background:#6B7079"></i>市场价格(Yahoo)</span><span><i style="background:#B89030"></i>持仓平均成本</span>
-     <span><i style="background:#E8B339"></i>当前价</span><span><i style="background:#4FB286"></i>买入(大小=金额)</span><span><i style="background:#E5707A"></i>卖出</span></div>
+     <span><i style="background:#E8B339"></i>当前价</span><span><i style="background:#4FB286"></i>买入(大小=金额)</span><span><i style="background:transparent;border:2px solid #E5707A;box-sizing:border-box"></i>卖出(空心环)</span></div>
    <div class="chartbox">${chart(s)}</div></div>
  </div>
  <div class="seg" data-seg="tx" hidden>
@@ -2527,6 +2555,7 @@ function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail').forEach(rail=>rail.setAttribute('role','tablist'));
  r.querySelectorAll('.seg-rail button').forEach(b=>{
   b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');
+  {const sg=b.dataset.seg,panel=r.querySelector('.seg[data-seg="'+sg+'"]');if(panel){const tid='segtab-'+sg,pid='segpanel-'+sg;b.id=tid;b.setAttribute('aria-controls',pid);panel.id=pid;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',tid);if(!panel.hasAttribute('tabindex'))panel.setAttribute('tabindex','0');}}
   b.onclick=()=>{
    r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
    r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
@@ -2534,10 +2563,10 @@ function segWire(){const r=document.getElementById('right');
 function restoreSeg(ctx){try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(!want)return;var r=document.getElementById('right'),btn=r.querySelector('.seg-rail [data-seg="'+want+'"]');if(btn&&!btn.classList.contains('on'))btn.click();}catch(e){}}
 function ovGo(seg){var b=document.querySelector('.seg-rail [data-seg="'+seg+'"]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'});}
 function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}if(done)return'';
- const j=(seg,t)=>`<span style="cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent-line)" onclick="ovGo('${seg}')">${t}</span>`;
+ const j=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" style="margin-left:0" onclick="ovGo('${seg}')">${t}</span>`;
  return `<div id="onboard" class="note" style="margin-bottom:14px;padding:10px 13px;background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:var(--r-card);line-height:1.7">
    <b style="color:var(--accent)">从这里开始</b> · 想知道我赚了多少 → ${j('score','决策一览')} / ${j('nw','净值')}　|　钱和风险集中在哪 → ${j('struct','结构')} / ${j('risk','风险')}　|　该不该调仓 → ${j('beh','行为决策')} / ${j('rebal','再平衡计划')}
-   <span style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var o=document.getElementById('onboard');if(o)o.remove()">不再显示 ✕</span></div>`;}
+   <span role="button" tabindex="0" style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var _i=document.getElementById('insight');if(_i)_i.innerHTML=onboardStrip()+insightBanner()">不再显示 ✕</span></div>`;}
 /* ===== plain-language glossary: hover/tap any .gl term -> reuse the #tt tooltip ===== */
 const GLOSS={
  thesisCov:'论点覆盖率：写了买入逻辑的持仓 ÷ 全部持仓。没论点的仓位无法事后复盘，会拉低成熟度评分。',
@@ -2556,6 +2585,7 @@ const GLOSS={
  effN:'有效持仓数 ≈ 1 ÷ HHI：把同因子标的合并后，约等于几个独立押注（常远小于名义只数）。',
  beta:'Beta：相对大盘(S&P)的波动倍数，>1 比大盘更猛、<1 更稳。',
  dd:'回撤：相对历史最高点跌了多少（描述风险，不预测未来）。',
+ vol:'年化波动率：日收益标准差×√252（颠簸幅度，非盈亏）。这里红=高于S&P（更颠簸），绿=低于S&P（更稳）；红≠亏损。',
  rc:'风险贡献：组合总波动按各持仓边际贡献拆开（合计100%），不等于资金权重。',
  mom:'动能：EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头、负=空头。',
  rsi:'RSI(14)：0–100 的强弱摆动，>70 偏超买、<30 偏超卖（技术参考）。',
@@ -2590,7 +2620,9 @@ function bindMarkers(){
      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY+14)+'px';
      const side=t.side==='BUY'?'买入':(t.side==='SELL'?'卖出':'期初底仓');
      tt.innerHTML=`<b>${m.dataset.sym} · ${side}</b><br>${t.date}<br>数量 ${fmtN(t.qty,0)} @ ${fmt(t.price)}<br>金额 ${fmt(t.amount)}${t.realized!=null?'<br>已实现 <span class="'+cls(t.realized)+'">'+fmt(t.realized)+'</span>':''}`;};
-   m.onmouseleave=()=>tt.style.display='none';});
+   m.onmouseleave=()=>tt.style.display='none';
+   m.ontouchstart=e=>{const p=e.touches&&e.touches[0];if(!p)return;e.stopPropagation();e.preventDefault();m.onmousemove({clientX:p.clientX,clientY:p.clientY});};});
+ if(!window.__mkTouchWired){window.__mkTouchWired=1;document.addEventListener('touchstart',ev=>{if(!(ev.target.classList&&ev.target.classList.contains('mk')))tt.style.display='none';},{passive:true});}
 }
 function bindCharts(){
  if(window.__xhWired)return;window.__xhWired=1;
@@ -2620,7 +2652,7 @@ function bindCharts(){
 }
 function renderOptions(){
  if(!DATA.options.length)return'';
- const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">到期/行权</span>')}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td class="${t.amount>0?'pos':''}">${fmt(t.amount)}</td></tr>`).join('');
+ const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">到期/行权</span>')}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.amount)}</td></tr>`).join('');
    return `<details><summary>${o.sym} · 净现金流 <span class="${cls(o.net)}">${fmt(o.net)}</span></summary>
      <table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>合约</th><th>权利金</th><th>金额</th></tr></thead><tbody>${tr}</tbody></table></details>`;}).join('');
  return `<div class="card"><div style="font-weight:650;margin-bottom:6px">期权交易（净现金流合计 <span class="${cls(S.optNet)}">${fmt(S.optNet)}</span>）</div>${rows}</div>`;
@@ -2628,11 +2660,12 @@ function renderOptions(){
 document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().trim();renderList();};
 document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderList();};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
- document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
- b.classList.add('on');filter=b.dataset.f;renderList();});
+ document.querySelectorAll('.tabs button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+ filter=b.dataset.f;renderList();});
 document.addEventListener('keydown',e=>{
  const a=document.activeElement;
  if(a&&a.id==='search'){if(e.key==='Escape'){a.value='';q='';renderList();}return;}
+ if(a&&a.classList&&a.classList.contains('ib-lk')&&(e.key==='Enter'||e.key===' ')){e.preventDefault();a.click();return;}
  if(e.key==='Escape'){const tt=document.getElementById('tt');if(tt&&tt.style.display==='block')return;if(sel!=='__OV__'){sel='__OV__';renderList();renderDetail();}return;}
  if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&a.parentElement.classList.contains('seg-rail')){
    const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}}});
