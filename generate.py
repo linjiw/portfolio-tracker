@@ -1473,6 +1473,11 @@ svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:no
 .totop{position:fixed; right:22px; bottom:22px; z-index:18; width:42px; height:42px; border-radius:var(--r-pill); border:1px solid var(--line); background:var(--panel2); color:var(--accent); font-size:18px; cursor:pointer; box-shadow:var(--sh-lift)}
 .totop[hidden]{display:none}
 @media (pointer:coarse){ .totop{width:48px; height:48px} svg .cx{stroke-width:1.6} }
+/* first-glance insight banner */
+.ib{border-left:3px solid var(--accent)}
+.ib-row{line-height:1.7; margin:5px 0; font-size:13.5px; color:var(--txt)}
+.ib-lk{cursor:pointer; color:var(--accent); border-bottom:1px dotted var(--accent-line); margin-left:6px; font-size:12px; white-space:nowrap}
+.ib-lk:hover{border-bottom-style:solid}
 
 /* ============================== TABLES (print-ledger) ============================== */
 table{width:100%; border-collapse:collapse; font-size:12px; margin-top:8px}
@@ -1657,6 +1662,9 @@ document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</
 const kpis=[
  ['当前持仓市值',fmt(S.marketValue),''],
  ['未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
+ ['区间收益 (时间加权)',pct(S.curReturn),cls(S.curReturn)],
+ ['超额 vs 标普',(S.spReturn==null?'—':(S.curReturn-S.spReturn>=0?'+':'')+(S.curReturn-S.spReturn).toFixed(1)+'pp'),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
+ ['期权毛敞口',(S.optMarkGross?fmt(S.optMarkGross)+' <span class="note">≈权益 '+S.optPctEquity+'%</span>':'—'),''],
  ['已实现盈亏 (窗口内·含估算)',fmt(S.realized),cls(S.realized)],
  ['期权净现金流',fmt(S.optNet),cls(S.optNet)],
  ['窗口内净买入',fmt(S.netInvested),''],
@@ -1943,6 +1951,20 @@ function bridgeCard(){
    <div class="note" style="margin-top:10px;line-height:1.6">仅股票口径（不含现金/保证金，为资金加权<b>权益账面</b> XIRR，非账户级）。未实现为券商精确，已实现为窗口内均价口径（含估算）；两者时间口径不同（未实现含建仓前浮盈，已实现仅本窗口）。累计入金约 ${fmt(B.lifeDeposits)}（净值还含“开始追踪入金前”已持有的仓位，故高于入金额）。单一窗口为小样本、描述性非预测。<b>非投资建议。</b></div>
  </div>${gapCard}`;
 }
+function insightBanner(){
+ const A=DATA.account,X=DATA.alloc,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
+ const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" onclick="ovGo('${seg}')">${t} →</span>`;
+ const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${al>=0?'+':''}${al.toFixed(1)}pp`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
+ const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
+ const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%），未计入上方市值`:'';
+ const l4=(gap!=null)?`择时 → 资金加权 ${pct(S.mwrPeriod)} vs 策略 ${pct(pr)}，本期${gap<0?'<b class="pos">略帮了忙</b>':(gap>0?'<b class="neg">略拖后腿</b>':'基本中性')}（行为缺口 ${gap>0?'+':''}${gap.toFixed(1)}pp）`:'';
+ return `<div class="card ib"><div class="dh"><span class="t">今日要点</span><span class="nm">一眼看懂：赚了多少 · 最大风险 · 隐藏杠杆 · 择时（点链接看详情）</span></div>
+   <div class="ib-row">${l1} ${lk('nw','净值')}${lk('cmp','指数对比')}</div>
+   ${l2?`<div class="ib-row">${l2} ${lk('struct','结构')}</div>`:''}
+   ${l3?`<div class="ib-row">${l3} ${lk('nw','期权敞口')}</div>`:''}
+   ${l4?`<div class="ib-row">${l4} ${lk('beh','行为决策')}</div>`:''}
+   <div class="note" style="margin-top:6px">下方“决策一览”按红旗数排序，逐只看该关注谁。技术指标为参考，<b>非投资建议</b>。</div></div>`;
+}
 function renderOverview(){
  CHARTREG={};
  const ser=DATA.series||[],right=document.getElementById('right');
@@ -1953,14 +1975,14 @@ function renderOverview(){
   ['期初持仓市值',fmt(S.netWorthStart)],
   ['选股策略本身的收益 ('+gl('TWR','时间加权 TWR')+')',`<span class="${cls(pr)}">${pct(pr)}</span>`],
   ['你的钱实际经历的收益 ('+gl('MWR','资金加权 MWR')+')',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`],
-  ['你的钱年化收益 ('+gl('XIRR','XIRR')+')',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span>`],
+  ['你的钱年化收益 ('+gl('XIRR','XIRR')+')',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span> <span class="note">数月年化·非预测</span>`],
   /* gap tile colored by NEGATED gap on purpose: +gap = dollars lagged TWR -> red. Do NOT change to cls(S.behaviorGap). */
   ['择时帮了还是拖了 ('+gl('gap','行为缺口')+')',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
   ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
- right.innerHTML=onboardStrip()+`
+ right.innerHTML=onboardStrip()+insightBanner()+`
  <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏">组合斐波那契</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
@@ -1975,8 +1997,8 @@ function renderOverview(){
  <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
  <div class="seg" data-seg="cmp" hidden>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">累计收益率对比（%，时间加权）</div>
-   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#E8B339"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#E8B339',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}</div>
+   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#6E9CA6"></i>纳斯达克综合</span></div>
+   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#6E9CA6',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}</div>
  </div>
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>

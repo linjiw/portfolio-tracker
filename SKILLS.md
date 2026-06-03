@@ -572,6 +572,27 @@ literals — a stray backtick breaks silently) plus a mocked-DOM smoke test of
 `onboardStrip()/restoreSeg()/ovGo()/renderOverview()` and the keydown/glossary
 handlers.
 
+## First-glance insight banner + masthead returns (IMPLEMENTED)
+
+From a 5-persona new-user usability test (scored the design 5/10: great content,
+buried — nothing answered the owner's questions at a glance; the default opened on
+the densest table; the KPI strip was 8 dollar cells with no %). Fixes (all
+presentation-only, computed from existing payload):
+- **`insightBanner()`** — a "今日要点" card rendered ABOVE the overview seg-rail
+  (after `onboardStrip()`), answering the owner's questions in 4 plain-Chinese
+  lines with `ovGo()` links to the detail tab: (1) value + unrealized + 区间收益
+  vs 标普 **and the Nasdaq-lag nuance**; (2) largest theme % money / % risk + the
+  buried **effective-N** ("≈2 笔独立押注"); (3) **gross option exposure** ≈ % of
+  equity (was invisible — only the misleading −$912 net showed); (4) the MWR-vs-TWR
+  timing verdict in words. Reads S/alloc/account; null-safe.
+- **KPI masthead** gained 区间收益(TWR) / 超额 vs 标普(pp) / 期权毛敞口 tiles, so
+  the first row answers "am I up & vs market" (it was all dollars before).
+- XIRR tile labeled "数月年化·非预测" inline (not hover-only) so +48% isn't
+  misread as a forecast; 指数对比 gave 纳斯达克 its own color (#6E9CA6) — it shared
+  amber with 我的组合, an unreadable two-line clash.
+Deferred (bigger/riskier): tab regrouping 9→~5, card-ify the 12-col table on phone,
+disclaimer/citation de-dup. Validate: sync gate + node --check + mocked-DOM render.
+
 ## Interactive charts & web-design pass (IMPLEMENTED)
 
 The marquee interaction upgrade — every hand-rolled SVG line chart is now
