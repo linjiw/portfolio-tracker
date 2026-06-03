@@ -133,7 +133,13 @@ def parse_portfolio(path):
             if sym.endswith("**") or sym in ("Pending activity", "") or sym.startswith("-"):
                 continue
             shares, price, val = fnum(r[4]), fnum(r[5]), fnum(r[7])
-            gain, cost = fnum(r[10]), fnum(r[13])
+            cost = fnum(r[13])
+            # Total Gain/Loss ($) is col 10, but Fidelity sometimes prints "--"
+            # (e.g. after a same-day fill). For a long equity gain == value − cost
+            # exactly (verified against reported rows), so fall back to that rather
+            # than letting fnum("--")→0 zero out a real gain on a big holding.
+            g_raw = r[10].strip()
+            gain = fnum(g_raw) if g_raw not in ("", "--") else round(val - cost, 2)
             d = cur.setdefault(sym, {"shares": 0.0, "price": price, "value": 0.0, "gain": 0.0, "cost": 0.0})
             d["shares"] += shares; d["value"] += val; d["gain"] += gain; d["cost"] += cost; d["price"] = price
     for d in cur.values():

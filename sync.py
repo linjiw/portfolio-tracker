@@ -83,8 +83,11 @@ def independent_totals(path):
             sym = r[2].strip()
             if sym.endswith("**") or sym.startswith("-") or sym in ("Pending activity", ""):
                 continue
-            val += fnum(r[7])
-            gain += fnum(r[10])
+            v = fnum(r[7])
+            g_raw = r[10].strip()
+            val += v
+            # mirror parse_portfolio: "--" / blank Total Gain falls back to value−cost
+            gain += fnum(g_raw) if g_raw not in ("", "--") else round(v - fnum(r[13]), 2)
             syms.add(sym)
     return {"marketValue": round(val, 2), "unrealized": round(gain, 2),
             "numHeld": len(syms), "accounts": sorted(accounts)}
