@@ -1610,12 +1610,46 @@ details[open] summary::before{content:"▾ "}
   .kpi:nth-child(-n+4){border-top:1px solid var(--line)}
   .kpi:nth-child(-n+2){border-top:0}
   .wrap{flex-direction:column}
-  .left{width:100%; position:static}
+  .right{order:1}            /* show 今日要点 / overview BEFORE the holdings rail on small screens */
+  .left{order:2; width:100%; position:static}
   .list{max-height:46vh}
   .seg-rail{top:0; position:static}
   .seg-rail button{padding:9px 11px 10px; font-size:12px}
   .seg-rail button.on::after{left:11px; right:11px}
   header .sub{margin-left:0; text-align:left; width:100%}
+}
+@media (max-width:560px){
+  /* phone: single-column KPIs with clamped values, no clipping */
+  .kpis{grid-template-columns:1fr; margin:12px 12px 4px}
+  .kpi{border-left:0!important; padding:12px 14px}
+  .kpi:nth-child(-n+2){border-top:1px solid var(--line)}
+  .kpi:first-child{border-top:0}
+  .kpi .v{font-size:18px; white-space:normal; overflow-wrap:anywhere}
+  .kpi:first-child .v{font-size:20px}
+  .wrap{padding:12px 12px 40px; gap:14px}
+  header{padding:14px 14px 0}
+  /* tab rail: wrap to rows on a phone so no tab is hidden */
+  .seg-rail{flex-wrap:wrap; overflow:visible; -webkit-mask-image:none; mask-image:none}
+  .seg-rail button{flex:1 1 28%; padding:11px 8px}
+  /* bigger touch targets */
+  .tabs button{padding:13px 6px}
+  .row{padding:13px 14px}
+  /* dense tables: keep the ticker column visible while the rest scrolls */
+  .scroll{overflow-x:auto}
+  .scroll table th:first-child,.scroll table td:first-child{position:sticky; left:0; background:var(--panel); z-index:2}
+  .scroll table thead th:first-child{z-index:3}
+  .scroll table th,.scroll table td{padding:7px 8px; font-size:11px}
+  /* 决策一览: drop secondary columns on a phone — priority columns only
+     (代码 / 权重 / 未实现% / 行为标记 / 关注度) */
+  .seg[data-seg="score"] table th:nth-child(4),.seg[data-seg="score"] table td:nth-child(4),
+  .seg[data-seg="score"] table th:nth-child(5),.seg[data-seg="score"] table td:nth-child(5),
+  .seg[data-seg="score"] table th:nth-child(6),.seg[data-seg="score"] table td:nth-child(6),
+  .seg[data-seg="score"] table th:nth-child(7),.seg[data-seg="score"] table td:nth-child(7),
+  .seg[data-seg="score"] table th:nth-child(8),.seg[data-seg="score"] table td:nth-child(8),
+  .seg[data-seg="score"] table th:nth-child(9),.seg[data-seg="score"] table td:nth-child(9),
+  .seg[data-seg="score"] table th:nth-child(11),.seg[data-seg="score"] table td:nth-child(11){display:none}
+  .ib-row{font-size:13px}
+  .ctx{display:none}
 }
 </style>
 </head>
@@ -1628,8 +1662,8 @@ details[open] summary::before{content:"▾ "}
 <div class="wrap">
  <div class="left">
    <div class="controls">
-     <input id="search" placeholder="搜索代码或公司名…"/>
-     <select id="sort">
+     <input id="search" placeholder="搜索代码或公司名…" aria-label="搜索持仓（代码或公司名）"/>
+     <select id="sort" aria-label="排序方式">
        <option value="value">按市值排序</option>
        <option value="unreal">按未实现盈亏</option>
        <option value="realized">按已实现盈亏</option>
@@ -1660,7 +1694,7 @@ const S=DATA.summary, D0=S.dateRange[0], D1=S.dateRange[1];
 document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</b> · 价格来自 Yahoo Finance · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
 
 const kpis=[
- ['当前持仓市值',fmt(S.marketValue),''],
+ ['股票市值 (不含现金/期权)',fmt(S.marketValue),''],
  ['未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
  ['区间收益 (时间加权)',pct(S.curReturn),cls(S.curReturn)],
  ['超额 vs 标普',(S.spReturn==null?'—':(S.curReturn-S.spReturn>=0?'+':'')+(S.curReturn-S.spReturn).toFixed(1)+'pp'),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
@@ -1881,7 +1915,7 @@ function scorecardCard(){
  return `<div class="card"><div class="dh"><span class="t">决策一览</span><span class="nm">每只持仓的 技术 · 风险 · 行为 · 再平衡偏离 同屏，联合评估而非逐项割裂（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th title="EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头 / 负=空头">动能</th><th title="0–100 强弱摆动，>70 偏超买、<30 偏超卖">RSI</th><th title="最近一次金叉(看多) / 死叉(看空)及日期">最近信号</th><th title="组合总波动按各持仓边际贡献拆开，合计100%，不等于资金权重">风险贡献</th><th title="该标的风险占比减资金占比，正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th class="l">行为标记</th><th title="按你在再平衡计划里设定的区间，当前权重偏离目标多少">偏离目标</th><th title="四类红色信号的计数，是默认排序键，不是评分也不是买卖建议">关注度</th></tr></thead>
    <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
-   <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></div></div>`;
+   <details class="note" style="margin-top:8px;line-height:1.6"><summary style="cursor:pointer">怎么读 · 口径说明</summary><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></details></div>`;
 }
 function wholeAccountCard(){
  const A=DATA.account;if(!A)return'';
@@ -1952,18 +1986,21 @@ function bridgeCard(){
  </div>${gapCard}`;
 }
 function insightBanner(){
+ let dismissed=false;try{dismissed=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}
+ const guide=dismissed?`<span class="ib-lk" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
  const A=DATA.account,X=DATA.alloc,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
  const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" onclick="ovGo('${seg}')">${t} →</span>`;
  const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${al>=0?'+':''}${al.toFixed(1)}pp`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${pct(nq)}`:''}）`;
  const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
  const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%），未计入上方市值`:'';
  const l4=(gap!=null)?`择时 → 资金加权 ${pct(S.mwrPeriod)} vs 策略 ${pct(pr)}，本期${gap<0?'<b class="pos">略帮了忙</b>':(gap>0?'<b class="neg">略拖后腿</b>':'基本中性')}（行为缺口 ${gap>0?'+':''}${gap.toFixed(1)}pp）`:'';
- return `<div class="card ib"><div class="dh"><span class="t">今日要点</span><span class="nm">一眼看懂：赚了多少 · 最大风险 · 隐藏杠杆 · 择时（点链接看详情）</span></div>
+ return `<div class="card ib"><div class="dh"><span class="t">今日要点</span><span class="nm">一眼看懂：赚了多少 · 最大风险 · 隐藏杠杆 · 择时（点链接看详情）</span>${guide}</div>
    <div class="ib-row">${l1} ${lk('nw','净值')}${lk('cmp','指数对比')}</div>
    ${l2?`<div class="ib-row">${l2} ${lk('struct','结构')}</div>`:''}
    ${l3?`<div class="ib-row">${l3} ${lk('nw','期权敞口')}</div>`:''}
    ${l4?`<div class="ib-row">${l4} ${lk('beh','行为决策')}</div>`:''}
-   <div class="note" style="margin-top:6px">下方“决策一览”按红旗数排序，逐只看该关注谁。技术指标为参考，<b>非投资建议</b>。</div></div>`;
+   <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${lk('score','按红旗数看该关注谁')}${lk('rebal','看再平衡动作清单')}</div>
+   <div class="note" style="margin-top:4px">所有指标为技术 / 描述性参考，<b>非投资建议</b>。</div></div>`;
 }
 function renderOverview(){
  CHARTREG={};
@@ -1983,7 +2020,7 @@ function renderOverview(){
   ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=onboardStrip()+insightBanner()+`
- <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏">组合斐波那契</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
+ <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
  <div class="card">
@@ -2299,9 +2336,9 @@ function renderFib(s){
    <div style="font-weight:650;margin:12px 0 2px">RSI(14)</div>
    ${svgLines(ser,[{key:'rsi',color:'#6E9CA6',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),
      guides:[{v:70,color:'#6b2f2f',label:'超买70'},{v:30,color:'#2f6b4f',label:'超卖30'}],marks:f.signals})}
-   <div class="note" style="margin-top:10px"><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
+   <details class="note" style="margin-top:10px"><summary style="cursor:pointer">怎么读 · 诚实说明</summary><b>怎么读：</b>四条 EMA 像缎带——向上发散（绿）= 快线在上、多头排列、动能强；向下发散（红）= 空头；缠绕（灰）= 盘整观望，信号不可靠。动能值是 EMA5 相对 EMA21 的偏离度（±100 封顶），RSI>70 超买、<30 超卖。<br>
    <b>多指标共振(◎ 圆环)：</b>同时满足「均线多头/空头排列 + 3 日内出现金叉/死叉 + RSI 未到超买/超卖」三个条件才标记——比单一信号更高确信度，能过滤掉震荡市里的假交叉。<br>
-   <b>诚实说明：</b>“斐波那契周期更神奇”在学术上并无强证据——5/8/13/21 相比其它周期没有统计显著的超额收益。它真正有用的地方是<b>周期按几何级数(≈1.6 倍)递增</b>，天然形成快/中/慢分层，便于判断趋势结构；这来自间距而非数字的“神秘性”。本面板为技术分析参考，<b>非投资建议</b>。</div>
+   <b>诚实说明：</b>“斐波那契周期更神奇”在学术上并无强证据——5/8/13/21 相比其它周期没有统计显著的超额收益。它真正有用的地方是<b>周期按几何级数(≈1.6 倍)递增</b>，天然形成快/中/慢分层，便于判断趋势结构；这来自间距而非数字的“神秘性”。本面板为技术分析参考，<b>非投资建议</b>。</details>
  </div>`;
 }
 function renderDetail(){
@@ -2336,10 +2373,13 @@ function renderDetail(){
  bindMarkers();segWire();restoreSeg('stk');bindCharts();updateCtx();
 }
 function segWire(){const r=document.getElementById('right');
- r.querySelectorAll('.seg-rail button').forEach(b=>b.onclick=()=>{
-  r.querySelectorAll('.seg-rail button').forEach(x=>x.classList.toggle('on',x===b));
-  r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
-  try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}updateCtx();});}
+ r.querySelectorAll('.seg-rail').forEach(rail=>rail.setAttribute('role','tablist'));
+ r.querySelectorAll('.seg-rail button').forEach(b=>{
+  b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');
+  b.onclick=()=>{
+   r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+   r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
+   try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}updateCtx();};});}
 function restoreSeg(ctx){try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(!want)return;var r=document.getElementById('right'),btn=r.querySelector('.seg-rail [data-seg="'+want+'"]');if(btn&&!btn.classList.contains('on'))btn.click();}catch(e){}}
 function ovGo(seg){var b=document.querySelector('.seg-rail [data-seg="'+seg+'"]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'});}
 function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}if(done)return'';
