@@ -485,10 +485,54 @@ mask large GROSS exposure (dominated-pair framing, p.1582).
   −912.53); `node --check`; mocked-DOM smoke incl. the `DATA.account==null`
   empty-string path.
 
+## Allocation / Concentration X-ray (IMPLEMENTED)
+
+The **结构** tab (after 风险). Aggregates holdings into asset-class and theme/
+sector buckets to surface the hidden CORRELATED bet — for this user, ~42% of
+dollars but ~61% of risk is one **半导体** theme across 13 names. Book grounding:
+narrow-vs-broad framing (Problem 1 vs 2, p.1582) — do the aggregation the user
+won't; correlation neglect (N tickers ≠ N bets); naive 1/N diversification &
+the diversification illusion (Benartzi–Thaler); and "structure ≠ correctly
+priced" (factor-of-two, p.1588).
+
+**Classification is HYBRID and NEVER fabricated** (CLAUDE.md anti-hallucination +
+Thaler's "fudge factor" p.1594), resolved per held name in priority:
+1. `CURATED_THEME` — fact-checked vs live yfinance .info on 2026-06-02; its ONLY
+   job is the documented GROUPING that collapses chips + "Semiconductor Equipment
+   & Materials" + the DRAM memory-ETF into one 半导体 super-theme. Grouping-only;
+   never overrides a live fetch except to collapse.
+2. `asset_class()` for ETFs/cash (宽基指数ETF / 主题ETF / 杠杆 / 商品 / 现金) —
+   derived from sym+name, zero new data, always available (the floor).
+3. **Real fetched** sector/industry via `fetch_sectors()` → `sector_to_theme()`
+   (reads .info verbatim, translates the sector to Chinese; never guesses).
+4. literal **`未分类`** for any miss — rendered as a REAL greyed bucket WITH its
+   weight (never dropped → Σ stays 100%, no exposure hidden).
+
+**`fetch_sectors(tickers, no_fetch, ...)`** mirrors `fetch_prices`' --no-fetch/
+cache/try-except contract, caches to `output/sectors_cache.json`, and is
+**hang-bounded**: get_info() has no timeout arg, so it uses
+`ThreadPoolExecutor.result(timeout)` + `shutdown(wait=False)` + a total wall-clock
+budget. Only fetches names MISSING from cache and NOT curated (steady-state ≈ 0
+calls); merge-on-write so a partial fetch never erases good labels. ETFs return
+sector=None (expected) → handled by the asset-class layer. Worst case (Yahoo
+down, cold cache) the x-ray degrades to the asset-class floor + 未分类 — truthful,
+never fabricated. Provenance (Yahoo行业 / 人工标注 / 资产类别 / 未分类 + asOf) is
+shown so the user sees what's live vs cached vs unknown.
+
+**`build_alloc()`** (pure, null-safe) → `payload.alloc`: byAssetClass, byTheme
+(weight + aggregated **riskPct from `risk.contrib`** + gap bar), and theme-level
+**HHI + effective-N (1/HHI)** in dollar and (if every bucket has risk) risk space
+— the honest "名义 28 只 → 主题有效 ≈ 3" statement. Theme weights use the
+marketValue basis to reconcile with risk.contrib's 100%. `structureCard()` is a
+pure renderer (3 cards), reusing .fbar/.scroll/.badges; risk-space HHI shown only
+when complete; excluded-<30d names footnoted; deep-link to 净值·全账户 for option
+leverage. **Strictly additive — no summary write — so the sync.py equity gate is
+unaffected (verified: still matches the broker CSV to the cent regardless of
+fetch outcome).** `output/sectors_cache.json` is committed like prices_cache.
+
 ## Extension ideas (not yet built)
 
 - Export per-stock chart to PNG, or full data to Excel.
-- Sector grouping / allocation treemap (needs sector metadata — not fetched yet).
 - True realized P&L if a full-history export (from inception) becomes available
   — then drop the legacy-estimate seeding entirely.
 

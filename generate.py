@@ -21,6 +21,7 @@ import csv, re, json, glob, os, sys, argparse, datetime, math
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, "output", "prices_cache.json")
+SECTORS_CACHE = os.path.join(HERE, "output", "sectors_cache.json")
 
 # ---------------------------------------------------------------- helpers
 def fnum(s):
@@ -178,6 +179,69 @@ def parse_account_extras(path):
             "optMarkNet": round(opt_net, 2), "optMarkGross": round(opt_gross, 2),
             "asOf": as_of}
 
+# ---------------------------------------------------------------- classification
+# fact-checked vs LIVE yfinance .info on 2026-06-02; this map's ONLY job is the
+# documented GROUPING that collapses the correlated semis cluster (chips +
+# 'Semiconductor Equipment & Materials' + the DRAM memory-ETF) into one 半导体
+# super-theme. Every entry is a real Technology/Semiconductor* label, none
+# invented. It never overrides a successful live fetch except to perform this
+# collapse; unknown names flow to live .info or stay 未分类.
+CURATED_THEME = {
+    "NVDA": "半导体", "MU": "半导体", "TSM": "半导体", "MRVL": "半导体", "AMD": "半导体",
+    "ARM": "半导体", "ASX": "半导体", "INTC": "半导体", "AVGO": "半导体", "KLAC": "半导体",
+    "ASML": "半导体", "LRCX": "半导体", "TER": "半导体", "AMAT": "半导体", "ONTO": "半导体",
+    "ENTG": "半导体", "COHR": "半导体", "CAMT": "半导体", "FORM": "半导体",
+    "DRAM": "半导体",  # Roundhill Memory ETF — assetClass=主题ETF, theme via documented name aggregation
+}
+
+def asset_class(sym, name):
+    """Asset-class bucket derived purely from sym + name (zero new data, never wrong)."""
+    u = (name or "").upper()
+    if sym.endswith("**"):
+        return "现金"
+    if sym in ("TQQQ", "SQQQ", "SPXL", "UPRO") or "ULTRAPRO" in u or "3X" in u:
+        return "杠杆"
+    if sym in ("VOO", "SPY", "SPMO", "QQQ", "IVV", "VTI") or "S&P 500" in u or "QQQ TR" in u:
+        return "宽基指数ETF"
+    if sym == "GLD" or "GOLD" in u:
+        return "商品"
+    if sym == "DRAM" or " ETF" in (" " + u) or sym.endswith("ETF"):
+        return "主题ETF"
+    return "个股"
+
+def sector_to_theme(rec):
+    """Map a REAL yfinance .info record to a Chinese theme — reads fetched fields
+    verbatim, never guesses. Returns '未分类' when the record carries no usable
+    sector (e.g. a 404/bad-ticker dict)."""
+    ind = (rec.get("industry") or ""); sec = (rec.get("sector") or "")
+    if "Semiconductor" in ind:
+        return "半导体"
+    if sec == "Communication Services":
+        return "互联网/通信"
+    if sec == "Financial Services":
+        return "金融"
+    if sec == "Consumer Cyclical":
+        return "消费"
+    if sec == "Utilities":
+        return "公用事业"
+    if sec == "Industrials":
+        return "工业"
+    if sec == "Technology":
+        return "科技(非半导体)"
+    if sec == "Healthcare":
+        return "医疗"
+    if sec == "Energy":
+        return "能源"
+    if sec == "Consumer Defensive":
+        return "必需消费"
+    if sec == "Real Estate":
+        return "房地产"
+    if sec == "Basic Materials":
+        return "材料"
+    if sec:
+        return sec   # any other REAL sector kept verbatim — honest, never invented
+    return "未分类"
+
 # ---------------------------------------------------------------- merge
 def merge_histories(parsed):
     """Merge trades across overlapping exports. Each real transaction appears
@@ -272,6 +336,67 @@ def fetch_prices(tickers, start, end, no_fetch=False):
     print(f"· got {len(out)}/{len(tickers)} tickers" + (f"  missing: {missing}" if missing else ""))
     json.dump(out, open(CACHE, "w"))
     return out
+
+def fetch_sectors(tickers, no_fetch=False, per_ticker_timeout=4.0, total_budget=25.0, stale_days=30):
+    """Fetch sector/industry per ticker from yfinance, cached to SECTORS_CACHE.
+    Mirrors fetch_prices' --no-fetch/cache/try-except contract AND is wall-clock
+    bounded (get_info() has no timeout arg, so use ThreadPoolExecutor + result
+    timeout + shutdown(wait=False)) so a flaky/rate-limited/hung .info can NEVER
+    hang the run or break the sync gate. Purely additive metadata — touches no
+    dollar figure. Only fetches names MISSING from cache and NOT in CURATED_THEME,
+    so steady-state syncs make ~0 calls. Merge-on-write: a partial fetch never
+    erases known-good labels. Always returns a dict (missing names just absent →
+    callers fall back to '未分类')."""
+    cache = json.load(open(SECTORS_CACHE)) if os.path.exists(SECTORS_CACHE) else {}
+    if no_fetch:
+        if cache:
+            print("· using cached sectors (--no-fetch)")
+        return cache
+    try:
+        import warnings; warnings.filterwarnings("ignore"); import yfinance as yf
+    except ImportError:
+        print("· yfinance missing; sectors from cache only")
+        return cache
+    import concurrent.futures as cf, time
+    def fresh(e):
+        try:
+            return e and (datetime.date.today() - datetime.date.fromisoformat(e["fetchedAt"][:10])).days < stale_days
+        except Exception:
+            return False
+    todo = [t for t in tickers if not t.startswith("^") and t not in CURATED_THEME and not fresh(cache.get(t))]
+    if not todo:
+        return cache
+    print(f"· fetching sectors for {len(todo)} names ...")
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    deadline = time.time() + total_budget
+    def one(t):
+        i = yf.Ticker(t).get_info() or {}
+        return {"sector": i.get("sector"), "industry": i.get("industry"),
+                "quoteType": i.get("quoteType"), "fetchedAt": now}
+    ex = cf.ThreadPoolExecutor(max_workers=4)
+    try:
+        for t in todo:
+            if time.time() > deadline:
+                print("· sector budget hit; rest stay cached/未分类"); break
+            try:
+                v = ex.submit(one, t).result(timeout=per_ticker_timeout)
+                if v.get("sector") or v.get("quoteType"):   # skip 404/bad-ticker (both None)
+                    cache[t] = v
+            except cf.TimeoutError:
+                pass
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"· sector fetch error ({e}); using cache")
+    finally:
+        ex.shutdown(wait=False)
+    got = sum(1 for t in tickers if t in cache)
+    print(f"· sectors: {got}/{len(tickers)} cached")
+    try:
+        json.dump(cache, open(SECTORS_CACHE, "w"))
+    except Exception:
+        pass
+    return cache
 
 def price_on(prices, sym, isodate):
     ps = prices.get(sym, {})
@@ -710,7 +835,79 @@ def compute_risk(series, stocks):
             "basisNote": "equity-only TWR basis; excludes cash/margin/options"}
 
 # ---------------------------------------------------------------- engine
-def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0, account=None):
+def classify(stocks, sectors):
+    """Attach assetClass / theme / themeSrc to each stock. Priority: curated semis
+    grouping → asset-class for ETFs/cash/etc → REAL fetched .info sector → 未分类.
+    No label is ever invented."""
+    for s in stocks:
+        sym = s["sym"]
+        s["assetClass"] = asset_class(sym, s.get("name"))
+        if sym in CURATED_THEME:
+            s["theme"], s["themeSrc"] = CURATED_THEME[sym], "人工标注"
+        elif s["assetClass"] in ("宽基指数ETF", "杠杆", "商品", "主题ETF"):
+            s["theme"], s["themeSrc"] = s["assetClass"], "资产类别"
+        elif sym in sectors and sector_to_theme(sectors[sym]) != "未分类":
+            s["theme"], s["themeSrc"] = sector_to_theme(sectors[sym]), "Yahoo行业"
+        else:
+            s["theme"], s["themeSrc"] = "未分类", "未分类"
+
+def build_alloc(stocks, summary, risk, account, sectors):
+    """Concentration X-ray: weight & risk-contribution aggregated BY asset-class and
+    BY theme, plus theme-level HHI / effective-N (the diversification-illusion number).
+    Additive only — adds no dollar figure to summary, so the sync gate is unaffected.
+    Theme weights use the marketValue basis to reconcile with risk.contrib's 100%."""
+    try:
+        held = [s for s in stocks if s.get("held")]
+        mv = summary.get("marketValue") or sum(s["value"] for s in held) or 1.0
+        rc = {c["sym"]: c["riskPct"] for c in ((risk or {}).get("contrib") or [])}
+        # by asset class (equity buckets + additive cash row)
+        ac = {}
+        for s in held:
+            ac.setdefault(s["assetClass"], 0.0)
+            ac[s["assetClass"]] += s["value"]
+        byAC = [{"bucket": k, "value": round(v, 2), "weightPct": round(v / mv * 100, 1)} for k, v in ac.items()]
+        cash = (account or {}).get("cashTotal") or 0.0
+        if cash:
+            byAC.append({"bucket": "现金", "value": round(cash, 2), "weightPct": round(cash / mv * 100, 1), "isCash": True})
+        byAC.sort(key=lambda x: -x["value"])
+        # by theme (equity only)
+        th = {}
+        for s in held:
+            t = th.setdefault(s["theme"], {"value": 0.0, "risk": 0.0, "hasRisk": False, "members": [], "src": s["themeSrc"]})
+            t["value"] += s["value"]; t["members"].append(s["sym"])
+            if s["sym"] in rc:
+                t["risk"] += rc[s["sym"]]; t["hasRisk"] = True
+        byTheme = []
+        for k, v in th.items():
+            w = round(v["value"] / mv * 100, 1)
+            rp = round(v["risk"], 1) if v["hasRisk"] else None
+            byTheme.append({"theme": k, "weightPct": w, "value": round(v["value"], 2), "n": len(v["members"]),
+                            "members": sorted(v["members"]), "src": v["src"], "riskPct": rp,
+                            "gap": (round(rp - w, 1) if rp is not None else None)})
+        byTheme.sort(key=lambda x: -x["weightPct"])
+        # theme-level concentration: HHI + effective-N (dollar and, if complete, risk)
+        def hhi(ws):
+            return sum((w / 100.0) ** 2 for w in ws) if ws else 0.0
+        hW = hhi([t["weightPct"] for t in byTheme])
+        all_risk = bool(byTheme) and all(t["riskPct"] is not None for t in byTheme)
+        hR = hhi([t["riskPct"] for t in byTheme]) if all_risk else None
+        hN = hhi([s["value"] / mv * 100 for s in held])
+        conc = {"nominalN": len(held),
+                "hhiWeight": round(hW, 3), "effNWeight": round(1 / hW, 1) if hW else None,
+                "hhiRisk": (round(hR, 3) if hR else None), "effNRisk": (round(1 / hR, 1) if hR else None),
+                "nameHhi": round(hN, 3), "nameEffN": round(1 / hN, 1) if hN else None}
+        srcs = {}
+        for s in held:
+            srcs[s["themeSrc"]] = srcs.get(s["themeSrc"], 0) + 1
+        prov = {"asOf": (max((sectors.get(s["sym"], {}).get("fetchedAt", "") for s in held), default="") or "—"),
+                "unclassified": srcs.get("未分类", 0), "sources": srcs}
+        return {"byAssetClass": byAC, "byTheme": byTheme, "largestTheme": (byTheme[0] if byTheme else None),
+                "conc": conc, "provenance": prov}
+    except Exception:
+        return {"byAssetClass": [], "byTheme": [], "largestTheme": None, "conc": None,
+                "provenance": {"asOf": "—", "unclassified": 0, "sources": {}}}
+
+def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0, account=None, sectors=None):
     tot_buy, tot_sell = totals
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
@@ -918,9 +1115,11 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
 
     behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
     risk = compute_risk(series, stocks)
+    classify(stocks, sectors or {})
+    alloc = build_alloc(stocks, summary, risk, acct_block, sectors or {})
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
             "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk,
-            "bridge": bridge, "account": acct_block}
+            "bridge": bridge, "account": acct_block, "alloc": alloc}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1554,6 +1753,41 @@ function rebalDriftMap(){
  if(tt&&tt.t&&!tt.disabled){uni.u.forEach((x,i)=>{m[x.sym]={cur:x.w,tgt:tt.t[i],drift:x.w-tt.t[i]};});}
  return {map:m,policy:rule.policy,band:rule.band||5};
 }
+function structureCard(){
+ const X=DATA.alloc;
+ if(!X||(!X.byAssetClass.length&&!X.byTheme.length))return '<div class="card"><div class="dh"><span class="t">结构</span></div><div class="note">结构数据不足。</div></div>';
+ // Card 1: asset-class structure (always-on floor)
+ const acRows=X.byAssetClass.map(b=>{const w=Math.min(b.weightPct,100);
+   return `<div class="frow"><span class="fsym" style="width:130px">${b.bucket}</span>
+     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'#4FB286':'#E8B339'}"></div></div>
+     <span style="width:60px;text-align:right">${b.weightPct.toFixed(1)}%</span>
+     <span class="note" style="width:96px;text-align:right">${fmt(b.value)}</span></div>`;}).join('');
+ const card1=`<div class="card"><div class="dh"><span class="t">资产类别结构</span><span class="nm">个股 vs 宽基ETF vs 主题ETF vs 杠杆 vs 商品 vs 现金 · 零额外数据，总是可得</span></div>${acRows}</div>`;
+ // Card 2: theme/sector structure (weight vs risk)
+ const lt=X.largestTheme;
+ const callout=lt?`<div class="note" style="margin:4px 0 10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:8px;line-height:1.6"><b>最大主题集中：${lt.theme}</b> · ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?` / ${lt.riskPct.toFixed(0)}% 风险`:''} · ${lt.n} 只标的。${lt.n>1?`这 ${lt.n} 只高度相关，名义上分散、实为一笔约 ${lt.weightPct.toFixed(0)}% 的单一主题押注。`:''}</div>`:'';
+ const tRows=X.byTheme.map(t=>{const grey=t.theme==='未分类'?'color:var(--mut)':'';
+   let riskCell='<td>—</td>',gapCell='<td></td><td>—</td>';
+   if(t.riskPct!=null){const g=t.gap,gc=g>0?'#E5707A':'#4FB286',w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
+     riskCell=`<td>${t.riskPct.toFixed(1)}%</td>`;
+     gapCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td><td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}</td>`;}
+   return `<tr style="${grey}"><td class="l">${t.theme}</td><td><span class="chip">${t.src}</span></td>
+     <td>${t.weightPct.toFixed(1)}%</td>${riskCell}${gapCell}<td class="note">${t.n}</td></tr>`;}).join('');
+ const ex=(DATA.risk&&DATA.risk.excluded)||[];
+ const exNote=ex.length?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险贡献（故各主题风险占比之和可能 <100%）：${ex.join('、')}</div>`:'';
+ const card2=`<div class="card"><div class="dh"><span class="t">主题 / 行业结构</span><span class="nm">把相关标的合成一个敞口 · 资金占比 vs 风险占比（复用风险贡献，零重算）</span></div>${callout}
+   <div class="scroll"><table><thead><tr><th class="l">主题</th><th>来源</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th><th>只数</th></tr></thead><tbody>${tRows}</tbody></table></div>${exNote}</div>`;
+ // Card 3: concentration / effective-N
+ const c=X.conc;let badges=[];
+ if(c){badges=[['名义持仓数',c.nominalN+' 只'],['主题 HHI（资金）',c.hhiWeight!=null?c.hhiWeight.toFixed(2):'—'],['主题有效持仓数（资金）',c.effNWeight!=null?('≈ '+c.effNWeight.toFixed(1)):'—']];
+   if(c.effNRisk!=null)badges.push(['主题 HHI（风险）',c.hhiRisk.toFixed(2)],['主题有效持仓数（风险）','≈ '+c.effNRisk.toFixed(1)]);
+   badges.push(['名义 → 主题有效',`${c.nominalN} 只 → ≈ ${c.effNWeight!=null?c.effNWeight.toFixed(0):'—'}`]);}
+ const p=X.provenance||{};
+ const howto=`<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>逐只看权重，会把同一驱动的多只标的读成多笔独立小仓；本页做的是<b>你自己不会做的汇总</b>——把同一因子的标的合成<b>一个敞口</b>，同屏看它占多少<b>资金</b>、又占多少<b>风险</b>（Thaler p.1582：逐项割裂 vs 联合判断）。机制：<b>窄框架</b> · <b>相关性忽视</b>（N 只不同代码 ≠ N 笔独立押注）· <b>朴素 1/N 分散</b>与<b>分散幻觉</b>（有效持仓数 ≪ 名义只数）。<br>风险贡献为<b>窗口内已实现风险</b>的描述性分解（小样本、非预测），仅含股票，<b>低估</b>杠杆(TQQQ)与期权真实敞口${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}。主题标签来源：Yahoo 行业 / 人工标注 / 资产类别${p.asOf&&p.asOf!=='—'?` · 缓存于 ${p.asOf}`:''} · ${p.unclassified||0} 项未分类。结构是“你的钱与波动落在哪里”的描述，<b>不评判任何标的高估/低估</b>（Thaler p.1588）。<b>非投资建议。</b></div>`;
+ const card3=`<div class="card"><div class="dh"><span class="t">集中度 · 有效持仓数</span><span class="nm">名义持仓 ≠ 独立押注：主题层 HHI 与有效 N（1/HHI）</span></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>${howto}</div>`;
+ return card1+card2+card3;
+}
 function scorecardCard(){
  const mv=S.marketValue||1;
  const bias=(DATA.behavior&&DATA.behavior.biasBySym)||{};
@@ -1680,7 +1914,7 @@ function renderOverview(){
   ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值 · 全账户</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
+ <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值 · 全账户</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="struct">结构</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
  <div class="card">
@@ -1700,6 +1934,7 @@ function renderOverview(){
  <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
  <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
  <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
+ <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
  <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
  segWire();wireRebal();
 }
@@ -2133,8 +2368,9 @@ def main():
     end = (datetime.date.fromisoformat(dmax) + datetime.timedelta(days=1)).isoformat()
     BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
     prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
+    sectors = fetch_sectors(tickers, no_fetch=args.no_fetch)
 
-    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep, acct_extras)
+    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep, acct_extras, sectors)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]
