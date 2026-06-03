@@ -5,3 +5,6 @@ __pycache__/
 *.csv
 # reference books / PDFs (personal, often copyrighted) — keep them out of the repo
 *.pdf
+# stray scaffolding some workflow subagents create — not part of this project
+.agents/
+AGENTS.md
