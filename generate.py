@@ -1446,6 +1446,12 @@ svg text{font-family:var(--f-mono); font-variant-numeric:tabular-nums slashed-ze
   box-shadow:var(--sh-tt);
 }
 .tt b{font-family:var(--f-disp); font-weight:600; letter-spacing:-.005em}
+.gl{border-bottom:1px dotted var(--faint); cursor:help}
+.gl:hover{border-bottom-color:var(--accent); color:var(--txt)}
+.gl:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
+.tt.gl-tt{pointer-events:auto; max-width:min(280px,80vw); white-space:normal; line-height:1.55; font-family:var(--f-ui)}
+.tt.gl-tt .gk{font-family:var(--f-disp); font-weight:600; color:var(--accent); display:block; margin-bottom:3px}
+.row:focus-visible,.seg-rail button:focus-visible,.tabs button:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-chip)}
 
 /* ============================== TABLES (print-ledger) ============================== */
 table{width:100%; border-collapse:collapse; font-size:12px; margin-top:8px}
@@ -1517,12 +1523,15 @@ details[open] summary::before{content:"▾ "}
   background:var(--panel); border:1px solid var(--line);
   border-radius:var(--r-card); padding:0 4px; margin-bottom:16px;
   box-shadow:var(--sh-lift);
+  overflow-x:auto; overflow-y:hidden; scrollbar-width:none;
 }
+.seg-rail::-webkit-scrollbar{display:none}
 .seg-rail button{
   background:none; border:0; color:var(--mut);
   font-family:var(--f-ui); font-size:12.5px; font-weight:600; letter-spacing:.02em;
   padding:11px 16px 12px; cursor:pointer; position:relative;
   transition:color .16s var(--ease);
+  flex:none; white-space:nowrap;
 }
 .seg-rail button:hover{color:var(--txt)}
 .seg-rail button.on{color:var(--accent)}
@@ -1578,6 +1587,8 @@ details[open] summary::before{content:"▾ "}
   .left{width:100%; position:static}
   .list{max-height:46vh}
   .seg-rail{top:0; position:static}
+  .seg-rail button{padding:9px 11px 10px; font-size:12px}
+  .seg-rail button.on::after{left:11px; right:11px}
   header .sub{margin-left:0; text-align:left; width:100%}
 }
 </style>
@@ -1591,7 +1602,7 @@ details[open] summary::before{content:"▾ "}
 <div class="wrap">
  <div class="left">
    <div class="controls">
-     <input id="search" placeholder="🔍 搜索代码…"/>
+     <input id="search" placeholder="搜索代码或公司名…"/>
      <select id="sort">
        <option value="value">按市值排序</option>
        <option value="unreal">按未实现盈亏</option>
@@ -1643,19 +1654,19 @@ function filtered(){
 }
 function renderList(){
  const a=filtered();
- const ov=`<div class="row ovrow ${sel==='__OV__'?'sel':''}" data-s="__OV__">
-   <div><div class="sym">📊 组合总览</div><div class="meta">净值 & 收益率 vs 指数</div></div>
+ const ov=`<div class="row ovrow ${sel==='__OV__'?'sel':''}" data-s="__OV__" tabindex="0" role="button">
+   <div><div class="sym">组合总览</div><div class="meta">净值 & 收益率 vs 指数</div></div>
    <div class="pnl ${cls(S.curReturn)}">${pct(S.curReturn)}<div class="meta">区间收益</div></div></div>`;
  document.getElementById('list').innerHTML=ov+(a.map(s=>{
   const main=s.held?s.unreal:s.realized, lbl=s.held?'未实现':'已实现';
   const fn=s.fib&&s.fib.now, dot=fn?`<span style="color:${FIBCOL[fn.state]}">●</span> `:'';
   const zap=fn&&fn.res?`<span title="${fn.res==='bull'?'多头共振':'空头共振'}" style="color:${fn.res==='bull'?'#4FB286':'#E5707A'}">⚡</span>`:'';
   const momtxt=fn?` · 动能<span style="color:${momColor(fn.mom)}">${fn.mom>0?'+':''}${fn.mom}</span>`:'';
-  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}">
+  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}" tabindex="0" role="button">
     <div><div class="sym">${dot}${s.sym} ${zap}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
     <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}</div></div>
-    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||'<div style="padding:16px;color:var(--mut)">无匹配</div>');
- document.querySelectorAll('.row').forEach(r=>r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();});
+    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||`<div class="note" style="padding:16px">没有匹配「${q}」的标的 · 试试清空搜索，或切到上方 持有 / 已清仓 / 全部</div>`);
+ document.querySelectorAll('.row').forEach(r=>{r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();};r.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();r.click();}};});
  renderDetail();
 }
 function chart(s){
@@ -1779,7 +1790,7 @@ function structureCard(){
    <div class="scroll"><table><thead><tr><th class="l">主题</th><th>来源</th><th>资金权重</th><th>风险贡献</th><th>差额</th><th>风险−资金</th><th>只数</th></tr></thead><tbody>${tRows}</tbody></table></div>${exNote}</div>`;
  // Card 3: concentration / effective-N
  const c=X.conc;let badges=[];
- if(c){badges=[['名义持仓数',c.nominalN+' 只'],['主题 HHI（资金）',c.hhiWeight!=null?c.hhiWeight.toFixed(2):'—'],['主题有效持仓数（资金）',c.effNWeight!=null?('≈ '+c.effNWeight.toFixed(1)):'—']];
+ if(c){badges=[['名义持仓数',c.nominalN+' 只'],['集中度指数 '+gl('HHI','HHI')+'（资金）',c.hhiWeight!=null?c.hhiWeight.toFixed(2):'—'],['约等于几个独立押注 ('+gl('effN','有效持仓数')+'·资金)',c.effNWeight!=null?('≈ '+c.effNWeight.toFixed(1)):'—']];
    if(c.effNRisk!=null)badges.push(['主题 HHI（风险）',c.hhiRisk.toFixed(2)],['主题有效持仓数（风险）','≈ '+c.effNRisk.toFixed(1)]);
    badges.push(['名义 → 主题有效',`${c.nominalN} 只 → ≈ ${c.effNWeight!=null?c.effNWeight.toFixed(0):'—'}`]);}
  const p=X.provenance||{};
@@ -1825,7 +1836,7 @@ function scorecardCard(){
  });
  data.sort((a,b)=>b.attn-a.attn||b.w-a.w);
  return `<div class="card"><div class="dh"><span class="t">决策一览</span><span class="nm">每只持仓的 技术 · 风险 · 行为 · 再平衡偏离 同屏，联合评估而非逐项割裂（点击看个股）</span></div>
-   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th>动能</th><th>RSI</th><th>最近信号</th><th>风险贡献</th><th>风险−资金</th><th class="l">行为标记</th><th>偏离目标</th><th>关注度</th></tr></thead>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th title="EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头 / 负=空头">动能</th><th title="0–100 强弱摆动，>70 偏超买、<30 偏超卖">RSI</th><th title="最近一次金叉(看多) / 死叉(看空)及日期">最近信号</th><th title="组合总波动按各持仓边际贡献拆开，合计100%，不等于资金权重">风险贡献</th><th title="该标的风险占比减资金占比，正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th class="l">行为标记</th><th title="按你在再平衡计划里设定的区间，当前权重偏离目标多少">偏离目标</th><th title="四类红色信号的计数，是默认排序键，不是评分也不是买卖建议">关注度</th></tr></thead>
    <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
    <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></div></div>`;
 }
@@ -1904,17 +1915,17 @@ function renderOverview(){
  const cards=[
   ['当前持仓市值',fmt(S.netWorthNow)],
   ['期初持仓市值',fmt(S.netWorthStart)],
-  ['区间收益率 · 时间加权',`<span class="${cls(pr)}">${pct(pr)}</span> <span class="note">选股策略本身</span>`],
-  ['区间收益率 · 资金加权 MWR',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span> <span class="note">你的钱实际经历</span>`],
-  ['年化资金加权 XIRR',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span>`],
+  ['选股策略本身的收益 ('+gl('TWR','时间加权 TWR')+')',`<span class="${cls(pr)}">${pct(pr)}</span>`],
+  ['你的钱实际经历的收益 ('+gl('MWR','资金加权 MWR')+')',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`],
+  ['你的钱年化收益 ('+gl('XIRR','XIRR')+')',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span>`],
   /* gap tile colored by NEGATED gap on purpose: +gap = dollars lagged TWR -> red. Do NOT change to cls(S.behaviorGap). */
-  ['行为缺口 · 时间−资金加权',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
+  ['择时帮了还是拖了 ('+gl('gap','行为缺口')+')',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
-  ['超额收益 vs S&P500',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
+  ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${pct(pr-sp)}</span>`],
  ];
- right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="score">决策一览</button><button data-seg="nw">净值 · 全账户</button><button data-seg="pfib">组合斐波那契</button><button data-seg="risk">风险</button><button data-seg="struct">结构</button><button data-seg="cmp">指数对比</button><button data-seg="sig">持仓信号</button><button data-seg="beh">行为决策</button><button data-seg="rebal">再平衡计划</button></div>
+ right.innerHTML=onboardStrip()+`
+ <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏">组合斐波那契</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
  <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
  <div class="card">
@@ -1936,7 +1947,7 @@ function renderOverview(){
  <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
  <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
  <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
- segWire();wireRebal();
+ segWire();wireRebal();restoreSeg('ov');
 }
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
@@ -1970,10 +1981,10 @@ function fibBadges(n,signals,curLabel){
  const lastSig=(signals||[]).slice(-1)[0];
  return [
   [curLabel||'斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
-  ['动能强弱',`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
-  ['RSI(14)',`<span style="color:${rsiCol}">${n.rsi}</span>`],
+  [gl('mom','动能强弱'),`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
+  [gl('rsi','RSI(14)'),`<span style="color:${rsiCol}">${n.rsi}</span>`],
   ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
-  ['多指标共振',n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
+  [gl('res','多指标共振'),n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
  ];
 }
 function portfolioFibCard(){
@@ -2045,8 +2056,8 @@ function riskCard(){
  const volCls=R.annVol>R.spAnnVol?'neg':'pos';
  const badges=[
   ['年化波动率',`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol.toFixed(1)}%</span>`],
-  ['Beta β (vs S&P)',R.beta==null?'—':`<span class="${R.beta>1?'neg':'pos'}">${R.beta.toFixed(2)}</span>`],
-  ['最大回撤',`<span class="neg">${R.maxDrawdown.toFixed(1)}%</span>`],
+  [gl('beta','Beta β (vs S&P)'),R.beta==null?'—':`<span class="${R.beta>1?'neg':'pos'}">${R.beta.toFixed(2)}</span>`],
+  [gl('dd','最大回撤'),`<span class="neg">${R.maxDrawdown.toFixed(1)}%</span>`],
   ['当前回撤',`<span class="${cls(R.currentUnderwater)}">${R.currentUnderwater.toFixed(1)}%</span>`],
   ['收益/波动比',`${R.retVolRatio.toFixed(2)} <span class="note">(rf=0)</span>`],
  ];
@@ -2205,10 +2216,10 @@ function renderFib(s){
    :(n.res==='bear'?'<span class="chip" style="color:#E5707A;border-color:#5a1f1f;background:rgba(255,107,107,.1)">⚡ 空头共振</span>':'');
  const badges=[
   ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
-  ['动能强弱',`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
-  ['RSI(14)',`<span style="color:${rsiCol}">${n.rsi}</span>`],
+  [gl('mom','动能强弱'),`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
+  [gl('rsi','RSI(14)'),`<span style="color:${rsiCol}">${n.rsi}</span>`],
   ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
-  ['多指标共振',n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
+  [gl('res','多指标共振'),n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
  ];
  return `<div class="card">
    <div class="dh"><span class="t">斐波那契动能分析</span>${resChip}<span class="nm">EMA 5 / 8 / 13 / 21 缎带 · 动能 · RSI</span></div>
@@ -2244,7 +2255,7 @@ function renderDetail(){
     <td class="${t.amount<0?'':'pos'}">${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
     <td class="${cls(t.realized)}">${t.realized==null?'—':fmt(t.realized)}</td></tr>`;}).join('');
  document.getElementById('right').innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="price">价格 · 操作</button><button data-seg="tx">交易明细</button><button data-seg="fib">斐波那契</button></div>
+ <div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button></div>
  <div class="seg" data-seg="price">
  <div class="card">
    <div class="dh"><span class="t">${s.sym}</span><span class="nm">${s.name}</span>
@@ -2260,16 +2271,62 @@ function renderDetail(){
    <tbody>${rows}</tbody></table></div></div>
  </div>
  <div class="seg" data-seg="fib" hidden>`+renderFib(s)+`</div>`;
- bindMarkers();segWire();
+ bindMarkers();segWire();restoreSeg('stk');
 }
 function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail button').forEach(b=>b.onclick=()=>{
   r.querySelectorAll('.seg-rail button').forEach(x=>x.classList.toggle('on',x===b));
-  r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});});}
+  r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
+  try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}});}
+function restoreSeg(ctx){try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(!want)return;var r=document.getElementById('right'),btn=r.querySelector('.seg-rail [data-seg="'+want+'"]');if(btn&&!btn.classList.contains('on'))btn.click();}catch(e){}}
+function ovGo(seg){var b=document.querySelector('.seg-rail [data-seg="'+seg+'"]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'});}
+function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}if(done)return'';
+ const j=(seg,t)=>`<span style="cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent-line)" onclick="ovGo('${seg}')">${t}</span>`;
+ return `<div id="onboard" class="note" style="margin-bottom:14px;padding:10px 13px;background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:var(--r-card);line-height:1.7">
+   <b style="color:var(--accent)">从这里开始</b> · 想知道我赚了多少 → ${j('score','决策一览')} / ${j('nw','净值')}　|　钱和风险集中在哪 → ${j('struct','结构')} / ${j('risk','风险')}　|　该不该调仓 → ${j('beh','行为决策')} / ${j('rebal','再平衡计划')}
+   <span style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var o=document.getElementById('onboard');if(o)o.remove()">不再显示 ✕</span></div>`;}
+/* ===== plain-language glossary: hover/tap any .gl term -> reuse the #tt tooltip ===== */
+const GLOSS={
+ TWR:'时间加权收益率：剔除你出入金时点的影响，衡量选股 / 策略本身的好坏。',
+ MWR:'资金加权收益率：把你真实的出入金时点算进去，是你的钱实际经历的回报。',
+ XIRR:'按真实出入金现金流求出的年化资金加权收益率（仅股票账面口径）。',
+ gap:'行为缺口 = 时间加权 − 资金加权；正(红)=你的择时拖了后腿，负(绿)=择时帮了忙。',
+ alpha:'超额收益：你的组合相对 S&P500 多赚或少赚的百分点。',
+ HHI:'集中度指数：各持仓权重平方和，越大越集中、越靠近押注单一标的。',
+ effN:'有效持仓数 ≈ 1 ÷ HHI：把同因子标的合并后，约等于几个独立押注（常远小于名义只数）。',
+ beta:'Beta：相对大盘(S&P)的波动倍数，>1 比大盘更猛、<1 更稳。',
+ dd:'回撤：相对历史最高点跌了多少（描述风险，不预测未来）。',
+ rc:'风险贡献：组合总波动按各持仓边际贡献拆开（合计100%），不等于资金权重。',
+ mom:'动能：EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头、负=空头。',
+ rsi:'RSI(14)：0–100 的强弱摆动，>70 偏超买、<30 偏超卖（技术参考）。',
+ cross:'金叉 / 死叉：快线 EMA5 上穿 / 下穿 EMA13，比传统 50 / 200 日更灵敏。',
+ attn:'关注度：四类红色信号的计数，是默认排序键，不是评分也不是买卖建议。',
+ res:'共振：趋势排列 + 近3日金 / 死叉 + RSI 未极端 三者同向，确信度更高的技术信号。'
+};
+function gl(k,l){return GLOSS[k]?'<span class="gl" tabindex="0" data-g="'+k+'">'+l+'</span>':l;}
+(function(){
+ const tt=document.getElementById('tt');if(!tt)return;let pinned=false;
+ function show(el,x,y){const d=GLOSS[el.dataset.g];if(!d)return;
+   tt.className='tt gl-tt';tt.innerHTML='<span class="gk">'+(el.textContent||'')+'</span>'+d;tt.style.display='block';
+   const w=tt.offsetWidth||260;let L=x+14;if(L+w>window.innerWidth-8)L=window.innerWidth-w-8;if(L<8)L=8;
+   tt.style.left=L+'px';tt.style.top=(y+14)+'px';}
+ function hide(){if(pinned)return;tt.style.display='none';tt.classList.remove('gl-tt');}
+ function unpin(){pinned=false;tt.style.display='none';tt.classList.remove('gl-tt');}
+ document.addEventListener('mouseover',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g&&!pinned)show(g,e.clientX,e.clientY);});
+ document.addEventListener('mousemove',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g&&!pinned)show(g,e.clientX,e.clientY);});
+ document.addEventListener('mouseout',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g)hide();});
+ document.addEventListener('click',e=>{const g=e.target.closest&&e.target.closest('.gl');
+   if(g){unpin();pinned=true;const r=g.getBoundingClientRect();show(g,r.left-14,r.bottom-14);e.stopPropagation();}
+   else if(pinned)unpin();});
+ document.addEventListener('keydown',e=>{const a=document.activeElement;
+   if((e.key==='Enter'||e.key===' ')&&a&&a.classList&&a.classList.contains('gl')){e.preventDefault();a.click();}
+   else if(e.key==='Escape'&&pinned)unpin();});
+})();
 function bindMarkers(){
  const tt=document.getElementById('tt');
  document.querySelectorAll('.mk').forEach(m=>{
    m.onmousemove=e=>{const s=stocks.find(x=>x.sym===m.dataset.sym),t=s.txns[+m.dataset.i];
+     tt.classList.remove('gl-tt');
      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY+14)+'px';
      const side=t.side==='BUY'?'买入':(t.side==='SELL'?'卖出':'期初底仓');
      tt.innerHTML=`<b>${m.dataset.sym} · ${side}</b><br>${t.date}<br>数量 ${fmtN(t.qty,0)} @ ${fmt(t.price)}<br>金额 ${fmt(t.amount)}${t.realized!=null?'<br>已实现 <span class="'+cls(t.realized)+'">'+fmt(t.realized)+'</span>':''}`;};
@@ -2287,6 +2344,12 @@ document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderList()
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
  b.classList.add('on');filter=b.dataset.f;renderList();});
+document.addEventListener('keydown',e=>{
+ const a=document.activeElement;
+ if(a&&a.id==='search'){if(e.key==='Escape'){a.value='';q='';renderList();}return;}
+ if(e.key==='Escape'){const tt=document.getElementById('tt');if(tt&&tt.style.display==='block')return;if(sel!=='__OV__'){sel='__OV__';renderList();renderDetail();}return;}
+ if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&a.parentElement.classList.contains('seg-rail')){
+   const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}}});
 renderList();
 requestAnimationFrame(()=>document.body.classList.add('ready'));
 setTimeout(()=>document.body.classList.add('done'),1500);

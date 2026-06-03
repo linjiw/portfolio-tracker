@@ -530,6 +530,48 @@ leverage. **Strictly additive — no summary write — so the sync.py equity gat
 unaffected (verified: still matches the broker CSV to the cent regardless of
 fetch outcome).** `output/sectors_cache.json` is committed like prices_cache.
 
+## Friendly UX & interaction layer (IMPLEMENTED)
+
+A presentation-only "choice architecture for the tool itself" pass (designed by
+an agent-team workflow reading the book): make-it-easy / reduce friction (p.1595),
+simplification & salience, plain framing over jargon (p.1582). **Strictly
+additive, inside `HTML_TEMPLATE` only — no Python/payload/summary change, so the
+sync.py equity gate is untouched.** Six tiers, each independently revertible:
+1. **Scrollable seg-rail** — `.seg-rail` got `overflow-x:auto; scrollbar-width:none`
+   + `button{flex:none;white-space:nowrap}` + tighter mobile padding; the 9-tab
+   (and 3-tab detail) rails now scroll horizontally instead of overflowing.
+2. **`title=` tab hints** — every overview & detail tab button has a one-line
+   "what question does this answer" native tooltip (data-seg keys unchanged → all
+   deep-links/segWire intact). Plus `title=` on the dense scorecard jargon headers.
+3. **Plain-language KPI labels** — badge labels lead with the human phrase, term
+   secondary (e.g. "你的钱实际经历的收益 (资金加权 MWR)"). Strings only; the
+   `cls(-behaviorGap)` inverted-color logic is NOT touched.
+4. **Glossary tooltips** — `GLOSS` map + `gl(k,l)` wraps jargon (TWR/MWR/XIRR/HHI/
+   有效持仓数/beta/回撤/动能/RSI/共振…) in a `.gl` dotted-underline span; ONE
+   document-delegated controller reuses the existing `#tt` element (adds a `gl-tt`
+   class; `pointer-events:auto` only on that class) — hover on desktop, tap-to-pin
+   on touch, Esc/click-away to dismiss, Enter/Space on a focused term. `gl()`
+   degrades to the bare label for unknown keys (typo-safe). `bindMarkers` clears
+   `gl-tt` so the trade-marker tooltip keeps its mono look.
+5. **Persistence + onboarding + keyboard** — last-viewed sub-tab persists per
+   context (`ptrak.seg.ov` / `ptrak.seg.stk`) via `restoreSeg()` (clicks the saved
+   button after render; deep-links still win since they click later); a dismissible
+   `#onboard` "从这里开始" strip (a non-`.card` div so the riseIn stagger is
+   unaffected; `ptrak.onboard.v1`); rows are `tabindex/role=button` with Enter/Space;
+   a document keydown gives Esc→home (defers to an open tooltip), Esc-in-search→clear,
+   ←/→ to cycle seg tabs when one is focused; `:focus-visible` amber outlines.
+6. **Hygiene** — friendlier empty state (names the query), plainer search
+   placeholder, dropped a decorative glyph.
+
+localStorage keys are namespaced `ptrak.*` and independent of `ptrak.rebal.v1`;
+all reads/writes are try/catch (private-mode degrades to today's behavior).
+**Do NOT** soften/remove any 非投资建议 line, "怎么读" note, or Thaler citation —
+friendliness = surfacing meaning on demand, never deleting honesty. Validate with
+`node --check` on the extracted `<script>` after every change (nested template
+literals — a stray backtick breaks silently) plus a mocked-DOM smoke test of
+`onboardStrip()/restoreSeg()/ovGo()/renderOverview()` and the keydown/glossary
+handlers.
+
 ## Extension ideas (not yet built)
 
 - Export per-stock chart to PNG, or full data to Excel.
