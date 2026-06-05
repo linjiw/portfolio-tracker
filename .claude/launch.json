@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["-e", "const http=require('http'),fs=require('fs'),p=require('path');const ROOT='/Users/linji/Downloads/portfolio-tracker/output';http.createServer((req,res)=>{let f=req.url==='/'?'/portfolio_dashboard.html':req.url.split('?')[0];try{const data=fs.readFileSync(p.join(ROOT,f));const ext=p.extname(f);const mime={'.html':'text/html','.js':'text/javascript','.json':'application/json','.png':'image/png','.css':'text/css'}[ext]||'text/plain';res.writeHead(200,{'Content-Type':mime});res.end(data);}catch(e){res.writeHead(404);res.end('not found');}}).listen(8765,'127.0.0.1',()=>console.log('serving on 127.0.0.1:8765'));"],
+      "port": 8765
+    }
+  ]
+}

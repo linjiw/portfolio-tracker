@@ -22,6 +22,7 @@ HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, "output", "prices_cache.json")
 SECTORS_CACHE = os.path.join(HERE, "output", "sectors_cache.json")
+OHLC_CACHE = os.path.join(HERE, "output", "ohlc_cache.json")
 
 # ---------------------------------------------------------------- helpers
 def fnum(s):
@@ -41,6 +42,24 @@ def newest(pattern, where):
     hits = sorted(glob.glob(os.path.join(where, pattern)), key=os.path.getmtime, reverse=True)
     return hits[0] if hits else None
 
+def collect_history_files(input_dir, explicit=None):
+    """Return every known history export, plus an optional newly supplied file.
+
+    Sync semantics are cumulative: a fresh Fidelity export is an increment or
+    fuller snapshot of activity, not a replacement for older local history.
+    """
+    seen, out = set(), []
+    for pat in ("History_for_Account*.csv", "Accounts_History*.csv"):
+        for p in sorted(glob.glob(os.path.join(input_dir, pat)), key=os.path.getmtime):
+            ap = os.path.abspath(p)
+            if ap not in seen:
+                seen.add(ap); out.append(ap)
+    if explicit:
+        ap = os.path.abspath(explicit)
+        if ap not in seen:
+            out.append(ap)
+    return out
+
 # ---------------------------------------------------------------- parsing
 def _colmap(header):
     """Map a Fidelity history header row to column indices (handles both export
@@ -49,6 +68,7 @@ def _colmap(header):
     for i, h in enumerate(header):
         h = h.strip().lower()
         if h == "run date": idx["date"] = i
+        elif h == "account number": idx["account"] = i
         elif h == "action": idx["action"] = i
         elif h == "symbol": idx["symbol"] = i
         elif h == "description": idx["desc"] = i
@@ -63,6 +83,8 @@ def parse_history(path):
     best source file when several exports are present."""
     from collections import defaultdict
     txns, opt_txns, names = defaultdict(list), defaultdict(list), {}
+    m_acct = re.search(r"History_for_Account_([A-Z0-9]+)", os.path.basename(path))
+    default_account = m_acct.group(1) if m_acct else ""
     deposits = dividends = tot_buy = tot_sell = 0.0
     n_buys = n_eft = n_div = 0
     dmin = dmax = None
@@ -97,7 +119,8 @@ def parse_history(path):
             is_opt = sym.startswith("-") or "CALL" in action or "PUT" in action
             side = "BUY" if "BOUGHT" in action else ("SELL" if "SOLD" in action else "?")
             rec = {"date": d, "side": side, "qty": abs(fnum(r[cmap["qty"]])),
-                   "price": fnum(r[cmap["price"]]), "amount": amt}
+                   "price": fnum(r[cmap["price"]]), "amount": amt,
+                   "account": r[cmap["account"]].strip() if "account" in cmap and len(r) > cmap["account"] else default_account}
             if is_opt:
                 opt_txns[sym].append(rec)
             else:
@@ -185,6 +208,89 @@ def parse_account_extras(path):
             "optMarkNet": round(opt_net, 2), "optMarkGross": round(opt_gross, 2),
             "asOf": as_of}
 
+MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+          "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+
+def parse_option_contract(leg):
+    """Parse Fidelity option leg display fields into contract metadata.
+
+    Returns None on uncertainty instead of guessing. Fidelity names currently
+    look like "QQQ JUN 18 2026 $711 CALL".
+    """
+    name = (leg.get("name") or "").upper()
+    m = re.search(r"\b([A-Z][A-Z0-9.]*)\s+([A-Z]{3})\s+(\d{1,2})\s+(\d{4})\s+\$([0-9.]+)\s+(CALL|PUT)\b", name)
+    if not m:
+        return None
+    mon = MONTHS.get(m.group(2))
+    if not mon:
+        return None
+    expiry = datetime.date(int(m.group(4)), mon, int(m.group(3))).isoformat()
+    return {"underlying": m.group(1), "expiry": expiry,
+            "right": "C" if m.group(6) == "CALL" else "P",
+            "strike": float(m.group(5))}
+
+def build_option_spreads(opt_legs, asof):
+    enriched = []
+    for idx, leg in enumerate(opt_legs or []):
+        meta = parse_option_contract(leg)
+        if not meta:
+            continue
+        qty = fnum(leg.get("qty", 0))
+        mark = fnum(leg.get("mark", 0))
+        contracts = abs(qty)
+        mark_per_share = abs(mark) / (contracts * 100) if contracts else None
+        enriched.append({**leg, **meta, "idx": idx, "qty": qty, "contracts": contracts,
+                         "mark": mark, "markPerShare": _rn(mark_per_share, 2)})
+
+    groups = {}
+    for leg in enriched:
+        key = (leg.get("acct"), leg["underlying"], leg["expiry"], leg["right"])
+        groups.setdefault(key, []).append(leg)
+
+    out = []
+    for (acct, und, expiry, right), legs in groups.items():
+        longs = sorted([x for x in legs if x["qty"] > 0], key=lambda x: x["strike"])
+        shorts = sorted([x for x in legs if x["qty"] < 0], key=lambda x: x["strike"])
+        used_l = set(); used_s = set()
+        for li, lg in enumerate(longs):
+            for si, sh in enumerate(shorts):
+                if li in used_l or si in used_s:
+                    continue
+                contracts = min(lg["contracts"], sh["contracts"])
+                if contracts <= 0:
+                    continue
+                width = abs(sh["strike"] - lg["strike"])
+                width_value = width * contracts * 100
+                net_mark = lg["mark"] + sh["mark"]
+                if right == "C" and lg["strike"] < sh["strike"]:
+                    kind = "bull call debit spread"; expected = [0, width_value]
+                elif right == "C":
+                    kind = "bear call credit spread"; expected = [-width_value, 0]
+                elif right == "P" and lg["strike"] > sh["strike"]:
+                    kind = "bear put debit spread"; expected = [0, width_value]
+                else:
+                    kind = "bull put credit spread"; expected = [-width_value, 0]
+                dte = None
+                try:
+                    dte = (datetime.date.fromisoformat(expiry) - datetime.date.fromisoformat(asof)).days
+                except Exception:
+                    pass
+                warn = []
+                if net_mark < expected[0] - 1 or net_mark > expected[1] + 1:
+                    warn.append("当前净 mark 超出垂直价差理论范围，请核对券商报价/腿配对")
+                out.append({
+                    "underlying": und, "acct": acct, "expiry": expiry, "right": right,
+                    "longStrike": _rn(lg["strike"]), "shortStrike": _rn(sh["strike"]),
+                    "contracts": _rn(contracts, 3), "kind": kind, "width": _rn(width),
+                    "widthValue": _rn(width_value), "netMark": _rn(net_mark),
+                    "expectedRange": [_rn(expected[0]), _rn(expected[1])], "dte": dte,
+                    "longMark": _rn(lg["mark"]), "shortMark": _rn(sh["mark"]),
+                    "warnings": warn,
+                })
+                used_l.add(li); used_s.add(si)
+                break
+    return out
+
 # ---------------------------------------------------------------- classification
 # fact-checked vs LIVE yfinance .info on 2026-06-02; this map's ONLY job is the
 # documented GROUPING that collapses the correlated semis cluster (chips +
@@ -253,29 +359,48 @@ def merge_histories(parsed):
     """Merge trades across overlapping exports. Each real transaction appears
     once per export that covers its date; overlapping exports repeat it. So we
     take, per identical-transaction key, the MAX count seen in any single file
-    (not the sum) — robust dedup that preserves genuine same-day duplicates."""
+    (not the sum) — robust dedup that preserves genuine same-day duplicates.
+
+    Amount is intentionally not part of the identity key: Fidelity sometimes
+    changes commission/fee rounding by a cent between overlapping exports. In
+    that case use the amount from the newest parsed export rather than double
+    counting the fill.
+    """
     from collections import Counter, defaultdict
     sc, oc, names = Counter(), Counter(), {}
+    sa, oa = {}, {}
     for h in parsed:
         fsc, foc = Counter(), Counter()
+        fsa, foa = defaultdict(list), defaultdict(list)
         for sym, L in h["txns"].items():
             names.setdefault(sym, h["names"].get(sym, sym))
             for t in L:
-                fsc[(t["date"], t["side"], sym, round(t["qty"], 3),
-                     round(t["price"], 2), round(t["amount"], 2))] += 1
+                k = (t.get("account", ""), t["date"], t["side"], sym,
+                     round(t["qty"], 3), round(t["price"], 2))
+                fsc[k] += 1
+                fsa[k].append(round(t["amount"], 2))
         for sym, L in h["opt_txns"].items():
             for t in L:
-                foc[(t["date"], t["side"], sym, round(t["qty"], 3),
-                     round(t["price"], 2), round(t["amount"], 2))] += 1
+                k = (t.get("account", ""), t["date"], t["side"], sym,
+                     round(t["qty"], 3), round(t["price"], 2))
+                foc[k] += 1
+                foa[k].append(round(t["amount"], 2))
         for k, n in fsc.items():
-            sc[k] = max(sc[k], n)
+            if n >= sc[k]:
+                sc[k] = n
+                sa[k] = fsa[k]
         for k, n in foc.items():
-            oc[k] = max(oc[k], n)
+            if n >= oc[k]:
+                oc[k] = n
+                oa[k] = foa[k]
     txns, opt = defaultdict(list), defaultdict(list)
-    for store, src in ((txns, sc), (opt, oc)):
-        for (d, side, sym, qty, price, amt), n in src.items():
-            for _ in range(n):
-                store[sym].append({"date": d, "side": side, "qty": qty, "price": price, "amount": amt})
+    for store, src, amts in ((txns, sc, sa), (opt, oc, oa)):
+        for (acct, d, side, sym, qty, price), n in src.items():
+            vals = amts.get((acct, d, side, sym, qty, price), [0.0])
+            for i in range(n):
+                amt = vals[i] if i < len(vals) else vals[-1]
+                store[sym].append({"date": d, "side": side, "qty": qty,
+                                   "price": price, "amount": amt, "account": acct})
     for L in txns.values():
         L.sort(key=lambda t: t["date"])
     return txns, opt, names
@@ -340,7 +465,73 @@ def fetch_prices(tickers, start, end, no_fetch=False):
         return json.load(open(CACHE)) if os.path.exists(CACHE) else {}
     missing = [t for t in tickers if t not in out]
     print(f"· got {len(out)}/{len(tickers)} tickers" + (f"  missing: {missing}" if missing else ""))
+    if os.path.exists(CACHE):
+        try:
+            old = json.load(open(CACHE))
+            for sym, series in out.items():
+                merged = old.get(sym, {})
+                merged.update(series)
+                old[sym] = merged
+            out = old
+        except Exception:
+            pass
     json.dump(out, open(CACHE, "w"))
+    return out
+
+def fetch_ohlc(tickers, start, end, no_fetch=False):
+    """Fetch daily OHLC for strategy indicators that need High/Low (ATR).
+    This is intentionally narrow and additive: the core portfolio valuation still
+    uses fetch_prices' close series and remains covered by sync.py's broker gate.
+    """
+    if no_fetch and os.path.exists(OHLC_CACHE):
+        print("· using cached OHLC (--no-fetch)")
+        return json.load(open(OHLC_CACHE))
+    if no_fetch:
+        return json.load(open(OHLC_CACHE)) if os.path.exists(OHLC_CACHE) else {}
+    try:
+        import warnings; warnings.filterwarnings("ignore")
+        import yfinance as yf
+    except ImportError:
+        print("!! yfinance not installed. OHLC strategy data from cache only.")
+        return json.load(open(OHLC_CACHE)) if os.path.exists(OHLC_CACHE) else {}
+    print(f"· fetching OHLC for {len(tickers)} strategy tickers {start}→{end} ...")
+    out = {}
+    try:
+        data = yf.download(list(tickers), start=start, end=end, progress=False,
+                           auto_adjust=True, group_by="ticker")
+        multi = len(tickers) > 1
+        for t in tickers:
+            try:
+                sub = data[t] if multi else data
+                rows = {}
+                for idx, r in sub.dropna(subset=["Open", "High", "Low", "Close"]).iterrows():
+                    rows[idx.strftime("%Y-%m-%d")] = {
+                        "open": round(float(r["Open"]), 4),
+                        "high": round(float(r["High"]), 4),
+                        "low": round(float(r["Low"]), 4),
+                        "close": round(float(r["Close"]), 4),
+                    }
+                if rows:
+                    out[t] = rows
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"!! OHLC fetch failed ({e}); using cache if available")
+        return json.load(open(OHLC_CACHE)) if os.path.exists(OHLC_CACHE) else {}
+    if os.path.exists(OHLC_CACHE):
+        try:
+            old = json.load(open(OHLC_CACHE))
+            for sym, rows in out.items():
+                merged = old.get(sym, {})
+                merged.update(rows)
+                old[sym] = merged
+            out = old
+        except Exception:
+            pass
+    try:
+        json.dump(out, open(OHLC_CACHE, "w"))
+    except Exception:
+        pass
     return out
 
 def fetch_sectors(tickers, no_fetch=False, per_ticker_timeout=4.0, total_budget=25.0, stale_days=30):
@@ -417,6 +608,44 @@ def price_on(prices, sym, isodate):
         else:
             break
     return prev if prev is not None else ps[min(ps)]
+
+def latest_price_date(prices, tickers, through):
+    """Latest market date available in the downloaded cache.
+
+    Prefer benchmark trading days so the portfolio axis lands on a real market
+    session; fall back to any held ticker if the benchmark download is missing.
+    """
+    for sym in ("^GSPC", "^IXIC", "QQQ"):
+        ds = sorted(d for d in (prices.get(sym) or {}) if d <= through)
+        if ds:
+            return ds[-1]
+    ds = sorted({d for sym in tickers for d in (prices.get(sym) or {}) if d <= through})
+    return ds[-1] if ds else None
+
+def mark_to_market(cur, prices, asof):
+    """Revalue held equities from latest downloaded prices.
+
+    Fidelity's Portfolio CSV remains the source of truth for shares and cost
+    basis. This only updates stock price/value/unrealized fields, leaving cash
+    and option marks as the broker snapshot because Yahoo close data is not a
+    reliable option-chain valuation source.
+    """
+    refreshed = {}
+    for sym, d in cur.items():
+        px = price_on(prices, sym, asof)
+        if not px or not d.get("shares"):
+            continue
+        shares = d["shares"]
+        cost = d.get("cost", 0.0)
+        value = shares * px
+        gain = value - cost
+        d["price"] = px
+        d["value"] = value
+        d["gain"] = gain
+        d["gainpct"] = gain / cost * 100 if cost else 0.0
+        d["avg"] = cost / shares if shares else 0.0
+        refreshed[sym] = round(px, 4)
+    return refreshed
 
 # ---------------------------------------------------------------- Fibonacci indicators
 def _ema(vals, n):
@@ -515,6 +744,373 @@ def compute_fib(items):
             "signals": sig, "resonance": res,
             "now": {"state": state[-1], "label": label[state[-1]],
                     "mom": mom[-1], "rsi": round(rsi[-1], 1), "res": active}}
+
+# ---------------------------------------------------------------- QQQ/TQQQ decision map
+def _ohlc_rows(prices, ohlc, sym, dmax):
+    src = ohlc.get(sym) or {}
+    rows = []
+    if src:
+        for d, r in sorted(src.items()):
+            if d > dmax:
+                continue
+            try:
+                rows.append({"date": d, "open": float(r["open"]), "high": float(r["high"]),
+                             "low": float(r["low"]), "close": float(r["close"])})
+            except Exception:
+                pass
+        if len(rows) >= 20:
+            return rows, "OHLC"
+    for d, c in sorted((prices.get(sym) or {}).items()):
+        if d > dmax:
+            continue
+        try:
+            c = float(c)
+            rows.append({"date": d, "open": c, "high": c, "low": c, "close": c})
+        except Exception:
+            pass
+    return rows, "close-proxy"
+
+def _atr14(rows):
+    out, trs, prev_close, prev_atr = [], [], None, None
+    for r in rows:
+        h, l, c = r["high"], r["low"], r["close"]
+        tr = (h - l) if prev_close is None else max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        if len(trs) < 14:
+            atr = sum(trs) / len(trs)
+        elif len(trs) == 14:
+            atr = sum(trs[-14:]) / 14.0
+        else:
+            atr = (prev_atr * 13 + tr) / 14.0
+        prev_atr, prev_close = atr, c
+        out.append(atr)
+    return out
+
+def _pct_chg(vals, n):
+    if len(vals) <= n or not vals[-n - 1]:
+        return None
+    return (vals[-1] / vals[-n - 1] - 1) * 100
+
+def _slope_pct(vals, n=5):
+    if len(vals) <= n or not vals[-n - 1]:
+        return None
+    return (vals[-1] / vals[-n - 1] - 1) * 100
+
+def _rn(v, d=2):
+    return None if v is None else round(v, d)
+
+def _holding_snapshot(cur, sym):
+    d = cur.get(sym, {})
+    shares = d.get("shares", 0.0) or 0.0
+    return {"sym": sym, "held": shares > 0.0001, "shares": round(shares, 3),
+            "avg": _rn(d.get("avg", 0.0)), "value": _rn(d.get("value", 0.0)),
+            "gain": _rn(d.get("gain", 0.0)), "gainPct": _rn(d.get("gainpct", 0.0))}
+
+def _option_underlying(sym="", name=""):
+    """Best-effort underlying extraction for Fidelity option symbols/names."""
+    usym = (sym or "").strip().upper()
+    m = re.match(r"^-?([A-Z][A-Z0-9.]*)\d{6}[CP][0-9.]+$", usym)
+    if m:
+        return m.group(1)
+    uname = (name or "").upper()
+    m = re.search(r"\b(?:CALL|PUT)\s+\(([A-Z][A-Z0-9.]*)\)", uname)
+    if m:
+        return m.group(1)
+    meta = parse_option_contract({"name": name or ""})
+    return meta.get("underlying") if meta else None
+
+def _option_trade_summary(opt_txns, underlyings):
+    out = []
+    wanted = set(underlyings)
+    for sym, L in sorted((opt_txns or {}).items()):
+        und = _option_underlying(sym=sym)
+        if und not in wanted:
+            continue
+        tl = sorted(L, key=lambda x: x["date"])
+        net_cash = sum(t["amount"] for t in tl)
+        net_qty = sum((t["qty"] if t["side"] == "BUY" else -t["qty"]) for t in tl)
+        out.append({"underlying": und, "sym": sym, "lastDate": tl[-1]["date"] if tl else None,
+                    "netCash": _rn(net_cash), "netQty": _rn(net_qty, 3),
+                    "trades": len(tl),
+                    "txns": [{"date": t["date"], "side": t["side"], "qty": t["qty"],
+                              "price": t["price"], "amount": _rn(t["amount"])} for t in tl]})
+    return out
+
+def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
+    qrows, qsrc = _ohlc_rows(prices, ohlc, "QQQ", dmax)
+    trows, tsrc = _ohlc_rows(prices, ohlc, "TQQQ", dmax)
+    if len(qrows) < 55:
+        return {"available": False, "reason": "QQQ price history is shorter than 55 trading days."}
+
+    dates = [r["date"] for r in qrows]
+    closes = [r["close"] for r in qrows]
+    ema = {n: _ema(closes, n) for n in (8, 13, 21, 34, 55, 89)}
+    atr = _atr14(qrows)
+    rsi = _rsi(closes)
+    i = len(closes) - 1
+    c, a = closes[i], atr[i] or 0.0
+    e8, e13, e21, e34, e55, e89 = (ema[n][i] for n in (8, 13, 21, 34, 55, 89))
+    q5 = _pct_chg(closes, 5)
+    tcloses = [r["close"] for r in trows]
+    t_close = tcloses[-1] if tcloses else None
+    t5 = _pct_chg(tcloses, 5) if tcloses else None
+    e21s, e34s = _slope_pct(ema[21], 5), _slope_pct(ema[34], 5)
+    dist8, dist21 = c - e8, c - e21
+    dist8_atr = dist8 / a if a else None
+    dist21_atr = dist21 / a if a else None
+    band = (max(e8, e13, e21, e34) - min(e8, e13, e21, e34)) / c * 100 if c else 0.0
+
+    stacked = c > e21 and e8 > e13 > e21 and (e21s or 0) > 0
+    overheat = stacked and ((dist8_atr is not None and dist8_atr > 1.5) or
+                            (q5 is not None and q5 > 3.0) or (t5 is not None and t5 > 9.0))
+    near8 = bool(stacked and a and abs(c - e8) <= 0.5 * a)
+    near21 = bool(a and abs(c - e21) <= 0.5 * a and (e21s or 0) > 0)
+    two_below_21 = len(closes) >= 2 and closes[-1] < ema[21][-1] and closes[-2] < ema[21][-2]
+    broken = two_below_21 or e8 < e21 or (c < e21 and (e21s or 0) <= 0)
+    chop = (not stacked and not broken and band < 1.2)
+
+    if broken:
+        state = {"code": "break", "label": "趋势破坏/防守", "tone": "neg",
+                 "action": "停止加 TQQQ / Call；等待重新站回 EMA21 或重新评估 regime。"}
+    elif near21:
+        state = {"code": "ema21", "label": "EMA21 期权观察区", "tone": "watch",
+                 "action": "趋势未坏时，才评估 14-30DTE call debit spread 或小仓 TQQQ 弹性仓。"}
+    elif near8:
+        state = {"code": "ema8", "label": "EMA8 浅回踩", "tone": "pos",
+                 "action": "可按计划拿回一部分 QQQ/TQQQ；期权不必急。"}
+    elif overheat:
+        state = {"code": "overheat", "label": "短线过热", "tone": "watch",
+                 "action": "高位不追；上移移动止盈，可用小仓 TQQQ 上方 call credit spread 做刹车。"}
+    elif stacked:
+        state = {"code": "bull", "label": "多头趋势", "tone": "pos",
+                 "action": "核心多头可以继续由趋势管理；等待 EMA8/EMA21 回踩再做新动作。"}
+    elif chop:
+        state = {"code": "chop", "label": "均线纠缠", "tone": "watch",
+                 "action": "降低交易频率；EMA8/21 信号容易来回打脸。"}
+    else:
+        state = {"code": "mixed", "label": "转换中", "tone": "watch",
+                 "action": "仓位先按风险管理，等 EMA8/13/21 重新排队或破位确认。"}
+
+    def zone(mid, half):
+        return [_rn(mid - half), _rn(mid + half)]
+
+    tqqq_ccs = None
+    if t_close:
+        p3, p6 = t_close * 1.03, t_close * 1.06
+        width = 1.0
+        credit_scenarios = []
+        for cr in (0.25, 0.35):
+            credit_scenarios.append({
+                "credit": cr, "maxProfit": cr * 100,
+                "maxLoss": (width - cr) * 100,
+                "breakeven": _rn(91 + cr),
+            })
+        tqqq_ccs = {
+            "spot": _rn(t_close), "shortRange": [_rn(p3), _rn(p6)],
+            "longRange": [_rn(p3 + 1), _rn(p6 + 3)],
+            "qqqApproxPct": [1.0, 2.0], "dte": "7-21 DTE", "width": "$1-$3",
+            "example9122": {"short": 91, "long": 92,
+                            "shortPct": _rn((91 / t_close - 1) * 100, 1),
+                            "longPct": _rn((92 / t_close - 1) * 100, 1),
+                            "qqqApproxPct": _rn(((91 / t_close - 1) * 100) / 3, 1),
+                            "width": width, "creditScenarios": credit_scenarios}
+        }
+
+    opt_focus = []
+    tqqq_option_legs = []
+    qqq_option_legs = []
+    for leg in (account or {}).get("optLegs", []):
+        txt = ((leg.get("sym") or "") + " " + (leg.get("name") or "")).upper()
+        if "QQQ" in txt or "TQQQ" in txt:
+            rec = {k: leg.get(k) for k in ("acct", "sym", "name", "qty", "mark", "side", "type")}
+            rec["underlying"] = _option_underlying(leg.get("sym"), leg.get("name"))
+            opt_focus.append(rec)
+            if rec["underlying"] == "TQQQ":
+                tqqq_option_legs.append(rec)
+            elif rec["underlying"] == "QQQ":
+                qqq_option_legs.append(rec)
+    spread_focus = [s for s in (account or {}).get("optionSpreads", [])
+                    if s.get("underlying") in ("QQQ", "TQQQ")]
+
+    def day_state(j):
+        cj, aj = closes[j], atr[j] or 0.0
+        if ema[8][j] < ema[21][j] or cj < ema[21][j]:
+            return "below21"
+        if aj and cj - ema[8][j] > 1.5 * aj:
+            return "overheat"
+        if aj and abs(cj - ema[21][j]) <= 0.5 * aj:
+            return "ema21"
+        if aj and abs(cj - ema[8][j]) <= 0.5 * aj and ema[8][j] > ema[21][j]:
+            return "ema8"
+        if ema[8][j] > ema[13][j] > ema[21][j]:
+            return "trend"
+        return "mixed"
+
+    series = []
+    for j, d in enumerate(dates):
+        series.append({"date": d, "close": _rn(closes[j]), "ema8": _rn(ema[8][j]),
+                       "ema13": _rn(ema[13][j]), "ema21": _rn(ema[21][j]),
+                       "ema34": _rn(ema[34][j]), "ema55": _rn(ema[55][j]),
+                       "atr": _rn(atr[j]), "rsi": _rn(rsi[j], 1), "state": day_state(j)})
+
+    rules = [
+        {"key": "bull", "title": "多头趋势但未到买点", "active": state["code"] == "bull",
+         "trigger": "Close > EMA21，EMA8 > EMA13 > EMA21，EMA21 仍向上",
+         "decision": "保留核心多头；不追 TQQQ；等待 EMA8/EMA21 或过热信号"},
+        {"key": "overheat", "title": "QQQ 远离 EMA8", "active": overheat,
+         "trigger": "Close - EMA8 > 1.5 x ATR14，或 QQQ 5日 >3%，或 TQQQ 5日 >9%",
+         "decision": "移动止盈；不追高；可小仓卖 TQQQ 上方 CCS"},
+        {"key": "ema8", "title": "QQQ 回踩 EMA8", "active": near8,
+         "trigger": "Close 在 EMA8 上下 0.5 x ATR14 内，且 EMA8 仍在 EMA21 上方",
+         "decision": "拿回一部分 QQQ/TQQQ，仓位轻于核心仓"},
+        {"key": "ema21", "title": "QQQ 回踩 EMA21", "active": near21,
+         "trigger": "Close 在 EMA21 上下 0.5 x ATR14 内，EMA21 仍向上，未连续两日收破",
+         "decision": "才评估期权多头，优先 call debit spread 而非高位裸追"},
+        {"key": "break", "title": "跌破 EMA21 并反抽失败", "active": broken,
+         "trigger": "连续两日收在 EMA21 下方，或 EMA8 下穿 EMA21",
+         "decision": "不加 TQQQ，不买 call；先保护本金"},
+        {"key": "chop", "title": "EMA8/13/21/34 缠绕", "active": chop,
+         "trigger": "均线带宽 < 1.2%，且没有清晰多头/空头排列",
+         "decision": "降低交易频率，避免被来回洗"},
+    ]
+
+    hqqq, htqqq = _holding_snapshot(cur, "QQQ"), _holding_snapshot(cur, "TQQQ")
+    long_value = (hqqq.get("value") or 0.0) + (htqqq.get("value") or 0.0)
+    has_long = bool(hqqq.get("held") or htqqq.get("held"))
+    known_cash = (account or {}).get("cashTotal", 0.0) or 0.0
+    tqqq_cash_contracts = math.floor(known_cash / (t_close * 100)) if t_close else 0
+    tqqq_covered_contracts = math.floor((htqqq.get("shares") or 0.0) / 100)
+    opt_hist_focus = _option_trade_summary(opt_txns or {}, ("QQQ", "TQQQ"))
+    tqqq_hist_focus = [x for x in opt_hist_focus if x["underlying"] == "TQQQ"]
+    qqq_hist_focus = [x for x in opt_hist_focus if x["underlying"] == "QQQ"]
+    q_high20 = max(closes[-20:]) if len(closes) >= 20 else max(closes)
+    q_trail_3atr = q_high20 - 3 * a if a else None
+    t_atr = _atr14(trows) if len(trows) >= 2 else []
+    t_atr_last = t_atr[-1] if t_atr else None
+    t_high20 = max(tcloses[-20:]) if tcloses else None
+    trailing = {
+        "qqqHigh20": _rn(q_high20), "qqqTrail3Atr": _rn(q_trail_3atr),
+        "qqqTrailGapPct": _rn((q_trail_3atr / c - 1) * 100, 2) if q_trail_3atr and c else None,
+        "tqqqHigh20": _rn(t_high20), "tqqqTrail8Pct": _rn(t_high20 * 0.92) if t_high20 else None,
+        "tqqqTrail12Pct": _rn(t_high20 * 0.88) if t_high20 else None,
+        "tqqqAtr14": _rn(t_atr_last),
+    }
+    next_triggers = [
+        {"name": "EMA8 拿回", "level": _rn(e8), "zone": zone(e8, 0.5 * a),
+         "distancePct": _rn((e8 / c - 1) * 100, 2),
+         "action": "浅回踩才考虑拿回小仓 QQQ/TQQQ"},
+        {"name": "EMA21 期权", "level": _rn(e21), "zone": zone(e21, 0.5 * a),
+         "distancePct": _rn((e21 / c - 1) * 100, 2),
+         "action": "趋势未坏时才评估 14-30DTE call debit spread"},
+        {"name": "过热阈值", "level": _rn(e8 + 1.5 * a), "zone": None,
+         "distancePct": _rn(((e8 + 1.5 * a) / c - 1) * 100, 2),
+         "action": "触发后上移移动止盈；只用小仓 CCS 刹车"},
+        {"name": "趋势破坏", "level": _rn(e21), "zone": None,
+         "distancePct": _rn((e21 / c - 1) * 100, 2),
+         "action": "连续收破 EMA21 或 EMA8<EMA21 时停止进攻"},
+    ]
+    panel_map = {
+        "bull": ("等待，不追", "核心多头继续趋势管理；新 TQQQ/期权等 EMA8/EMA21。",
+                 "不要因为多头趋势就高位加 TQQQ；不要常态化卖 CCS 拖累白天鹅。"),
+        "overheat": ("先防守浮盈", "上移移动止盈；战术仓可分批止盈；已有多头时才考虑小仓上方 CCS。",
+                     "不要追高；不要让 CCS 从 hedge 变成账户主风险。"),
+        "ema8": ("小仓拿回", "可小仓拿回 QQQ/TQQQ；仍不必急着重仓期权。",
+                 "不要把浅回踩当 EMA21 深回踩；仓位轻于核心。"),
+        "ema21": ("期权观察", "若 EMA21 守住且主线未破，可评估 call debit spread 或小仓 TQQQ。",
+                  "不要用 0DTE/远 OTM 裸 call 代替有风险定义的结构。"),
+        "break": ("停止进攻", "退出/降低战术仓，保护本金，等重新站回 EMA21。",
+                  "不要无脑抄底 TQQQ；不要把趋势破坏当普通回调。"),
+        "chop": ("降频小仓", "均线纠缠时减少交易频率，等方向重新排队。",
+                 "不要用 EMA8/21 反复加减仓被 whipsaw。"),
+        "mixed": ("等确认", "仓位按风险管理，等趋势重排或破位确认。",
+                  "不要在转换区把任何单一信号看成确定性。"),
+    }
+    p = panel_map.get(state["code"], panel_map["mixed"])
+    decision_panel = {
+        "headline": p[0], "doNow": p[1], "avoid": p[2],
+        "ccsRole": ("已有 QQQ/TQQQ 多头，CCS 只能小仓做 hedge；当前 QQQ/TQQQ 多头约 "
+                    + f"${long_value:,.0f}") if has_long else "没有 QQQ/TQQQ 多头；上方 CCS 是偏空交易，不是 hedge。",
+        "movingStop": "QQQ 用 3xATR 保护天气图；TQQQ 战术仓用 8%-12% trailing stop。",
+    }
+    teacher_checks = [
+        {"label": "QQQ 天气", "value": state["label"], "ok": state["code"] not in ("break", "chop")},
+        {"label": "多头可对冲", "value": ("有 QQQ/TQQQ 多头" if has_long else "没有 QQQ/TQQQ 多头"), "ok": has_long},
+        {"label": "CCS 风险", "value": "最大亏损 = 宽度 - credit；需实盘确认 delta/credit", "ok": True},
+        {"label": "移动止盈", "value": "先写 QQQ 3ATR / TQQQ 8%-12% 线", "ok": True},
+        {"label": "白天鹅", "value": "核心多头不为小 credit 封顶", "ok": True},
+    ]
+    def option_status(kind):
+        code = state["code"]
+        if kind == "debit":
+            if code == "ema21":
+                return ("WATCH", "EMA21 守住且未连续收破时，才评估 14-30DTE call debit spread。")
+            if code in ("break", "chop"):
+                return ("BLOCK", "趋势破坏或均线纠缠时，不加 TQQQ/call 方向性风险。")
+            return ("WATCH", "等 QQQ 回到 EMA21 期权区；高位不急着买期权。")
+        if kind == "ccs":
+            if not has_long:
+                return ("BLOCK", "没有 QQQ/TQQQ 多头，上方 CCS 不是 hedge。")
+            if code == "overheat":
+                return ("WATCH", "仅小仓、定义风险，用作多头短线刹车；先确认实盘 delta/credit。")
+            return ("WATCH", "等 QQQ 过热或冲高停顿；不要常态化卖 CCS 拖累白天鹅。")
+        if kind == "covered":
+            if tqqq_covered_contracts > 0:
+                return ("WATCH", f"最多约 {tqqq_covered_contracts} 组 covered call；只有愿意交割 TQQQ 才做。")
+            return ("BLOCK", f"TQQQ 仅 {htqqq.get('shares', 0)} 股，不足 100 股，不能叫 covered call。")
+        if kind == "csp":
+            if tqqq_cash_contracts > 0:
+                return ("WATCH", f"已知现金粗略可覆盖 {tqqq_cash_contracts} 组，但必须愿意接 TQQQ。")
+            need = (t_close or 0) * 100
+            return ("BLOCK", f"已知现金 ${known_cash:,.0f}，不足覆盖 1 张 TQQQ put 约 ${need:,.0f}。")
+        return ("WATCH", "先确认结构、流动性、最大亏损和退出线。")
+
+    tqqq_option_plan = {
+        "status": ("当前导出没有 TQQQ 期权合约；最近 TQQQ 记录是股票/ETF买入。"
+                   if not tqqq_option_legs and not tqqq_hist_focus
+                   else "发现 TQQQ 期权记录；先按当前腿和成交净额核对。"),
+        "currentTqqqLegs": tqqq_option_legs,
+        "currentQqqLegs": qqq_option_legs,
+        "recentTqqqOrders": tqqq_hist_focus,
+        "recentQqqOrders": qqq_hist_focus,
+        "cashKnown": _rn(known_cash),
+        "coveredContracts": tqqq_covered_contracts,
+        "cashSecuredPutContracts": tqqq_cash_contracts,
+        "structures": [
+            {"name": "TQQQ call debit spread", "role": "方向性战术",
+             "status": option_status("debit")[0], "rule": option_status("debit")[1],
+             "risk": "付出的 debit 为最大亏损；优先 14-30 DTE、近 ATM long call + 更高 strike short call。"},
+            {"name": "TQQQ 上方 CCS", "role": "多头刹车/hedge",
+             "status": option_status("ccs")[0], "rule": option_status("ccs")[1],
+             "risk": "最大亏损 = 宽度 - credit；小仓，50%-70% credit captured 可收。"},
+            {"name": "TQQQ covered call", "role": "愿意卖出持仓才用",
+             "status": option_status("covered")[0], "rule": option_status("covered")[1],
+             "risk": "会封顶 TQQQ 上行；不是愿意交割就不要用。"},
+            {"name": "TQQQ cash-secured put", "role": "愿意接货才用",
+             "status": option_status("csp")[0], "rule": option_status("csp")[1],
+             "risk": "必须有真实现金接 assignment；不要用 margin 假装 CSP。"},
+        ],
+    }
+
+    return {"available": True, "asOf": dates[-1], "source": {"qqq": qsrc, "tqqq": tsrc},
+            "state": state, "decisionPanel": decision_panel,
+            "teacherChecks": teacher_checks, "nextTriggers": next_triggers,
+            "trailing": trailing,
+            "latest": {"date": dates[-1], "qqq": _rn(c), "tqqq": _rn(t_close),
+                       "ema8": _rn(e8), "ema13": _rn(e13), "ema21": _rn(e21),
+                       "ema34": _rn(e34), "ema55": _rn(e55), "ema89": _rn(e89),
+                       "atr14": _rn(a), "rsi14": _rn(rsi[-1], 1),
+                       "distEma8": {"dollar": _rn(dist8), "pct": _rn(dist8 / e8 * 100, 2), "atr": _rn(dist8_atr, 2)},
+                       "distEma21": {"dollar": _rn(dist21), "pct": _rn(dist21 / e21 * 100, 2), "atr": _rn(dist21_atr, 2)},
+                       "qqqRet5": _rn(q5, 2), "tqqqRet5": _rn(t5, 2),
+                       "ema21Slope5": _rn(e21s, 2), "ema34Slope5": _rn(e34s, 2),
+                       "bandWidthPct": _rn(band, 2), "twoBelowEma21": two_below_21},
+            "zones": {"ema8Buyback": zone(e8, 0.5 * a), "ema21Options": zone(e21, 0.5 * a),
+                      "ema34Defense": zone(e34, 0.25 * a), "ema55Regime": zone(e55, 0.25 * a)},
+            "rules": rules, "series": series[-130:],
+            "holdings": {"QQQ": hqqq, "TQQQ": htqqq},
+            "tqqqCcs": tqqq_ccs, "optionLegs": opt_focus,
+            "optionSpreads": spread_focus, "optionHistory": opt_hist_focus,
+            "tqqqOptions": tqqq_option_plan}
 
 # ---------------------------------------------------------------- behavioral
 def analyze_behavior(stocks, summary, prices, dmin, dmax):
@@ -657,7 +1253,7 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
     # examples are symbol-prefixed) and only at level alert/watch — account-level
     # flags (overtrading) have no per-name examples and are excluded. When the data
     # is clean a name simply gets no chip (honest; never manufactured).
-    PER_NAME_IDS = {"concentration", "disposition", "sunkcost", "recency", "anchoring"}
+    PER_NAME_IDS = {"disposition", "sunkcost", "recency", "anchoring"}   # concentration is account-level — don't paint broad-index ETFs (VOO/QQQ) with a per-name 集中 chip
     biasBySym = {}
     for f in flags:
         if f["id"] not in PER_NAME_IDS or f["level"] not in ("alert", "watch"):
@@ -871,10 +1467,11 @@ def build_alloc(stocks, summary, risk, account, sectors):
         for s in held:
             ac.setdefault(s["assetClass"], 0.0)
             ac[s["assetClass"]] += s["value"]
-        byAC = [{"bucket": k, "value": round(v, 2), "weightPct": round(v / mv * 100, 1)} for k, v in ac.items()]
         cash = (account or {}).get("cashTotal") or 0.0
+        acBase = mv + cash   # asset-class weights are % of (equity + cash) so the card sums to 100%; theme weights stay on the mv basis to reconcile with risk.contrib
+        byAC = [{"bucket": k, "value": round(v, 2), "weightPct": round(v / acBase * 100, 1)} for k, v in ac.items()]
         if cash:
-            byAC.append({"bucket": "现金", "value": round(cash, 2), "weightPct": round(cash / mv * 100, 1), "isCash": True})
+            byAC.append({"bucket": "现金", "value": round(cash, 2), "weightPct": round(cash / acBase * 100, 1), "isCash": True})
         byAC.sort(key=lambda x: -x["value"])
         # by theme (equity only)
         th = {}
@@ -913,7 +1510,10 @@ def build_alloc(stocks, summary, risk, account, sectors):
         return {"byAssetClass": [], "byTheme": [], "largestTheme": None, "conc": None,
                 "provenance": {"asOf": "—", "unclassified": 0, "sources": {}}}
 
-def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends=0.0, life_deposits=0.0, account=None, sectors=None):
+def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax,
+                  dividends=0.0, life_deposits=0.0, account=None, sectors=None,
+                  ohlc=None, price_mode="broker", price_as_of=None,
+                  refreshed_prices=None):
     tot_buy, tot_sell = totals
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
@@ -948,6 +1548,15 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                          "realized": (round(r, 2) if r is not None else None)})
         total_realized += realized
         c = cur.get(sym, {})
+        sym_window = sorted((d, p) for (d, p) in prices.get(sym, {}).items() if dmin <= d <= dmax)
+        # 'today's mover': use the last two trading-day closes in the window so the sort matches the trader's morning question
+        day_pct = None
+        day_dollar = None
+        if len(sym_window) >= 2 and sym_window[-2][1]:
+            lp, pp = sym_window[-1][1], sym_window[-2][1]
+            day_pct = round((lp - pp) / pp * 100.0, 2)
+            if held:
+                day_dollar = round((lp - pp) * final, 2)
         stocks.append({
             "sym": sym, "name": names.get(sym, sym), "held": held,
             "shares": round(final, 3), "avg": round(c.get("avg", 0), 2),
@@ -956,7 +1565,8 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
             "unrealPct": round(c.get("gainpct", 0), 2), "cost": round(c.get("cost", 0), 2),
             "realized": round(realized, 2), "hasLegacy": has_legacy,
             "numTrades": len(tl), "prices": sorted(prices.get(sym, {}).items()),
-            "txns": rows, "fib": compute_fib(sorted(prices.get(sym, {}).items()))})
+            "txns": rows, "fib": compute_fib(sorted(prices.get(sym, {}).items())),
+            "dayChangePct": day_pct, "dayChangeDollar": day_dollar})
 
     # per-stock momentum keyed by date (for the portfolio-level overlay)
     mom_map = {}
@@ -1050,7 +1660,10 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "numHeld": sum(1 for s in stocks if s["held"]),
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
-               "netWorthStart": series[0]["value"] if series else 0}
+               "netWorthStart": series[0]["value"] if series else 0,
+               "priceMode": price_mode, "priceAsOf": price_as_of or dmax,
+               "refreshedPriceCount": len(refreshed_prices or {}),
+               "generatedAt": datetime.datetime.now().isoformat(timespec="seconds")}
 
     # ---- whole-account: fold cash + option mark-to-market into net worth ----
     # Strictly additive: NEW summary keys only. The 股票 bucket = held_val (the
@@ -1062,6 +1675,7 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
         acct_block = {**account, "equity": eq, "netWorthWhole": whole,
                       "optPctEquity": (round(account["optMarkGross"] / held_val * 100, 2) if held_val else None),
                       "asOf": account.get("asOf") or "券商最新快照"}
+        acct_block["optionSpreads"] = build_option_spreads(acct_block.get("optLegs", []), dmax)
         summary["accountNetWorth"] = whole
         summary["cashTotal"] = account["cashTotal"]
         summary["pendingTotal"] = account["pending"]
@@ -1123,9 +1737,10 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     risk = compute_risk(series, stocks)
     classify(stocks, sectors or {})
     alloc = build_alloc(stocks, summary, risk, acct_block, sectors or {})
+    qqq_tqqq = build_qqq_tqqq_strategy(prices, ohlc or {}, cur, acct_block, dmax, opt_txns)
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
             "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk,
-            "bridge": bridge, "account": acct_block, "alloc": alloc}
+            "bridge": bridge, "account": acct_block, "alloc": alloc, "qqqTqqq": qqq_tqqq}
 
 # ---------------------------------------------------------------- HTML
 def render_html(payload):
@@ -1160,15 +1775,17 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
   /* ---- palette ---- */
   --bg:#0B0C0E; --bg2:#0E1013; --panel:#121316; --panel2:#16181C;
   --line:#23262C; --hair:#1A1C21;
-  --txt:#ECEDEF; --mut:#888D96; --faint:#5C616B;
+  --txt:#ECEDEF; --mut:#888D96; --faint:#7E848E;   /* faint bumped #5C616B→#7E848E for WCAG-AA on group labels / gl underline */
   --accent:#E8B339;            /* the ONE chromatic accent: live line / active / "you are here" */
   --accent-ref:#B89030;        /* muted amber = reference (cost basis) — distinct from live */
   --accent-soft:rgba(232,179,57,0.12);
   --accent-line:rgba(232,179,57,0.32);
-  --green:#4FB286; --red:#E5707A; --orange:#E8B339;
+  --green:#4FB286; --red:#E5707A;       /* semantic P&L sign / risk direction ONLY */
+  --mut2:#B6BAC1;                        /* secondary grey: benchmark (Nasdaq) line + legend — not P&L, not the amber accent */
+  --chip-bd-green:#4FB28666; --chip-bd-red:#E5707A66; --chip-bd-amber:#E8B33966;  /* one tinted-chip border convention */
   --grid:#1A1C21; --axis:#6B7079;
   /* legacy aliases kept so any stray var() refs still resolve */
-  --panel-2:var(--panel2); --blue:var(--accent); --purple:var(--accent);
+  --panel-2:var(--panel2); --blue:var(--accent); --purple:var(--accent); --orange:var(--accent);
   /* ---- type ---- */
   --f-disp:"Space Grotesk","Noto Sans SC","PingFang SC",ui-sans-serif,system-ui,sans-serif;
   --f-ui:"Archivo","Noto Sans SC","PingFang SC",-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -1301,6 +1918,27 @@ body.ready .kpi:first-child .l::after{
   box-shadow:var(--sh-lift);
 }
 .right{flex:1; min-width:0}
+.viewbar{
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  min-height:42px; margin-bottom:12px; padding:8px 2px;
+}
+.trail{display:flex; align-items:center; gap:8px; min-width:0; color:var(--mut)}
+.trail .here{font-family:var(--f-disp); font-weight:600; color:var(--txt); white-space:nowrap}
+.trail .note{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.view-actions{display:flex; align-items:center; justify-content:flex-end; gap:7px; flex-wrap:wrap}
+.microbtn{
+  display:inline-flex; align-items:center; justify-content:center; gap:5px;
+  min-height:30px; padding:5px 10px;
+  border:1px solid var(--line); border-radius:var(--r-ctl);
+  background:var(--panel); color:var(--txt);
+  font-family:var(--f-ui); font-size:12px; font-weight:600;
+  cursor:pointer; white-space:nowrap;
+  transition:border-color .16s var(--ease),color .16s var(--ease),background-color .16s var(--ease);
+}
+.microbtn:hover{border-color:var(--accent-line); color:var(--accent); background:var(--panel2)}
+.microbtn:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.microbtn.primary{border-color:var(--accent-line); color:var(--accent); background:var(--accent-soft)}
+.recent-chip{font-family:var(--f-mono); font-size:11px}
 
 /* ---- controls ---- */
 .controls{
@@ -1376,6 +2014,9 @@ body.ready .kpi:first-child .l::after{
   text-align:right; white-space:nowrap; color:var(--txt);
 }
 .row .pnl .meta{text-align:right}
+/* colorblind-safe sign glyph: ▲ for gain, ▼ for loss — color is no longer the only cue */
+.row .pnl.pos::before{content:"\25B2\00a0"; opacity:0.55; font-size:0.78em; vertical-align:1px}
+.row .pnl.neg::before{content:"\25BC\00a0"; opacity:0.55; font-size:0.78em; vertical-align:1px}
 /* pinned overview row = "home": amber tick + faint amber wash */
 .ovrow{background:var(--accent-soft)}
 .ovrow .sym{color:var(--accent)}
@@ -1581,6 +2222,13 @@ details[open] summary::before{content:"▾ "}
   content:""; position:absolute; left:16px; right:16px; bottom:-1px; height:2px;
   background:var(--accent); border-radius:1px; box-shadow:0 0 8px var(--accent-line);
 }
+.seg-grp{
+  flex:none; align-self:center; padding:0 8px;
+  font-family:var(--f-ui); font-size:10px; font-weight:700;
+  letter-spacing:.08em; text-transform:uppercase; color:var(--faint);
+  border-left:1px solid var(--hair);
+}
+.seg-grp:first-child{border-left:0}
 .seg[hidden]{display:none}
 
 /* ============================== MOTION ============================== */
@@ -1626,13 +2274,13 @@ details[open] summary::before{content:"▾ "}
   .kpi:nth-child(-n+4){border-top:1px solid var(--line)}
   .kpi:nth-child(-n+2){border-top:0}
   .wrap{flex-direction:column}
-  .right{order:1}            /* show 今日要点 / overview BEFORE the holdings rail on small screens */
+  .right{order:1;width:100%}            /* show 今日要点 / overview BEFORE the holdings rail on small screens */
   .left{order:2; width:100%; position:static}
   .list{max-height:46vh}
   .seg-rail{top:0; position:static}
   .seg-rail button{padding:9px 11px 10px; font-size:12px}
   .seg-rail button.on::after{left:11px; right:11px}
-  header .sub{margin-left:0; text-align:left; width:100%}
+  header .sub{margin-left:0; text-align:left; width:100%; overflow-wrap:anywhere; text-transform:none; letter-spacing:.04em}
 }
 @media (max-width:560px){
   /* phone: single-column KPIs with clamped values, no clipping */
@@ -1644,12 +2292,25 @@ details[open] summary::before{content:"▾ "}
   .kpi:first-child .v{font-size:20px}
   .wrap{padding:12px 12px 40px; gap:14px}
   header{padding:14px 14px 0}
-  /* tab rail: wrap to rows on a phone so no tab is hidden */
-  .seg-rail{flex-wrap:wrap; overflow:visible; -webkit-mask-image:none; mask-image:none}
-  .seg-rail button{flex:1 1 28%; padding:11px 8px}
+  /* keep the back-button + breadcrumb visible after scrolling so the trader is never trapped below the fold.
+     top:84px sits BELOW the sticky page header (header is z:20, height ≈84px); z:16 keeps us under header and above content */
+  .viewbar{position:sticky; top:84px; z-index:16; background:var(--bg); align-items:center; flex-direction:row; flex-wrap:wrap; gap:8px; padding:10px 0 8px; margin:0 0 10px; border-bottom:1px solid var(--hair)}
+  .viewbar .trail{flex:1 1 auto; min-width:0}
+  .view-actions{justify-content:flex-end}
+  .microbtn{min-height:44px; padding:11px 14px; font-size:13px}   /* 44pt iOS-recommended tap target */
+  .viewbar .microbtn.primary{flex:0 0 auto}
+  /* tab rail: scroll horizontally; chevron edge instead of fading-mask so users know more tabs exist */
+  .seg-rail{
+    flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden;
+    scroll-snap-type:x proximity; -webkit-overflow-scrolling:touch;
+    position:relative;
+  }
+  .seg-rail::after{content:"›"; position:sticky; right:0; padding:6px 8px; color:var(--mut); background:linear-gradient(90deg,transparent,var(--bg) 40%); pointer-events:none; align-self:center; font-size:18px}
+  .seg-rail button{flex:0 0 auto; min-height:44px; padding:13px 14px; font-size:13px; scroll-snap-align:start}   /* 44pt min-height for one-handed thumb hits */
   /* bigger touch targets */
-  .tabs button{padding:13px 6px}
-  .row{padding:13px 14px}
+  .tabs button{padding:14px 6px; min-height:44px}
+  .row{padding:14px 14px; min-height:44px}
+  .controls input,.controls select{min-height:44px; padding:12px 12px; font-size:14px}   /* search & sort dropdown also 44pt */
   /* dense tables: keep the ticker column visible while the rest scrolls */
   .scroll{overflow-x:auto}
   .scroll table th:first-child,.scroll table td:first-child{position:sticky; left:0; background:var(--panel); z-index:2}
@@ -1665,10 +2326,18 @@ details[open] summary::before{content:"▾ "}
   .seg[data-seg="score"] table th:nth-child(9),.seg[data-seg="score"] table td:nth-child(9),
   .seg[data-seg="score"] table th:nth-child(11),.seg[data-seg="score"] table td:nth-child(11){display:none}
   .ib-row{font-size:13px}
-  .ctx{display:none}
+  /* keep the floating context pill visible on mobile — it doubles as a back-button when in a stock view */
+  .ctx{top:8px; right:8px; left:auto; transform:none; max-width:70vw; font-size:12px; padding:9px 14px; cursor:pointer; min-height:38px}
   #insight{margin:12px 12px 0}
-  /* phone KPI strip: keep the 5 essentials (市值/未实现/区间收益/超额/期权毛敞口), drop the dollar-ledger tail */
-  .kpi:nth-child(n+6){display:none}
+  /* phone KPI strip: single-column is vertically cheap → keep the FULL ledger
+     (realized P&L / dividends / deposits are the truth the strip exists to show) */
+  /* dense secondary tables: priority-column drops so decision columns survive 390px */
+  .seg[data-seg="sig"] table th:nth-child(8),.seg[data-seg="sig"] table td:nth-child(8){display:none}
+  .seg[data-seg="tx"] table th:nth-child(3),.seg[data-seg="tx"] table td:nth-child(3),
+  .seg[data-seg="tx"] table th:nth-child(4),.seg[data-seg="tx"] table td:nth-child(4),
+  .seg[data-seg="tx"] table th:nth-child(5),.seg[data-seg="tx"] table td:nth-child(5){display:none}
+  .badges{gap:14px; row-gap:12px}
+  .badge .v{overflow-wrap:anywhere}
 }
 </style>
 </head>
@@ -1685,6 +2354,7 @@ details[open] summary::before{content:"▾ "}
      <input id="search" placeholder="搜索代码或公司名…" aria-label="搜索持仓（代码或公司名）"/>
      <select id="sort" aria-label="排序方式">
        <option value="value">按市值排序</option>
+       <option value="day">按今日涨跌幅</option>
        <option value="unreal">按未实现盈亏</option>
        <option value="realized">按已实现盈亏</option>
        <option value="numTrades">按交易次数</option>
@@ -1702,7 +2372,8 @@ details[open] summary::before{content:"▾ "}
  <div class="right" id="right"></div>
 </div>
 <div class="tt" id="tt"></div>
-<div id="ctx" class="ctx" hidden><span class="ctx-tick"></span><span id="ctxt"></span></div>
+<div id="ctx" class="ctx" hidden role="button" tabindex="0" aria-label="跳转 / 返回组合总览" onclick="if(sel!=='__OV__')goBack();else window.scrollTo({top:0,behavior:'smooth'});" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"><span class="ctx-tick"></span><span id="ctxt"></span></div>
+<div id="srlive" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%)"></div>
 <button id="totop" class="totop" aria-label="回到顶部" hidden>↑</button>
 <script>
 const DATA = __DATA__;
@@ -1712,11 +2383,14 @@ const pct=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(2)+'%';
 const ppf=n=>n==null?'—':(n>=0?'+':'')+n.toFixed(2)+'pp';   // percentage-point difference (excess vs benchmark) — one canonical unit everywhere
 const cls=n=>n>0?'pos':(n<0?'neg':'');
 const S=DATA.summary, D0=S.dateRange[0], D1=S.dateRange[1];
-document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</b> · 价格来自 Yahoo Finance · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
+const priceSrc=S.priceMode==='mark-to-market'
+ ? `股票市值 Yahoo refreshed <b>${S.priceAsOf}</b> · 期权/现金 Fidelity 快照`
+ : `股票市值 Fidelity 快照 · 图表价格 Yahoo Finance`;
+document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</b> · ${priceSrc} · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
 
 const kpis=[
  ['股票市值 (不含现金/期权)',fmt(S.marketValue),''],
- ['未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
+ [S.priceMode==='mark-to-market'?'未实现盈亏 (Yahoo重估)':'未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
  ['区间收益 (时间加权)',pct(S.curReturn),cls(S.curReturn)],
  ['超额 vs 标普',(S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
  ['期权毛敞口',(S.optMarkGross?fmt(S.optMarkGross)+' <span class="note">≈权益 '+S.optPctEquity+'%</span>':'—'),''],
@@ -1731,28 +2405,190 @@ document.getElementById('kpis').innerHTML=kpis.map(k=>`<div class="kpi"><div cla
 
 let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
+const DEFAULT_SEG={ov:'score',stk:'price'};
+const VALID_SEG={ov:['score','qt','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'], stk:['price','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
+const SEG_LABEL={score:'决策一览', qt:'QQQ/TQQQ', nw:'净值 · 全账户', risk:'风险', struct:'结构', cmp:'指数对比', pfib:'斐波那契·技术', sig:'持仓信号', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
+function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
+let routeApplying=false;
+function findStock(sym){sym=(sym||'').toUpperCase();return stocks.find(x=>x.sym===sym)||null;}
+function normSym(sym){return (sym||'__OV__').toUpperCase();}
+function ctxFor(sym){return sym==='__OV__'?'ov':'stk';}
+function defaultSeg(sym){return sym==='__OV__'?DEFAULT_SEG.ov:DEFAULT_SEG.stk;}
+function cleanRoute(r){
+ const sym=normSym(r&&r.sym);
+ if(sym==='__OV__'){const seg=(r&&r.seg)||DEFAULT_SEG.ov; return {sym:'__OV__', seg:VALID_SEG.ov.indexOf(seg)>=0?seg:DEFAULT_SEG.ov};}
+ if(!findStock(sym))return{sym:'__OV__',seg:DEFAULT_SEG.ov};
+ const seg=(r&&r.seg)||DEFAULT_SEG.stk;
+ return {sym, seg:VALID_SEG.stk.indexOf(seg)>=0?seg:DEFAULT_SEG.stk};
+}
+const VALID_F=['held','exited','all'], VALID_S=['value','day','fibmom','sym','unreal','realized','numTrades'];
+function encodeRoute(sym,seg){
+ sym=normSym(sym);seg=seg||defaultSeg(sym);
+ const base=sym==='__OV__'?'#/portfolio/'+encodeURIComponent(seg):'#/stock/'+encodeURIComponent(sym)+'/'+encodeURIComponent(seg);
+ // append filter/search/sort suffix when non-default so the URL is shareable AND back/forward restores them
+ const qs=[
+   q?'q='+encodeURIComponent(q):'',
+   (filter&&filter!=='held')?'f='+encodeURIComponent(filter):'',
+   (sortKey&&sortKey!=='value')?'s='+encodeURIComponent(sortKey):'',
+ ].filter(Boolean).join('&');
+ return qs?base+'?'+qs:base;
+}
+function parseRoute(){
+ const raw=(window.location.hash||'').replace(/^#\/?/,'');
+ if(!raw)return null;
+ const qi=raw.indexOf('?');
+ const path=qi>=0?raw.slice(0,qi):raw;
+ const qs=qi>=0?raw.slice(qi+1):'';
+ // URL is source of truth for filter state — reset to defaults, then override from query
+ let next={q:'',filter:'held',sortKey:'value'};
+ if(qs){qs.split('&').forEach(kv=>{const eq=kv.indexOf('=');const k=eq>=0?kv.slice(0,eq):kv;
+   let v=eq>=0?kv.slice(eq+1):'';try{v=decodeURIComponent(v);}catch(e){}
+   if(k==='q')next.q=(v||'').toLowerCase().trim();
+   else if(k==='f'&&VALID_F.indexOf(v)>=0)next.filter=v;
+   else if(k==='s'&&VALID_S.indexOf(v)>=0)next.sortKey=v;
+ });}
+ q=next.q; filter=next.filter; sortKey=next.sortKey;
+ syncListUI();
+ const parts=path.split('/').filter(Boolean).map(p=>{try{return decodeURIComponent(p)}catch(e){return p}});
+ const head=(parts[0]||'').toLowerCase();
+ if(head==='portfolio'||head==='overview'||head==='ov')return cleanRoute({sym:'__OV__',seg:parts[1]});
+ if(head==='stock'&&parts[1])return cleanRoute({sym:parts[1],seg:parts[2]});
+ if(parts[0]&&findStock(parts[0]))return cleanRoute({sym:parts[0],seg:parts[1]}); // legacy short hash, e.g. #NVDA/fib
+ return null;
+}
+function activeSeg(){
+ const b=document.querySelector('#right .seg-rail button.on');
+ return b&&b.dataset?b.dataset.seg:defaultSeg(sel);
+}
+function rememberSeg(ctx,seg){try{localStorage.setItem('ptrak.seg.'+ctx,seg);}catch(e){}}
+function lastSeg(ctx){try{return localStorage.getItem('ptrak.seg.'+ctx)||DEFAULT_SEG[ctx];}catch(e){return DEFAULT_SEG[ctx];}}
+function writeRoute(sym,seg,replace){
+ const r=cleanRoute({sym,seg}),url=encodeRoute(r.sym,r.seg);
+ if(window.location.hash===url)return;
+ const liveY=window.scrollY||window.pageYOffset||0;
+ const _l=document.getElementById('list');
+ const liveListY=_l?_l.scrollTop:0;
+ if(!routeApplying){   // skip during back/forward replay — the live scroll is mid-restore and would clobber the saved offset
+   // snapshot OUTGOING view's scroll into the current entry so a future back/forward can restore it
+   try{const cur=history.state||{};
+     history.replaceState(Object.assign({},cur,{scrollY:liveY,listScrollY:liveListY}),'',window.location.hash);
+   }catch(e){}
+ }
+ // for replaceState (tab/filter): preserve live scroll (in-place); for pushState (new entry): start at 0
+ try{history[replace?'replaceState':'pushState']({ptrak:r,scrollY:replace?liveY:0,listScrollY:replace?liveListY:0},'',url);}
+ catch(e){window.location.hash=url;}
+}
+function recentStocks(){
+ try{const a=JSON.parse(localStorage.getItem('ptrak.recent.v1'));if(Array.isArray(a))return a.filter(x=>findStock(x));}
+ catch(e){}
+ return [];
+}
+function rememberStock(sym){
+ if(sym==='__OV__'||!findStock(sym))return;
+ const a=[sym].concat(recentStocks().filter(x=>x!==sym)).slice(0,8);
+ try{localStorage.setItem('ptrak.recent.v1',JSON.stringify(a));}catch(e){}
+}
+function _updateDocTitleAndSR(sym,seg){
+ const _stk=sym!=='__OV__'?findStock(sym):null;
+ const _name=sym==='__OV__'?'组合总览':sym+(_stk&&_stk.name?(' · '+_stk.name):'');
+ const _label=segLabel(seg,ctxFor(sym));
+ try{document.title=_name+' · '+_label+' · ptrak';}catch(e){}
+ try{const _sr=document.getElementById('srlive');if(_sr)_sr.textContent='已切换到 '+_name+' · '+_label;}catch(e){}
+}
+function activateSeg(seg,opts){
+ const r=document.getElementById('right');if(!r)return null;
+ let b=r.querySelector('.seg-rail [data-seg="'+seg+'"]')||r.querySelector('.seg-rail button');
+ if(!b)return null;
+ const chosen=b.dataset.seg;
+ r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+ r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==chosen;});
+ if(!routeApplying)rememberSeg(sel==='__OV__'?'ov':'stk',chosen);   // don't overwrite user's last-chosen tab during back/forward replay
+ updateCtx();
+ if(!routeApplying)_updateDocTitleAndSR(sel,chosen);   // tab click should refresh window/tab title + SR-announce — applyRoute already covers route-driven changes
+ if(!routeApplying){try{_tmLog({type:'tab',sym:sel,seg:chosen});}catch(e){}}
+ if(!(opts&&opts.push===false)&&!routeApplying)writeRoute(sel,chosen,true);   // tab clicks are view-state, not pages: replaceState so back walks stock-to-stock
+ return chosen;
+}
+function applyRoute(route,opts){
+ const r=cleanRoute(route||{sym:'__OV__'});
+ routeApplying=true;
+ sel=r.sym;
+ renderList();
+ activateSeg(r.seg,{push:false});
+ routeApplying=false;
+ rememberStock(sel);
+ if(opts&&opts.replace)writeRoute(sel,activeSeg(),true);
+ _updateDocTitleAndSR(r.sym,r.seg);   // route change: update browser-history title + SR announcement (shared helper, also used by activateSeg)
+ // local telemetry: nav event (opt-in via window.ptrak_telemetry_on())
+ try{_tmLog({type:'nav', sym:r.sym, seg:r.seg, src: opts&&opts.fromHistory?'back':((opts&&opts.src)||'click')});}catch(e){}
+ // focus the active row when applyRoute came from a keyboard nav / back-forward — so Tab order doesn't reset to body
+ try{if(opts&&opts.fromHistory){const _t=document.querySelector('.row[data-s="'+(r.sym==='__OV__'?'__OV__':r.sym.replace(/"/g,'\\"'))+'"]');if(_t&&document.activeElement!==_t&&document.body.contains(document.activeElement)&&!_t.contains(document.activeElement))_t.focus({preventScroll:true});}}catch(e){}
+ if(opts&&opts.scroll)window.scrollTo({top:0,behavior:opts.smooth===false?'auto':'smooth'});
+}
+function navTo(sym,seg,opts){
+ const r=cleanRoute({sym,seg:seg||defaultSeg(normSym(sym))});
+ writeRoute(r.sym,r.seg,opts&&opts.replace);
+ applyRoute(r,{scroll:!(opts&&opts.scroll===false),smooth:!(opts&&opts.smooth===false),src:opts&&opts.src});
+}
+function stockGo(sym,seg,opts){navTo(sym,seg||DEFAULT_SEG.stk,Object.assign({scroll:true},opts||{}));}
+function ovGo(seg,opts){navTo('__OV__',seg||lastSeg('ov')||DEFAULT_SEG.ov,Object.assign({scroll:true},opts||{}));}
+function goBack(){   // browser-back if we have a real history entry; fall back to overview on cold deep-link
+ if(history.state&&history.state.ptrak&&history.state.ptrak.sym!=='__OV__')history.back();
+ else if(sel!=='__OV__')ovGo();
+}
+function adjacentStock(dir){
+ const a=filtered().filter(x=>x.sym!=='__OV__');
+ if(!a.length)return;
+ let i=a.findIndex(x=>x.sym===sel);
+ if(i<0)i=dir>0?-1:0;
+ const n=a[(i+dir+a.length)%a.length];
+ if(n)stockGo(n.sym,sel==='__OV__'?DEFAULT_SEG.stk:activeSeg(),{replace:true,scroll:false,src:'sib'});   // sibling-paging: don't pollute history or scroll-snap
+}
+function viewBarOverview(){
+ const rec=recentStocks().slice(0,5);
+ // chips from overview = jumping IN to a stock — pushState (new history entry) is correct
+ const chips=rec.map(sym=>`<button class="microbtn recent-chip" onclick="stockGo('${sym}')" aria-label="查看 ${sym}">${sym}</button>`).join('');
+ return `<div class="viewbar"><div class="trail"><span class="here">组合总览</span></div>${chips?`<div class="view-actions"><span class="note">最近查看</span>${chips}</div>`:''}</div>`;
+}
+function viewBarStock(s){
+ const rec=recentStocks().filter(x=>x!==s.sym).slice(0,4);
+ // chips from a stock view = sibling jumps; use {replace:true} so back still goes to overview, not through chip history
+ const chips=rec.map(sym=>`<button class="microbtn recent-chip" onclick="stockGo('${sym}',null,{replace:true,scroll:false})" aria-label="跳转到 ${sym}">${sym}</button>`).join('');
+ return `<div class="viewbar"><div class="trail"><button class="microbtn primary" onclick="goBack()" aria-label="返回组合总览">← 组合总览</button><span aria-hidden="true">/</span><span class="here">${s.sym}</span><span class="note">${s.name||''}</span></div><div class="view-actions"><button class="microbtn" onclick="adjacentStock(-1)" aria-label="上一只持仓">上一只</button><button class="microbtn" onclick="adjacentStock(1)" aria-label="下一只持仓">下一只</button></div>${chips?`<div class="view-actions" style="flex-basis:100%"><span class="note">最近</span>${chips}</div>`:''}</div>`;
+}
 function filtered(){
  let a=stocks.filter(s=>filter==='all'||(filter==='held'?s.held:!s.held));
  if(q)a=a.filter(s=>s.sym.toLowerCase().includes(q)||(s.name||'').toLowerCase().includes(q));
  const k=sortKey, fm=s=>(s.fib&&s.fib.now)?s.fib.now.mom:-999;
- a.sort((x,y)=> k==='sym'? x.sym.localeCompare(y.sym) : (k==='fibmom'? fm(y)-fm(x) : (y[k]||0)-(x[k]||0)));
+ const dy=s=>(s.dayChangePct==null?-999:s.dayChangePct);   // unranked stocks fall to bottom for "today's mover" view
+ a.sort((x,y)=> k==='sym'? x.sym.localeCompare(y.sym) : (k==='fibmom'? fm(y)-fm(x) : (k==='day'? dy(y)-dy(x) : (y[k]||0)-(x[k]||0))));
  return a;
 }
-function renderList(){
+function renderHoldingsList(){   // left-list-only rebuild — used by search/sort/filter so the right panel keeps its SVG/tooltip state
  const a=filtered();
+ const listEl=document.getElementById('list');
+ const _ls=listEl?listEl.scrollTop:0;
  const ov=`<div class="row ovrow ${sel==='__OV__'?'sel':''}" data-s="__OV__" tabindex="0" role="button">
    <div><div class="sym">组合总览</div><div class="meta">净值 & 收益率 vs 指数</div></div>
    <div class="pnl ${cls(S.curReturn)}">${pct(S.curReturn)}<div class="meta">区间收益</div></div></div>`;
- document.getElementById('list').innerHTML=ov+(a.map(s=>{
+ listEl.innerHTML=ov+(a.map(s=>{
   const main=s.held?s.unreal:s.realized, lbl=s.held?'未实现':'已实现';
-  const fn=s.fib&&s.fib.now, dot=fn?`<span style="color:${FIBCOL[fn.state]}">●</span> `:'';
-  const zap=fn&&fn.res?`<span title="${fn.res==='bull'?'多头共振':'空头共振'}" style="color:${fn.res==='bull'?'#4FB286':'#E5707A'}">⚡</span>`:'';
-  const momtxt=fn?` · 动能<span style="color:${momColor(fn.mom)}">${fn.mom>0?'+':''}${fn.mom}</span>`:'';
-  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}" tabindex="0" role="button">
+  const fn=s.fib&&s.fib.now, dot=fn?`<span role="img" aria-label="${FIBLBL[fn.state]||'趋势状态'}" title="${FIBLBL[fn.state]||'趋势状态'}" style="color:var(--mut)">●</span> `:'';
+  const zap=fn&&fn.res?`<span role="img" aria-label="${fn.res==='bull'?'多头共振':'空头共振'}" title="${fn.res==='bull'?'多头共振':'空头共振'}" style="color:var(--mut)">⚡</span>`:'';
+  const momtxt=fn?` · 动能<span style="color:var(--txt)">${fn.mom>0?'+':''}${fn.mom}</span>`:'';
+  // surface today's % move on held names so the trader's morning question ('who moved overnight?') is answerable without sorting
+  const showDay=(sortKey==='day'||s.held)&&s.dayChangePct!=null;
+  const daytxt=showDay?` · 今日<span class="${cls(s.dayChangePct)}" style="font-weight:600">${s.dayChangePct>0?'+':''}${s.dayChangePct.toFixed(2)}%</span>`:'';
+  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}" tabindex="0" role="button" aria-current="${sel===s.sym?'page':'false'}">
     <div><div class="sym">${dot}${s.sym} ${zap}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
-    <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}</div></div>
+    <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}${daytxt}</div></div>
     <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||`<div class="note" style="padding:16px">没有匹配「${q}」的标的 · 试试清空搜索，或切到上方 持有 / 已清仓 / 全部</div>`);
- document.querySelectorAll('.row').forEach(r=>{r.onclick=()=>{sel=r.dataset.s;renderList();renderDetail();};r.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();r.click();}};});
+ document.querySelectorAll('.row').forEach(r=>{r.onclick=()=>{const sym=r.dataset.s;if(sym===sel)return;if(sym==='__OV__')ovGo();else stockGo(sym);};r.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();r.click();}};});
+ listEl.scrollTop=_ls;
+ if(sel!=='__OV__'&&!window.__ptrakRestoringScroll){const sr=listEl.querySelector('.row[data-s="'+sel+'"]');if(sr&&sr.scrollIntoView)sr.scrollIntoView({block:'nearest'});}
+}
+function renderList(){   // full re-render (left list + right detail) — used only by applyRoute / sel changes
+ renderHoldingsList();
  renderDetail();
 }
 /* ===== interactive charts: registry + one delegated crosshair controller ===== */
@@ -1830,6 +2666,34 @@ function svgLines(ser,defs,opts){
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
  return `<svg id="${cid}" class="xh" role="img" aria-label="数据图表 · 关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
+function qStateColor(s){return {trend:'#4FB286',overheat:'#E8B339',ema8:'#4FB286',ema21:'#B89030',below21:'#E5707A',mixed:'#888D96'}[s]||'#888D96';}
+function qStateLabel(s){return {trend:'多头',overheat:'过热',ema8:'EMA8',ema21:'EMA21',below21:'破21',mixed:'转换'}[s]||s;}
+function qqqStrategyChart(q){
+ const ser=(q&&q.series)||[];if(!ser.length)return'<div class="note">QQQ 数据不足，无法绘图。</div>';
+ const W=900,H=390,mL=62,mR=82,mT=16,mB=46,stripH=12,stripY=H-mB+24;
+ const xmin=+new Date(ser[0].date),xmax=+new Date(ser[ser.length-1].date);
+ let vals=[];ser.forEach(p=>['close','ema8','ema21','ema34','ema55'].forEach(k=>{if(p[k]!=null)vals.push(p[k]);}));
+ Object.values(q.zones||{}).forEach(z=>(z||[]).forEach(v=>{if(v!=null)vals.push(v);}));
+ let ymin=Math.min(...vals),ymax=Math.max(...vals);const pad=(ymax-ymin)*0.08||1;ymin-=pad;ymax+=pad;
+ const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
+ const yc=v=>mT+(1-(v-ymin)/((ymax-ymin)||1))*(H-mT-mB-stripH);
+ let el='';
+ const zone=(z,c,l)=>{if(!z||z.length<2)return;const y1=yc(Math.max(z[0],z[1])),y2=yc(Math.min(z[0],z[1]));el+=`<rect x="${mL}" y="${y1}" width="${W-mL-mR}" height="${Math.max(1,y2-y1)}" fill="${c}" fill-opacity="0.08"/><text x="${W-mR+4}" y="${(y1+y2)/2+4}" fill="${c}" font-size="10">${l}</text>`;};
+ zone((q.zones||{}).ema8Buyback,'#4FB286','EMA8');zone((q.zones||{}).ema21Options,'#E8B339','EMA21');zone((q.zones||{}).ema34Defense,'#E5707A','EMA34');
+ for(let i=0;i<=4;i++){const v=ymin+(ymax-ymin)*i/4,y=yc(v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1A1C21"/><text x="${mL-8}" y="${y+4}" fill="#6B7079" font-size="11" text-anchor="end">$${v.toFixed(0)}</text>`;}
+ for(let i=0;i<=5;i++){const idx=Math.round((ser.length-1)*i/5),p=ser[idx],x=xs(p.date),dt=new Date(p.date);el+=`<text x="${x}" y="${stripY+stripH+12}" fill="#6B7079" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}
+ const line=(key,col,w,dash,op=1)=>{const pts=ser.filter(p=>p[key]!=null).map(p=>`${xs(p.date).toFixed(1)},${yc(p[key]).toFixed(1)}`).join(' ');el+=`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="${w}" stroke-opacity="${op}" ${dash?'stroke-dasharray="5 3"':''}/>`;};
+ line('close','#D9DCE1',2.35);line('ema8','#E8B339',2.05);line('ema21','#AEB4BE',1.95);line('ema34','#888D96',1.15,1,.52);line('ema55','#4B4F58',1.05,1,.44);
+ for(let i=1;i<ser.length;i++){const x0=xs(ser[i-1].date),x1=xs(ser[i].date);el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${qStateColor(ser[i].state)}" fill-opacity="0.86"/>`;}
+ const last=ser[ser.length-1],lx=xs(last.date);
+ el+=`<circle cx="${lx}" cy="${yc(last.close)}" r="4.2" fill="#D9DCE1" stroke="#0B0C0E" stroke-width="1"/>`;
+ [['QQQ',last.close,'#D9DCE1',-12],['EMA8',last.ema8,'#E8B339',4],['EMA21',last.ema21,'#AEB4BE',16]].forEach(a=>{if(a[1]!=null)el+=`<text x="${Math.min(W-mR+4,lx+8)}" y="${yc(a[1])+a[3]}" fill="${a[2]}" font-size="11" font-weight="700">${a[0]}</text>`;});
+ el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="#6B7079" font-size="10" text-anchor="end">状态</text>`;
+ const cid='c'+(++CHARTID);
+ CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),rows:ser.map(p=>{const dt=new Date(p.date);return '<b>'+(dt.getMonth()+1)+'/'+dt.getDate()+'</b><br><span class="xr"><i style="background:#B6BAC1"></i>QQQ '+fmt(p.close)+'</span><span class="xr"><i style="background:#E8B339"></i>EMA8 '+fmt(p.ema8)+'</span><span class="xr"><i style="background:#5F6168"></i>EMA21 '+fmt(p.ema21)+'</span><span class="xr"><i style="background:'+qStateColor(p.state)+'"></i>'+qStateLabel(p.state)+'</span>';})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
+ return `<svg id="${cid}" class="xh" role="img" aria-label="QQQ EMA strategy chart" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+}
 function nwChart(ser){
  const W=900,H=330,mL=64,mR=22,mT=16,mB=40,stripH=11,stripY=H-mB+22;
  const xmin=+new Date(ser[0].date),xmax=+new Date(ser[ser.length-1].date);
@@ -1869,7 +2733,7 @@ function structureCard(){
  // Card 1: asset-class structure (always-on floor)
  const acRows=X.byAssetClass.map(b=>{const w=Math.min(b.weightPct,100);
    return `<div class="frow acrow"><span class="fsym">${b.bucket}</span>
-     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'#888D96':'#E8B339'}"></div></div>
+     <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'var(--faint)':'var(--mut)'}"></div></div>
      <span class="acpct">${b.weightPct.toFixed(1)}%</span>
      <span class="note acval">${fmt(b.value)}</span></div>`;}).join('');
  const card1=`<div class="card"><div class="dh"><span class="t">资产类别结构</span><span class="nm">个股 vs 宽基ETF vs 主题ETF vs 杠杆 vs 商品 vs 现金 · 零额外数据，总是可得</span></div>${acRows}</div>`;
@@ -1893,7 +2757,7 @@ function structureCard(){
    if(c.effNRisk!=null)badges.push(['主题 HHI（风险）',c.hhiRisk.toFixed(2)],['主题有效持仓数（风险）','≈ '+c.effNRisk.toFixed(1)]);
    badges.push(['名义 → 主题有效',`${c.nominalN} 只 → ≈ ${c.effNWeight!=null?c.effNWeight.toFixed(0):'—'}`]);}
  const p=X.provenance||{};
- const howto=`<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>逐只看权重，会把同一驱动的多只标的读成多笔独立小仓；本页做的是<b>你自己不会做的汇总</b>——把同一因子的标的合成<b>一个敞口</b>，同屏看它占多少<b>资金</b>、又占多少<b>风险</b>（Thaler p.1582：逐项割裂 vs 联合判断）。机制：<b>窄框架</b> · <b>相关性忽视</b>（N 只不同代码 ≠ N 笔独立押注）· <b>朴素 1/N 分散</b>与<b>分散幻觉</b>（有效持仓数 ≪ 名义只数）。<br>风险贡献为<b>窗口内已实现风险</b>的描述性分解（小样本、非预测），仅含股票，<b>低估</b>杠杆(TQQQ)与期权真实敞口${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}。主题标签来源：Yahoo 行业 / 人工标注 / 资产类别${p.asOf&&p.asOf!=='—'?` · 缓存于 ${p.asOf}`:''} · ${p.unclassified||0} 项未分类。结构是“你的钱与波动落在哪里”的描述，<b>不评判任何标的高估/低估</b>（Thaler p.1588）。<b>非投资建议。</b></div>`;
+ const howto=`<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>逐只看权重，会把同一驱动的多只标的读成多笔独立小仓；本页做的是<b>你自己不会做的汇总</b>——把同一因子的标的合成<b>一个敞口</b>，同屏看它占多少<b>资金</b>、又占多少<b>风险</b>（Thaler p.1582：逐项割裂 vs 联合判断）。机制：<b>窄框架</b> · <b>相关性忽视</b>（N 只不同代码 ≠ N 笔独立押注）· <b>朴素 1/N 分散</b>与<b>分散幻觉</b>（有效持仓数 ≪ 名义只数）。<br>风险贡献为<b>窗口内已实现风险</b>的描述性分解（小样本、非预测），仅含股票，<b>低估</b>杠杆(TQQQ)与期权真实敞口${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}。主题标签来源：Yahoo 行业 / 人工标注 / 资产类别${p.asOf&&p.asOf!=='—'?` · 缓存于 ${p.asOf}`:''} · ${p.unclassified||0} 项未分类。结构是“你的钱与波动落在哪里”的描述，<b>不评判任何标的高估/低估</b>（Thaler p.1588）。<b>非投资建议。</b></div>`;
  const card3=`<div class="card"><div class="dh"><span class="t">集中度 · 有效持仓数</span><span class="nm">名义持仓 ≠ 独立押注：主题层 HHI 与有效 N（1/HHI）</span></div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>${howto}</div>`;
  return card1+card2+card3;
@@ -1908,7 +2772,7 @@ function contributionCard(){
  const showShare=Math.abs(totUn)>maxAbs;   // only show % when the net dominates the largest single name (else share is sign-mixed nonsense)
  const rows=ranked.slice(0,10).map(x=>{const hw=Math.min(Math.abs(x.unreal)/maxAbs,1)*50,left=x.unreal>=0?50:50-hw,c=x.unreal>0?'#4FB286':(x.unreal<0?'#E5707A':'var(--mut)');
    const share=showShare?`<span class="fst" style="color:${c}">${(x.unreal/totUn*100).toFixed(0)}%</span>`:'<span class="fst"></span>';
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})"><span class="fsym">${x.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${hw}%;background:${c}"></div></div><span class="fval" style="color:${c}">${fmt(x.unreal)}</span>${share}</div>`;}).join('');
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')"><span class="fsym">${x.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${hw}%;background:${c}"></div></div><span class="fval" style="color:${c}">${fmt(x.unreal)}</span>${share}</div>`;}).join('');
  const shareNote=showShare?'右列=占组合未实现盈亏净额的比例。':'各仓盈亏方向不一、净额较小，占比无意义，故只看绝对金额（条形）。';
  return `<div class="card"><div class="dh"><span class="t">盈亏贡献 · 谁在拉高 / 拉低</span><span class="nm">按未实现盈亏绝对额排序（点击看个股）</span></div>
    <div class="legend"><span><i style="background:#4FB286"></i>拉高</span><span><i style="background:#E5707A"></i>拉低</span><span class="note">条形=相对最大贡献的金额</span></div>
@@ -1940,7 +2804,7 @@ function scorecardCard(){
    if(d){const g=d.drift,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
      driftCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
    const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">${attn}</span>`:'<span class="note">—</span>';
-   const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
      <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
      <td>${fmt(x.value)} <span class="note">${w.toFixed(1)}%</span></td>
      <td class="${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</td>
@@ -1952,7 +2816,7 @@ function scorecardCard(){
  });
  data.sort((a,b)=>b.attn-a.attn||b.w-a.w);
  return `<div class="card"><div class="dh"><span class="t">决策一览</span><span class="nm">每只持仓的 技术 · 风险 · 行为 · 再平衡偏离 同屏，联合评估而非逐项割裂（点击看个股）</span></div>
-   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th title="EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头 / 负=空头">动能</th><th title="0–100 强弱摆动，>70 偏超买、<30 偏超卖">RSI</th><th title="最近一次金叉(看多) / 死叉(看空)及日期">最近信号</th><th title="组合总波动按各持仓边际贡献拆开，合计100%，不等于资金权重">风险贡献</th><th title="该标的风险占比减资金占比，正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th class="l">行为标记</th><th title="按你在再平衡计划里设定的区间，当前权重偏离目标多少">偏离目标</th><th title="四类红色信号的计数，是默认排序键，不是评分也不是买卖建议">关注度</th></tr></thead>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th>${gl('mom','动能')}</th><th>${gl('rsi','RSI')}</th><th>${gl('cross','最近信号')}</th><th>${gl('rc','风险贡献')}</th><th title="该标的风险占比减资金占比，正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th class="l">行为标记</th><th title="按你在再平衡计划里设定的区间，当前权重偏离目标多少">偏离目标</th><th>${gl('attn','关注度')}</th></tr></thead>
    <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
    <details class="note" style="margin-top:8px;line-height:1.6"><summary style="cursor:pointer">怎么读 · 口径说明</summary><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></details></div>`;
 }
@@ -1986,10 +2850,39 @@ function optionsExposureCard(){
    <div class="dh"><span class="t">期权敞口（隐藏杠杆）</span><span class="chip" style="color:#E8B339;border-color:#E8B33966">留意</span></div>
    <div class="hero-fig" style="margin:6px 0 2px">期权总市值（毛额/GROSS） ${fmt(A.optMarkGross)} <span style="font-size:13px;color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
    <div class="note" style="margin-bottom:8px">净市价仅 <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> —— 这是<b>盈亏口径</b>，不是你的敞口（小净值会掩盖大总额，Thaler p.1582）。</div>
+   ${(A.optionSpreads&&A.optionSpreads.length)?`<div class="note" style="margin-bottom:8px">其中可配对的垂直价差，理论盈亏被<b>价差宽度</b>封顶（合计约 ${fmt(A.optionSpreads.reduce((s,x)=>s+(x.widthValue||0),0))}，远小于上面的毛额）——这部分是<b>定义化风险</b>，详见下方 <b>Spread Risk Ledger</b>；未配对的单腿真实杠杆才是毛额低估的来源。</div>`:''}
    ${legsHtml}${tbl}
-   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。四条期权腿均在<b>保证金(Margin)账户</b>。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。${(()=>{const a=[...new Set(A.optLegs.map(l=>l.type||'—'))];return A.optLegs.length+' 条期权腿，'+(a.length===1?'均在 <b>'+a[0]+'</b> 账户':'分布于 <b>'+a.join(' / ')+'</b> 账户');})()}。<b>非投资建议。</b></div>
    <div class="note" style="margin-top:6px;opacity:.65">Thaler 2016 · p.1582 / p.1589 / p.1594</div>
  </div>`;}
+function optionsSpreadLedgerCard(){
+ const A=DATA.account;if(!A||!A.optLegs||!A.optLegs.length)return'';
+ const spreads=A.optionSpreads||[];
+ const warnN=spreads.reduce((n,s)=>n+((s.warnings&&s.warnings.length)?1:0),0);
+ if(!spreads.length)return `<div class="card"><div class="dh"><span class="t">全账户 Spread Risk Ledger</span><span class="nm">自动配对垂直价差失败时，先按单腿管理风险</span></div>
+   <div class="note">当前有 ${A.optLegs.length} 条期权腿，但没有自动识别出同标的 / 同到期 / 同 CALL-PUT 类型的一多一空垂直价差。请按单腿查看 liquidity、assignment、margin 与最大风险；不要把未配对 short option 当作 defined-risk spread。<b>非投资建议。</b></div></div>`;
+ const rows=spreads.map(s=>{const er=s.expectedRange||[null,null],bad=s.warnings&&s.warnings.length;
+   const warn=bad?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">核对</span> ${s.warnings.join('；')}`:`<span class="chip" style="color:#4FB286;border-color:#4FB28666">范围内</span> 仍需实盘 bid/ask/Greeks`;
+   return `<tr><td class="l">${s.underlying}<br><span class="note">${s.kind}</span></td><td>${s.expiry}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${s.right}</td><td>${fmt(s.widthValue)}</td><td class="${cls(s.netMark)}">${fmt(s.netMark)}</td><td>${fmt(er[0])} - ${fmt(er[1])}</td><td class="l">${warn}</td></tr>`;}).join('');
+ return `<div class="card" style="${warnN?'border-left:3px solid #E5707A':'border-left:3px solid #4FB286'}">
+   <div class="dh"><span class="t">全账户 Spread Risk Ledger</span><span class="nm">所有账户期权先组合配对，再看单腿</span>${warnN?`<span class="chip" style="color:#E5707A;border-color:#E5707A66">${warnN} 个需核对</span>`:''}</div>
+   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>宽度</th><th>当前净Mark</th><th>理论范围</th><th class="l">风险提示</th></tr></thead><tbody>${rows}</tbody></table></div>
+   <div class="note" style="margin-top:10px;line-height:1.6">这是从券商持仓名、数量、方向保守识别出的垂直价差。它只能检查<b>当前市价是否落在理论区间</b>，不能替代 entry debit/credit、Delta/Gamma、实时盘口和流动性。老师视角：先确定结构是不是 defined risk，再决定能不能移动止盈、平仓、滚仓或拆腿。<b>非投资建议。</b></div>
+  </div>`;}
+function diagnosticsCard(){
+ const mode=S.priceMode==='mark-to-market'?'Yahoo mark-to-market':'Fidelity snapshot';
+ const refreshed=S.refreshedPriceCount!=null?`${S.refreshedPriceCount}/${S.numHeld} held prices refreshed`:'—';
+ return `<div class="card"><details><summary>数据新鲜度 / 口径诊断</summary>
+   <div class="badges" style="margin-top:10px">
+    <div class="badge"><div class="l">生成时间</div><div class="v" style="font-size:13px">${S.generatedAt||'—'}</div></div>
+    <div class="badge"><div class="l">价格口径</div><div class="v" style="font-size:13px">${mode}</div></div>
+    <div class="badge"><div class="l">价格 as of</div><div class="v">${S.priceAsOf||S.dateRange[1]}</div></div>
+    <div class="badge"><div class="l">刷新覆盖</div><div class="v" style="font-size:13px">${refreshed}</div></div>
+    <div class="badge"><div class="l">数据窗口</div><div class="v" style="font-size:13px">${D0} → ${D1}</div></div>
+   </div>
+   <div class="note" style="margin-top:8px;line-height:1.6">普通 <b>sync</b> 会要求市值/未实现与 Fidelity CSV 完全一致；每日 <b>mark-to-market</b> 则用最新 Yahoo 股票价重估持仓，现金和期权仍保留 Fidelity 快照。若自动刷新失败，先看 <code>output/price_refresh.log</code> 与 <code>output/price_refresh_log.json</code>。<b>非投资建议。</b></div>
+  </details></div>`;
+}
 function bridgeCard(){
  const B=DATA.bridge;if(!B||B.terminal==null)return'';
  const g=S.behaviorGap;
@@ -2003,14 +2896,14 @@ function bridgeCard(){
  const legsHtml=B.legs.map(leg).join('')+`<div class="frow" style="border-top:1px solid #1A1C21;margin-top:4px;padding-top:6px"><span class="fsym"><b>合计盈亏</b></span><div class="fbar"></div><span class="fval ${cls(B.totalPL)}"><b>${fmt(B.totalPL)}</b></span></div>`;
  const badges=[['当前市值',fmt(B.terminal)],['持仓成本',fmt(B.heldCost)],
    ['合计盈亏（美元）',`<span class="${cls(B.totalPL)}">${fmt(B.totalPL)}</span>`],
-   ['你的钱实际回报 MWR',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`]];
+   ['你的钱实际回报 '+gl('MWR','MWR'),S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`]];
  let lv,head,detail;
  if(g==null){lv=['#888D96','提示'];head='资金加权收益暂不可用';detail='IRR 在该现金流形态下无定义（现金流未变号或未收敛），故显示破折号。';}
  else if(g>0){lv=['#E8B339','留意'];head='你的钱表现弱于策略本身 · 典型行为缺口';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）落后于策略本身（时间加权 ${pct(S.curReturn)}）。机制上倾向在走平或下跌前加仓——这正是经典的“行为缺口”：追近期强势（过度外推）或下跌后犹豫（近视损失厌恶）。`;}
  else if(g<0){lv=['#4FB286','良好'];head='你的钱表现优于策略本身';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）跑赢了策略本身（时间加权 ${pct(S.curReturn)}）。机制上你净在上涨前加仓，本窗口择时较好——但单一窗口是小样本，可能含运气成分，别据此过度自信。`;}
  else {lv=['#888D96','提示'];head='加仓节奏基本中性';detail='本窗口入金时点对结果影响不大。';}
  const tip='💡 TWR 评判你的选股 / 策略本身，MWR + 本金桥评判你的钱实际经历，指数对比看相对大盘——三者回答的是不同问题。';
- const link=`<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;rebal&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">看到不喜欢的缺口？趁冷静先去“再平衡计划”给自己预设一条规则。</span>`;
+ const link=`<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="ovGo('rebal')">看到不喜欢的缺口？趁冷静先去“再平衡计划”给自己预设一条规则。</span>`;
  const gapCard=`<div class="card" style="border-left:3px solid ${lv[0]}">
    <div class="dh"><span class="t">${head}</span><span class="chip" style="color:${lv[0]};border-color:${lv[0]}66">${lv[1]}</span></div>
    <div class="note" style="color:var(--txt);line-height:1.6;margin-top:4px">${detail}</div>
@@ -2027,20 +2920,150 @@ function bridgeCard(){
 function insightBanner(){
  let dismissed=false;try{dismissed=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}
  const guide=dismissed?`<span class="ib-lk" role="button" tabindex="0" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
- const A=DATA.account,X=DATA.alloc,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
+ const A=DATA.account,X=DATA.alloc,Q=DATA.qqqTqqq,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
  const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" onclick="ovGo('${seg}')">${t} →</span>`;
  const l1=`你的股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${ppf(pr-nq)}`:''}）`;
  const l2=lt?`最大风险 → <b>${lt.theme}</b> 占 ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?`、${lt.riskPct.toFixed(0)}% 风险`:''}（${lt.n} 只，${(X.conc&&X.conc.effNRisk!=null)?`实际≈ ${X.conc.effNRisk.toFixed(0)} 笔独立押注`:'高度相关'}）`:'';
  const tr=(DATA.risk&&DATA.risk.contrib&&DATA.risk.contrib[0])?DATA.risk.contrib[0].sym:null;
  const l3=(A&&A.optMarkGross)?`隐藏杠杆 → 期权毛敞口 ≈ <b>${fmt(A.optMarkGross)}</b>（约权益 ${A.optPctEquity}%，毛额·市价口径，净≈${fmt(A.optMarkNet)}，非 Delta/名义），未计入上方市值`:'';
  const l4=(gap!=null)?`择时 → 本期${gap<0?'<b class="pos">略帮了忙 ✓</b>':(gap>0?'<b class="neg">略拖了后腿</b>':'基本中性')}（你的钱 ${pct(S.mwrPeriod)} ${gap<0?'≥':(gap>0?'<':'≈')} 策略 ${pct(pr)}）`:'';
+ const nq8=Q&&Q.available&&(Q.nextTriggers||[]).find(x=>x.name==='EMA8 拿回');
+ const nq21=Q&&Q.available&&(Q.nextTriggers||[]).find(x=>x.name==='EMA21 期权');
+ const qTrail=Q&&Q.available&&Q.trailing;
+ const qBrief=Q&&Q.available?`QQQ 天气 → <b>${Q.state.label}</b>，老师动作 <b style="color:${Q.state.tone==='neg'?'var(--red)':(Q.state.tone==='pos'?'var(--green)':'var(--mut)')}">${(Q.decisionPanel&&Q.decisionPanel.headline)||Q.state.action}</b>；下个触发：EMA8 ${nq8?fmt(nq8.level)+' ('+(nq8.distancePct>=0?'+':'')+nq8.distancePct+'%)':'—'} / EMA21 ${nq21?fmt(nq21.level)+' ('+(nq21.distancePct>=0?'+':'')+nq21.distancePct+'%)':'—'}；QQQ 3ATR 防守 ${qTrail?fmt(qTrail.qqqTrail3Atr):'—'}`:'';
  return `<div class="card ib"><div class="dh"><span class="t">今日要点</span><span class="nm">一眼看懂：赚了多少 · 最大风险 · 隐藏杠杆 · 择时（点链接看详情）</span>${guide}</div>
    <div class="ib-row">${l1} ${lk('nw','净值')}${lk('cmp','指数对比')}</div>
+   ${qBrief?`<div class="ib-row">${qBrief} ${lk('qt','老师策略台')}</div>`:''}
    ${l2?`<div class="ib-row">${l2} ${lk('struct','结构')}</div>`:''}
    ${l3?`<div class="ib-row">${l3} ${lk('nw','期权敞口')}</div>`:''}
    ${l4?`<div class="ib-row">${l4} ${lk('beh','行为决策')}</div>`:''}
    <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${tr?`最该看一眼 <b>${tr}</b>（最大风险贡献）　`:''}${lk('score','按红旗数排序')}${lk('rebal','看再平衡动作清单')}</div>
    <div class="note" style="margin-top:4px">所有指标为技术 / 描述性参考，<b>非投资建议</b>。</div></div>`;
+}
+function qqqTqqqTab(){
+ const q=DATA.qqqTqqq;
+ if(!q||!q.available)return `<div class="card"><div class="dh"><span class="t">QQQ/TQQQ 决策台</span></div><div class="note">${q&&q.reason?q.reason:'QQQ/TQQQ 数据不足。'} 技术参考，非投资建议。</div></div>`;
+ const L=q.latest,st=q.state,tc=st.tone==='pos'?'#4FB286':(st.tone==='neg'?'#E5707A':'#E8B339');
+ const dist=(d)=>d&&d.atr!=null?`${d.dollar>=0?'+':''}${d.dollar.toFixed(2)} (${d.pct>=0?'+':''}${d.pct.toFixed(2)}%, ${d.atr>=0?'+':''}${d.atr.toFixed(2)} ATR)`:'—';
+ const sourceNote=(q.source&&q.source.qqq==='OHLC')?'ATR14 使用 Yahoo OHLC 高低点。':'ATR14 当前用收盘价近似，适合看节奏，不适合精确风控。';
+ const badges=[
+  ['状态',`<span class="chip" style="color:${tc};border-color:${tc}66">${st.label}</span>`],
+  ['QQQ 收盘',fmt(L.qqq)],
+  ['TQQQ 收盘',fmt(L.tqqq)],
+  ['EMA8',fmt(L.ema8)],
+  ['EMA21',fmt(L.ema21)],
+  ['距 EMA8',dist(L.distEma8)],
+  ['距 EMA21',dist(L.distEma21)],
+  [gl('atr','ATR14'),fmt(L.atr14)],
+  ['QQQ 5日',`<span class="${cls(L.qqqRet5)}">${pct(L.qqqRet5)}</span>`],
+  ['TQQQ 5日',`<span class="${cls(L.tqqqRet5)}">${pct(L.tqqqRet5)}</span>`],
+  ['EMA21 5日斜率',`<span class="${cls(L.ema21Slope5)}">${pct(L.ema21Slope5)}</span>`],
+ [gl('rsi','RSI14'),`${L.rsi14}`],
+ ];
+ const dp=q.decisionPanel||{},trail=q.trailing||{};
+ const nextRows=(q.nextTriggers||[]).map(n=>`<tr><td class="l">${n.name}</td><td>${fmt(n.level)}</td><td>${n.distancePct>=0?'+':''}${n.distancePct}%</td><td class="l">${n.action}</td></tr>`).join('');
+ const checks=(q.teacherChecks||[]).map(x=>`<div class="badge"><div class="l">${x.label}</div><div class="v" style="font-size:13px;line-height:1.45;color:${x.ok?'#4FB286':'#E8B339'}">${x.value}</div></div>`).join('');
+ const decisionBrief=`<div class="card" style="border-left:3px solid ${tc}">
+   <div class="dh"><span class="t">老师 Decision Brief</span><span class="nm">天气 → 仓位 → 工具 → 风控，一屏给结论</span></div>
+   <div class="badges">
+    <div class="badge"><div class="l">现在</div><div class="v" style="font-size:15px;line-height:1.45;color:${tc}">${dp.headline||st.label}</div></div>
+    <div class="badge"><div class="l">允许动作</div><div class="v" style="font-size:13px;line-height:1.45">${dp.doNow||st.action}</div></div>
+    <div class="badge"><div class="l">不要做</div><div class="v" style="font-size:13px;line-height:1.45;color:#E8B339">${dp.avoid||'先等更清晰触发，不把单一信号当确定性。'}</div></div>
+    <div class="badge"><div class="l">CCS 身份</div><div class="v" style="font-size:13px;line-height:1.45">${dp.ccsRole||'必须先判断是 hedge 还是方向性做空。'}</div></div>
+   </div>
+   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">下一触发</th><th>关键价</th><th>距现价</th><th class="l">老师动作</th></tr></thead><tbody>${nextRows}</tbody></table></div>
+   <div class="note" style="margin-top:10px"><b>移动止盈：</b>${dp.movingStop||'先定义防守线。'} QQQ 20日高点 ${fmt(trail.qqqHigh20)}，3xATR 参考 ${fmt(trail.qqqTrail3Atr)}（距现价 ${trail.qqqTrailGapPct==null?'—':trail.qqqTrailGapPct+'%'}）；TQQQ 20日高点 ${fmt(trail.tqqqHigh20)}，8%/12% trailing 参考 ${fmt(trail.tqqqTrail8Pct)} / ${fmt(trail.tqqqTrail12Pct)}。<b>技术参考，非投资建议。</b></div>
+   <div class="badges" style="margin-top:12px">${checks}</div>
+  </div>`;
+ const z=q.zones||{},zr=[
+  ['EMA8 拿回区',z.ema8Buyback,'浅回踩：偏 QQQ/TQQQ 小仓拿回'],
+  ['EMA21 期权区',z.ema21Options,'深回踩：趋势未坏才评估 call debit spread'],
+  ['EMA34 防线',z.ema34Defense,'跌到这里不再当普通浅回调'],
+  ['EMA55 regime',z.ema55Regime,'重新判断市场状态'],
+ ].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]?fmt(r[1][0])+' - '+fmt(r[1][1]):'—'}</td><td class="l">${r[2]}</td></tr>`).join('');
+ const rr=(q.rules||[]).map(r=>`<tr style="${r.active?'background:rgba(232,179,57,.08)':''}"><td class="l">${r.active?'<span class="chip" style="color:#E8B339;border-color:#E8B33966">现在</span> ':''}${r.title}</td><td class="l">${r.trigger}</td><td class="l">${r.decision}</td></tr>`).join('');
+ const h=Object.values(q.holdings||{}).map(x=>`<tr><td class="l">${x.sym}</td><td>${x.held?fmtN(x.shares,0):'—'}</td><td>${x.held?fmt(x.avg):'—'}</td><td>${x.held?fmt(x.value):'—'}</td><td class="${cls(x.gain)}">${x.held?fmt(x.gain)+' / '+pct(x.gainPct):'—'}</td></tr>`).join('');
+ const c=q.tqqqCcs;
+ const A=DATA.account;
+ const optExposure=A?`<div class="card"><div class="dh"><span class="t">期权 / 杠杆风险抬头看</span><span class="nm">QQQ 决策前先看账户刹车距离</span></div>
+   <div class="badges">
+    <div class="badge"><div class="l">期权毛市值</div><div class="v">${fmt(A.optMarkGross)}</div></div>
+    <div class="badge"><div class="l">约占股票权益</div><div class="v">${A.optPctEquity==null?'—':A.optPctEquity+'%'}</div></div>
+    <div class="badge"><div class="l">期权净市值</div><div class="v ${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</div></div>
+    <div class="badge"><div class="l">Margin debit</div><div class="v" style="font-size:13px;color:#E8B339">CSV 不提供</div></div>
+   </div>
+   <div class="note">老师视角：看 QQQ/TQQQ 前先确认账户不会被 short option、保证金或流动性拖住。这里是 mark-to-market，不是 Delta/Gamma/名义本金；真实杠杆可能更大。<b>非投资建议。</b></div></div>`:'';
+ const qh=(q.holdings&&q.holdings.QQQ)||{},th=(q.holdings&&q.holdings.TQQQ)||{};
+ const knownCash=A?(A.cashTotal||0):0, pending=A?(A.pending||0):0;
+ const constraintCard=`<div class="card"><div class="dh"><span class="t">Ownership / Cash Constraint Check</span><span class="nm">老师两句话：call 卖方死于没正股，put 卖方死于没现金</span></div>
+   <div class="badges">
+    <div class="badge"><div class="l">Covered call</div><div class="v" style="font-size:13px;line-height:1.45;color:${(qh.shares||0)>=100?'#4FB286':'#E8B339'}">${(qh.shares||0)>=100?'QQQ 满 100 股可覆盖':'QQQ 仅 '+fmtN(qh.shares||0,3)+' 股，不是 covered call'}</div></div>
+    <div class="badge"><div class="l">CSP cash</div><div class="v" style="font-size:13px;line-height:1.45;color:#E8B339">已知现金 ${fmt(knownCash)}；pending ${fmt(pending)} 先不当可用现金</div></div>
+    <div class="badge"><div class="l">Defined-risk spread</div><div class="v" style="font-size:13px;line-height:1.45">优先窄宽度；每组最大亏损必须先写入计划</div></div>
+    <div class="badge"><div class="l">Long hedge base</div><div class="v" style="font-size:13px;line-height:1.45">QQQ ${fmt(qh.value||0)} / TQQQ ${fmt(th.value||0)}</div></div>
+   </div>
+   <div class="note">这张卡不判断买卖，只防止结构误用：没有 100 股就不是 covered call；现金不足就不是 CSP；${gl('ccs','CCS')} 即使 ${gl('defrisk','defined risk')}，也不能大到压过核心多头和移动止盈能力。<b>非投资建议。</b></div></div>`;
+ const tp=q.tqqqOptions||{};
+ const statusChip=s=>{const c=s==='BLOCK'?'#E5707A':(s==='ALLOW'?'#4FB286':'#E8B339');return `<span class="chip" style="color:${c};border-color:${c}66">${s||'WATCH'}</span>`;};
+ const optLegRows=[...(tp.currentTqqqLegs||[]),...(tp.currentQqqLegs||[])].map(l=>`<tr><td class="l">${l.underlying||'—'}</td><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name||l.sym}</td><td>${fmtN(l.qty,0)}</td><td class="${cls(l.mark)}">${fmt(l.mark)}</td></tr>`).join('');
+ const optHistRows=(tp.recentTqqqOrders||[]).concat(tp.recentQqqOrders||[]).map(o=>`<tr><td class="l">${o.underlying}</td><td class="l">${o.sym}</td><td>${o.lastDate||'—'}</td><td>${o.trades}</td><td>${fmtN(o.netQty,3)}</td><td class="${cls(o.netCash)}">${fmt(o.netCash)}</td></tr>`).join('');
+ const structRows=(tp.structures||[]).map(x=>`<tr><td class="l">${x.name}<br><span class="note">${x.role}</span></td><td>${statusChip(x.status)}</td><td class="l">${x.rule}</td><td class="l">${x.risk}</td></tr>`).join('');
+ const tqqqOptionControl=`<div class="card" style="border-left:3px solid #7F8794">
+   <div class="dh"><span class="t">TQQQ 期权控制台</span><span class="nm">把 TQQQ 股票、QQQ 期权、TQQQ 期权分开，避免误判</span></div>
+   <div class="note" style="margin-bottom:9px"><b>当前核对：</b>${tp.status||'—'} 已知现金 ${fmt(tp.cashKnown||0)}；TQQQ covered-call 可覆盖组数 ${tp.coveredContracts||0}；TQQQ CSP 可覆盖组数 ${tp.cashSecuredPutContracts||0}。<b>非投资建议。</b></div>
+   <div class="scroll"><table><thead><tr><th class="l">TQQQ 结构</th><th>状态</th><th class="l">触发 / 纪律</th><th class="l">风险口径</th></tr></thead><tbody>${structRows}</tbody></table></div>
+   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">标的</th><th class="l">方向</th><th class="l">当前 QQQ/TQQQ 期权腿</th><th>数量</th><th>Mark</th></tr></thead><tbody>${optLegRows||'<tr><td class="l" colspan="5">当前持仓快照没有 QQQ/TQQQ 期权腿。</td></tr>'}</tbody></table></div>
+   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">标的</th><th class="l">合约</th><th>最近日期</th><th>成交数</th><th>净张数</th><th>净现金流</th></tr></thead><tbody>${optHistRows||'<tr><td class="l" colspan="6">本窗口没有 QQQ/TQQQ 期权成交。</td></tr>'}</tbody></table></div>
+   <div class="note" style="margin-top:10px">解读：TQQQ 股票买入不会自动变成 TQQQ 期权风险；当前 open 的 QQQ 708/711 是 QQQ call debit spread，和未来可能设计的 TQQQ CCS / debit spread 分开管理。任何 TQQQ 期权都先写 max loss、DTE、delta/credit、止盈和失效线。</div>
+  </div>`;
+ const ccs=c?`<div class="card"><div class="dh"><span class="t">TQQQ 上方 CCS 对冲区</span><span class="nm">定义风险 · 小仓 · 给多头仓位加短线刹车</span></div>
+   <div class="note" style="margin-bottom:8px"><b>身份检查：</b>${dp.ccsRole||'先判断是否有多头仓可 hedge。'} 没有多头仓时，它不是 hedge，是偏空 short-premium。</div>
+   <div class="scroll"><table><thead><tr><th class="l">项目</th><th>当前量化</th><th class="l">执行含义</th></tr></thead><tbody>
+   <tr><td class="l">TQQQ spot</td><td>${fmt(c.spot)}</td><td class="l">执行标的，不用它判断趋势</td></tr>
+   <tr><td class="l">Short call 参考</td><td>${fmt(c.shortRange[0])} - ${fmt(c.shortRange[1])}</td><td class="l">当前价上方 3%-6%，或实盘用 0.15-0.25 delta</td></tr>
+   <tr><td class="l">Long call 风险封顶</td><td>${fmt(c.longRange[0])} - ${fmt(c.longRange[1])}</td><td class="l">宽度 ${c.width}，DTE ${c.dte}</td></tr>
+   <tr><td class="l">QQQ 等效涨幅</td><td>约 +${c.qqqApproxPct[0].toFixed(1)}% - +${c.qqqApproxPct[1].toFixed(1)}%</td><td class="l">TQQQ 3x 的粗略换算，路径会影响结果</td></tr>
+   <tr><td class="l">91/92 参照</td><td>91C ${c.example9122.shortPct>=0?'+':''}${c.example9122.shortPct}% / 92C ${c.example9122.longPct>=0?'+':''}${c.example9122.longPct}%</td><td class="l">对应 QQQ 约 ${c.example9122.qqqApproxPct>=0?'+':''}${c.example9122.qqqApproxPct}% 的短线空间</td></tr>
+   </tbody></table></div>
+   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">1美元宽示例</th><th>Max profit/组</th><th>Max loss/组</th><th>Breakeven</th></tr></thead><tbody>${(c.example9122.creditScenarios||[]).map(s=>`<tr><td class="l">credit ${fmt(s.credit)}</td><td class="pos">${fmt(s.maxProfit)}</td><td class="neg">${fmt(s.maxLoss)}</td><td>${fmt(s.breakeven)}</td></tr>`).join('')}</tbody></table></div>
+   <div class="note" style="margin-top:10px">退出纪律：赚到 credit 的 50%-70% 可收；亏损到 credit 的 1.5-2 倍或 QQQ 强势突破前高时不要硬扛。这里不读期权链，delta 需实盘确认。<b>非投资建议。</b></div></div>`:'';
+ const spreadCard=(q.optionSpreads||[]).length?`<div class="card"><div class="dh"><span class="t">Spread Risk Ledger</span><span class="nm">先看组合结构，再看单腿</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>宽度</th><th>当前净Mark</th><th>理论范围</th><th class="l">风险提示</th></tr></thead><tbody>${q.optionSpreads.map(s=>`<tr><td class="l">${s.underlying} ${s.kind}</td><td>${s.expiry}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${s.right}</td><td>${fmt(s.widthValue)}</td><td>${fmt(s.netMark)}</td><td>${fmt(s.expectedRange[0])} - ${fmt(s.expectedRange[1])}</td><td class="l">${(s.warnings&&s.warnings.length)?'<span class="chip" style="color:#E5707A;border-color:#E5707A66">核对</span> '+s.warnings.join('；'):'<span class="chip" style="color:#4FB286;border-color:#4FB28666">范围内</span> 仍需实盘 bid/ask/Greeks'}</td></tr>`).join('')}</tbody></table></div>
+   <div class="note" style="margin-top:10px">这里根据券商持仓名和数量保守识别垂直价差；entry debit/credit 不在持仓 CSV 中，真实最大盈亏仍需结合成交记录和实时盘口。若 short leg 已接近 0.01/0.02 且 long leg 很便宜，才考虑老师的“买回 short、留 long 彩票”拆腿。<b>非投资建议。</b></div></div>`:'';
+ const legs=(q.optionLegs||[]).length?`<div class="card"><div class="dh"><span class="t">当前 QQQ/TQQQ 期权腿</span><span class="nm">券商快照市价，不是 Delta/名义敞口</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th>数量</th><th>Mark</th><th class="l">账户</th></tr></thead><tbody>${q.optionLegs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name||l.sym}</td><td>${fmtN(l.qty,0)}</td><td>${fmt(l.mark)}</td><td class="l">${l.type||l.acct||'—'}</td></tr>`).join('')}</tbody></table></div></div>`:'';
+ const playbook=`<div class="card"><div class="dh"><span class="t">老师策略蒸馏</span><span class="nm">天气 · 执行 · 刹车 · 生存</span></div>
+   <div class="badges">
+    <div class="badge"><div class="l">QQQ = 天气图</div><div class="v" style="font-size:13px;line-height:1.5">只用 QQQ 日线 EMA/ATR 判断 regime，不用 TQQQ 噪音决定世界观。</div></div>
+    <div class="badge"><div class="l">TQQQ = 战术仓</div><div class="v" style="font-size:13px;line-height:1.5">只在 EMA8/EMA21 健康回踩时放大，强趋势高位不追。</div></div>
+    <div class="badge"><div class="l">CCS = 小刹车</div><div class="v" style="font-size:13px;line-height:1.5">过热时小仓定义风险，机械常态化卖会拖累白天鹅。</div></div>
+    <div class="badge"><div class="l">移动止盈 = 生存</div><div class="v" style="font-size:13px;line-height:1.5">过热分批止盈，runner 用 trailing stop，不把利润全还回去。</div></div>
+   </div>
+   <div class="note" style="margin-top:10px">回测发现：强趋势里核心 QQQ 暴露最关键；更接近老师的版本是 90% QQQ core + TQQQ 回踩战术 + 过热卖一半留 runner；CCS 只在明确过热/停顿时小仓做。<b>非投资建议。</b></div></div>`;
+ return `<div class="card" style="border-left:3px solid ${tc}">
+   <div class="dh"><span class="t">QQQ/TQQQ 决策台</span><span class="nm">QQQ 判天气 · TQQQ/期权做执行 · as of ${q.asOf}</span></div>
+   <div class="hero-fig" style="color:${tc};margin:8px 0 3px">${st.action}</div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
+   <div class="note">${sourceNote} 数据窗口跟随本次 CSV / Yahoo cache。<b>技术参考，非投资建议。</b></div>
+ </div>
+ ${decisionBrief}
+ ${optExposure}
+ ${constraintCard}
+ ${tqqqOptionControl}
+ ${playbook}
+ <div class="card"><div class="dh"><span class="t">QQQ 日线天气图</span><span class="nm">EMA8/21/34/55 + ATR 作战区</span></div>
+   <div class="legend"><span><i style="background:#B6BAC1"></i>QQQ</span><span><i style="background:#E8B339"></i>EMA8</span><span><i style="background:#5F6168"></i>EMA21</span><span><i style="background:#888D96"></i>EMA34</span><span><i style="background:#4B4F58"></i>EMA55</span></div>
+   ${qqqStrategyChart(q)}
+ </div>
+ <div class="card"><div class="dh"><span class="t">执行地图</span><span class="nm">高位不追 · 回踩分批 · 趋势坏先防守</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">触发状态</th><th class="l">量化条件</th><th class="l">动作</th></tr></thead><tbody>${rr}</tbody></table></div><div class="note" style="margin-top:8px">这是你预先写好的机械执行清单（${gl('ema','EMA')} / ${gl('atr','ATR')} 触发），不是预测——按既定规则执行、减少临场情绪。<b>非投资建议。</b></div></div>
+ <div class="card"><div class="dh"><span class="t">QQQ 作战区间</span><span class="nm">用 ATR 把 EMA8 / EMA21 变成价格带</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">区间</th><th>价格带</th><th class="l">含义</th></tr></thead><tbody>${zr}</tbody></table></div><div class="note" style="margin-top:8px">用 ${gl('atr','ATR')} 把均线变成价格带，仅供对照节奏的技术参考。<b>非投资建议。</b></div></div>
+ ${ccs}
+ <div class="card"><div class="dh"><span class="t">当前 QQQ/TQQQ 仓位</span><span class="nm">券商持仓快照</span></div>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>股数</th><th>均价</th><th>市值</th><th>未实现</th></tr></thead><tbody>${h}</tbody></table></div></div>
+ ${spreadCard}
+ ${legs}`;
 }
 function renderOverview(){
  CHARTREG={};
@@ -2061,16 +3084,19 @@ function renderOverview(){
  ];
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=onboardStrip()+insightBanner();
  right.innerHTML=`
- <div class="seg-rail"><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
+ ${viewBarOverview()}
+ <div class="seg-rail"><span class="seg-grp">决策</span><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><span class="seg-grp">风险</span><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><span class="seg-grp">表现</span><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><span class="seg-grp">记录</span><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div>
  <div class="seg" data-seg="score">`+scorecardCard()+`</div>
- <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+`
+ <div class="seg" data-seg="qt" hidden>`+qqqTqqqTab()+`</div>
+ <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+optionsSpreadLedgerCard()+diagnosticsCard()+`
  <div class="card">
    <div class="dh"><span class="t">组合总览</span><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部“全账户”卡片）</span></div>
    <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
  </div>
  <div class="card"><div class="cap" style="margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
    <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#E8B339">琥珀=强(>15)</span> / <span style="color:#9A8A4A">浅琥珀=中性</span> / <span style="color:#6B7079">灰=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
-   ${nwChart(ser)}</div>${bridgeCard()}
+   ${nwChart(ser)}
+   <div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这条是<b>持仓总市值（$，含入金）</b>——净值上升可能来自<b>入金而非盈利</b>。要看真金白银的回报，去“指数对比”的 ${gl('TWR','TWR')} 与本卡下方“真金白银桥”的 ${gl('MWR','MWR')}。底部色带 = 组合加权动能，仅供对照择时节奏。<b>非投资建议。</b></div></div>${bridgeCard()}
  </div>
  <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
  <div class="seg" data-seg="cmp" hidden>
@@ -2086,12 +3112,12 @@ function renderOverview(){
  <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
  <div class="seg" data-seg="journal" hidden>`+journalCard()+`</div>
  <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
- segWire();wireRebal();wireJournalTab();restoreSeg('ov');bindCharts();updateCtx();
+ segWire();wireRebal();wireJournalTab();bindCharts();updateCtx();renderOptSec();   // restoreSeg removed — URL is now source of truth; applyRoute already activated the right seg
 }
 function resonanceCard(){
- const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
- const bear=stocks.filter(x=>x.held&&x.fib&&x.fib.now.res==='bear');
- const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
+ const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
+ const bear=stocks.filter(x=>x.held&&x.fib&&x.fib.now&&x.fib.now.res==='bear');
+ const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
  return `<div class="card"><div class="dh"><span class="t">今日多指标共振</span><span class="nm">趋势排列 + 3日内金/死叉 + RSI 未极端 → 高确信度</span></div>
    <div style="margin-top:10px"><div class="l" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px;font-weight:600">多头共振 · ${bull.length}</div>
    <div style="display:flex;gap:8px;flex-wrap:wrap">${bull.map(x=>chip(x,'#4FB286')).join('')||'<span class="note">无</span>'}</div></div>
@@ -2103,7 +3129,7 @@ function fibRanking(){
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
  if(!held.length)return'';
  const rows=held.map(x=>{const m=x.fib.now.mom,c=momColor(m),w=Math.abs(m)/100*50,left=m>=0?50:50-w;
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
      <span class="fsym"><span style="color:${FIBCOL[x.fib.now.state]}">●</span> ${x.sym}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${m>0?'+':''}${m}</span>
@@ -2164,14 +3190,14 @@ function positionSignalsCard(){
    const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
    const res=n.res==='bull'?'<span class="pos">多</span>':(n.res==='bear'?'<span class="neg">空</span>':'—');
    const rc=n.rsi>70?'neg':(n.rsi<30?'pos':'');
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${x.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
      <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
      <td>${w.toFixed(1)}%</td><td style="color:${FIBCOL[n.state]}">${n.label}</td>
      <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
      <td class="${rc}">${n.rsi}</td><td>${sigTxt}</td><td>${res}</td>
      <td class="l">${postureOf(n)}</td></tr>`;}).join('');
  return `<div class="card"><div class="dh"><span class="t">持仓信号一览</span><span class="nm">按权重排序 · 趋势 / 动能 / RSI / 最近金死叉 / 共振（点击看个股）</span></div>
-   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>权重</th><th>状态</th><th>动能</th><th>RSI</th><th>最近信号</th><th>共振</th><th class="l">技术姿态</th></tr></thead>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>权重</th><th>状态</th><th>${gl('mom','动能')}</th><th>${gl('rsi','RSI')}</th><th>${gl('cross','最近信号')}</th><th>${gl('res','共振')}</th><th class="l">技术姿态</th></tr></thead>
    <tbody>${rows}</tbody></table></div>
    <div class="note" style="margin-top:8px">“技术姿态”只是均线/动能/RSI 的客观描述，<b>非投资建议</b>；金叉/死叉为 EMA5×13 快线交叉。</div></div>`;
 }
@@ -2182,7 +3208,7 @@ function behaviorCard(){
    const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip">${e}</span>`).join('')}</div>`:'';
    return `<div class="card" style="border-left:3px solid ${c[0]}">
      <div class="dh"><span class="t">${f.title}</span><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
-     <div class="flag-head" style="color:${c[0]};margin:3px 0 6px">${f.headline}</div>
+     <div class="flag-head" style="margin:3px 0 6px">${f.headline}</div>
      <div class="note" style="color:var(--txt);line-height:1.55">${f.detail}</div>${ex}
      <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
      <div class="note" style="margin-top:6px;opacity:.65">${f.ref}</div></div>`;}).join('');
@@ -2201,7 +3227,7 @@ function riskCard(){
   ['收益/波动比',`${R.retVolRatio.toFixed(2)} <span class="note">(rf=0)</span>`],
  ];
  const rows=(R.contrib||[]).map(c=>{const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${c.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${c.sym}')">
      <td class="l">${c.sym}</td><td>${c.weightPct.toFixed(1)}%</td><td>${c.riskPct.toFixed(1)}%</td>
      <td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td>
      <td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}pp</td></tr>`;}).join('');
@@ -2215,11 +3241,12 @@ function riskCard(){
    <div class="note" style="margin-top:6px">最大回撤 <span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
  <div class="card"><div style="font-weight:650;margin-bottom:4px">21 日滚动年化波动率</div>
    <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span></div>
-   ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339',label:'我的波动'},{key:'spvol',color:'#888D96',dash:1,label:'S&P波动'}],{fmt:v=>v.toFixed(0)+'%'})}</div>
+   ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339',label:'我的波动'},{key:'spvol',color:'#888D96',dash:1,label:'S&P波动'}],{fmt:v=>v.toFixed(0)+'%'})}
+   <div class="note" style="margin-top:6px"><b>怎么读：</b>波动率衡量“颠簸幅度”，<b>不是盈亏</b>——线在 S&P 之上 = 近期比大盘更颠簸，未必是亏损。21 日滚动、窗口内小样本，<b>描述性、非预测</b>。</div></div>
  <div class="card"><div class="dh"><span class="t">风险贡献分解</span><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该标的风险占比减资金占比；正(红)=波动放大器、负(绿)=分散器">风险−资金</th></tr></thead>
    <tbody>${rows}</tbody></table></div>${exNote}
-   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
+   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。${DATA.account?` <span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
 }
 /* ===== Rebalancing Planner (Thaler commitment device) ===== */
 let rebalDraft=null;
@@ -2245,7 +3272,7 @@ function rebalTargets(rule,uni,volMap){const ws=uni.u.map(x=>x.w),N=ws.length;
   return{t:raw.map(r=>r/sm*100),note:'目标 ∝ 1/波动率：高波动标的权重更低，使各仓位风险贡献趋于均衡',disabled:false};}
  const c=capTargets(ws,rule.cap);return{t:c.t,note:c.fallback?('上限 '+rule.cap+'% 对 '+N+' 只标的不可行，已退回等权'):null,disabled:false};}
 function rebalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">诚实说明与边界（点击展开）</summary>
- <div class="note" style="margin-top:8px;line-height:1.65">本计划只是把权重拉回<b>你自己设定的区间</b>的描述性算术，仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆${DATA.account?`，<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="var b=document.querySelector('.seg-rail [data-seg=&quot;nw&quot;]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'})">→ 去“净值 · 全账户”看期权敞口</span>`:''}）。它<b>忽略</b>税费、洗售(wash-sale)、成本批次(lot)选择与交易/佣金/点差成本——交易成本若不实测，就是“万能借口”(Thaler)。反波动率目标基于“风险”页同一份<b>小样本、描述性（非预测）</b>协方差。股数四舍五入到整股。规则只存在<b>本浏览器本设备</b>，不跨设备。本计划<b>不声称提高收益</b>，只把权重拉回你选的区间。<b>非投资建议。</b></div></details></div>`;}
+ <div class="note" style="margin-top:8px;line-height:1.65">本计划只是把权重拉回<b>你自己设定的区间</b>的描述性算术，仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆${DATA.account?`，<span style="cursor:pointer;color:#E8B339;text-decoration:underline" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}）。它<b>忽略</b>税费、洗售(wash-sale)、成本批次(lot)选择与交易/佣金/点差成本——交易成本若不实测，就是“万能借口”(Thaler)。反波动率目标基于“风险”页同一份<b>小样本、描述性（非预测）</b>协方差。股数四舍五入到整股。规则只存在<b>本浏览器本设备</b>，不跨设备、不上传。本计划<b>不声称提高收益</b>，只把权重拉回你选的区间。<b>非投资建议。</b></div></details></div>`;}
 function rebalancePlanner(){
  if(rebalDraft===null)rebalDraft=rebalLoad();
  const rule=rebalDraft,uni=rebalUniverse(),volMap=rebalVolMap();
@@ -2286,11 +3313,11 @@ function rebalOutput(rule,uni,volMap){
  const badges=[['最大持仓',`${top.sym} ${top.w.toFixed(0)}% → ${topT.toFixed(0)}%`],['前五合计',`${top5n.toFixed(0)}% → ${top5t.toFixed(0)}%`],
    ['HHI 集中度',`${hhi(wn).toFixed(2)} → ${hhi(tn).toFixed(2)}`],['越界标的',`${out.length} / ${rows.length}`],['双向成交额',`≈ ${fmt(sells+buys)}`]];
  const bars=rows.map(r=>{const c=r.inB?'#888D96':'#E8B339',wd=Math.min(Math.abs(r.drift),20)/20*50,left=r.drift>=0?50:50-wd;
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${r.sym}')">
      <span class="fsym">${r.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</span><span class="fst">${r.inB?'区间内':(r.drift>0?'超配':'低配')}</span></div>`;}).join('');
  const arows=out.map(r=>{const sh=r.sh==null?'<span class="note">缺价</span>':((r.d$<0?'−':'+')+Math.abs(r.sh)+'股'),edge=rule.glide==='center'?'目标':(r.drift>0?'上沿':'下沿');
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="sel='${r.sym}';renderList();window.scrollTo({top:0,behavior:'smooth'})">
+   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${r.sym}')">
      <td class="l">${r.sym}</td><td>${r.w.toFixed(1)}%</td><td>${r.lo.toFixed(0)}–${(r.t+band).toFixed(0)}%</td>
      <td style="color:${r.inB?'#888D96':'#E8B339'}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</td>
      <td class="l">${sh} <span class="note">(${fmt(Math.abs(r.d$))})</span> 拉回${edge}</td></tr>`;}).join('');
@@ -2299,7 +3326,8 @@ function rebalOutput(rule,uni,volMap){
    <div class="note" style="margin-top:8px">卖出释放 ${fmt(sells)} · 买入部署 ${fmt(buys)} · 净${net>=0?'需追加':'释放'} ${fmt(Math.abs(net))}（股数已取整，带内标的不动）。</div></div>`:'';
  return banner+`<div class="card"><div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>`
    +`<div class="card"><div style="font-weight:650;margin-bottom:4px">权重偏离目标（pp）· 颜色 = 方向</div>
-      <div class="legend"><span><i style="background:#E8B339"></i>越界·需操作</span><span><i style="background:#888D96"></i>区间内·无需操作</span><span class="note">方向（超配/低配）见每行标签</span></div>${bars}</div>`+actionTable;
+      <div class="legend"><span><i style="background:#E8B339"></i>越界·需操作</span><span><i style="background:#888D96"></i>区间内·无需操作</span><span class="note">方向（超配/低配）见每行标签</span></div>${bars}
+      <div class="note" style="margin-top:8px"><b>怎么读：</b><b>pp</b>=百分点（当前权重 − 你设定的目标）；<b>区间内(灰)</b>=在你冷静时定的带宽内，什么都不做才是纪律；<b>越界(琥珀)</b>=你预设的规则触发了；动作列“拉回上沿 / 下沿 / 目标”对应你选的回归方式。仅描述把权重拉回你所选区间的算术，<b>非投资建议。</b></div></div>`+actionTable;
 }
 function wireRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(!seg)return;
  seg.querySelectorAll('[data-reb]').forEach(b=>b.onclick=()=>{if(b.disabled)return;const k=b.dataset.reb,v=b.dataset.v;if(k==='pol')rebalDraft.policy=v;if(k==='glide')rebalDraft.glide=v;rerenderRebal();});
@@ -2310,6 +3338,7 @@ function wireRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');
 function rerenderRebal(){const seg=document.querySelector('.seg[data-seg="rebal"]');if(seg){seg.innerHTML=rebalancePlanner();wireRebal();}}
 /* ===== Trade Journal + Investor-Maturity layer (per-position, localStorage) ===== */
 let journalState=null, journalDraft=null;
+const journalDrafts={};   // per-symbol draft cache: navigating between stocks preserves in-progress edits
 const J_DESTRUCT=['FOMO追高','报复','无聊'], J_CONSTRUCT=['冷静','坚定','纪律'];
 const jToday=()=>new Date().toISOString().slice(0,10);
 const jesc=s=>(s||'').replace(/</g,'&lt;');
@@ -2356,7 +3385,7 @@ function killerStatCard(){
  const grp=tag=>held.filter(x=>J[x.sym]&&J[x.sym].adherence===tag);
  const inn=grp('在计划内'), out=grp('计划外'), base=meanBy(held,x=>x.unrealPct);
  if(!inn.length&&!out.length)return `<div class="card"><div class="dh"><span class="t">计划遵守 → 结果</span><span class="nm">在计划内 vs 计划外的平均结果</span></div><div class="note">给持仓标上「在计划内 / 计划外」后，这里会对比两组的平均结果。</div></div>`;
- const bar=(label,g)=>{const m=meanBy(g,x=>x.unrealPct),small=g.length<3;const c=small?'#888D96':(m>=base?'#4FB286':'#E5707A');
+ const bar=(label,g)=>{const m=meanBy(g,x=>x.unrealPct),small=g.length<3;const c=small?'#888D96':(m>=0?'#4FB286':'#E5707A');   // bar color = P&L sign (green=+/red=−); distance-to-baseline carried by bar offset/width, not fill
    const wd=m==null?0:Math.min(Math.abs(m-base),30)/30*50,left=(m!=null&&m>=base)?50:50-wd;
    return `<div class="frow"><span class="fsym" style="width:auto;min-width:96px">${label}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
@@ -2364,7 +3393,7 @@ function killerStatCard(){
      <span class="fst">n=${g.length}${small?' 样本不足':''}</span></div>`;};
  return `<div class="card"><div class="dh"><span class="t">计划遵守 → 结果</span><span class="nm">${gl('killer','在计划内 vs 计划外')}的平均未实现%（基线=全部持仓均值 ${base==null?'—':(base>=0?'+':'')+base.toFixed(1)+'%'}）</span></div>
    ${bar('在计划内',inn)}${bar('计划外',out)}
-   <div class="note" style="margin-top:8px">这是你自己过去交易的记录，不是买卖建议；任一组 n&lt;3 仅描述、不下结论。</div></div>`;
+   <div class="note" style="margin-top:8px">颜色仅表示盈亏方向（绿＝正、红＝负），长度表示与基线的差距。这是你自己过去交易的记录，不是买卖建议；任一组 n&lt;3 仅描述、不下结论。</div></div>`;
 }
 function emotionOutcomeCard(){
  const J=journalLoad().entries, held=stocks.filter(x=>x.held);
@@ -2389,21 +3418,32 @@ function weeklyReview(){
  const wk=isoWeek(new Date()), r=reviewGet(wk)||{}, mv=S.marketValue, topH=stocks.filter(x=>x.held).sort((a,b)=>b.value-a.value)[0];
  const heldN=stocks.filter(x=>x.held).length, cov=stocks.filter(x=>x.held&&journalEntry(x.sym)).length;
  const facts=[['本周市值',fmt(mv)],['区间收益',pct(S.curReturn)],['超额 vs 标普',S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)],
-   ['最大回撤',DATA.risk?(DATA.risk.maxDrawdown.toFixed(1)+'%'):'—'],['行为缺口',S.behaviorGap==null?'—':(S.behaviorGap>0?'+':'')+S.behaviorGap.toFixed(2)+'pp'],
+   ['最大回撤',DATA.risk?(DATA.risk.maxDrawdown.toFixed(1)+'%'):'—'],['行为缺口',S.behaviorGap==null?'—':((S.behaviorGap>0?'+':'')+S.behaviorGap.toFixed(2)+'pp '+(S.behaviorGap>0?'(择时拖累)':(S.behaviorGap<0?'(择时帮忙)':'(中性)')))],
    ['最大持仓',topH?topH.sym+' '+(topH.value/mv*100).toFixed(0)+'%':'—'],['本周日志覆盖',cov+'/'+heldN]];
  const ta=(id,lbl,v)=>`<div style="margin:8px 0 2px;font-size:12px;color:var(--mut)">${lbl}</div><textarea id="${id}" rows="2" aria-label="${lbl}" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical">${jesc(v)}</textarea>`;
- const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">本周复盘 · 保存于 ${r.savedOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">本周尚未复盘</span>`;
+ const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">本周复盘 · 保存于 ${r.savedOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">本周尚未复盘</span>`;
  return `<div class="card"><div class="dh"><span class="t">每周复盘 · ${wk}</span><span class="nm">把复盘做成每周默认动作</span> ${stamp}</div>
    <div class="badges">${facts.map(f=>`<div class="badge"><div class="l">${f[0]}</div><div class="v">${f[1]}</div></div>`).join('')}</div>
    <div class="note" style="margin:6px 0">事实由面板自动带入——你无法事后改写，只能据此反思。</div>
    ${ta('rvBest','本周最好的决策',r.best)}${ta('rvWorst','本周最差的决策',r.worst)}${ta('rvLesson','学到了什么',r.lesson)}${ta('rvDo','下周要做',r.doNext)}${ta('rvAvoid','下周要避免',r.avoidNext)}
    <div style="margin-top:8px;display:flex;gap:8px"><button id="rvSave" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid #E8B339;background:rgba(232,179,57,.12);color:#E8B339;cursor:pointer">保存本周复盘</button><button id="rvClear" style="padding:6px 14px;border-radius:var(--r-ctl);border:1px solid var(--line);background:transparent;color:var(--txt);cursor:pointer">清除本周</button></div></div>`;
 }
+function thesisCheckpointCard(){
+ const J=journalLoad().entries, held=stocks.filter(x=>x.held&&J[x.sym]&&(J[x.sym].planStop!=null||J[x.sym].planTarget!=null));
+ if(!held.length)return '';
+ const rows=held.map(x=>{const e=J[x.sym],p=x.curPrice;
+   let rail='var(--line)',tag='<span class="chip">区间内</span>',msg='现价仍在你写下的失效价与目标价之间。';
+   if(e.planStop!=null&&p<=e.planStop){rail='var(--red)';tag='<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">失效触及</span>';msg=`现价 ${fmt(p)} ≤ 你写下的失效价 ${fmt(e.planStop)} —— 论点已被你自己的规则证伪，去复盘是否离场。`;}
+   else if(e.planTarget!=null&&p>=e.planTarget){rail='var(--accent)';tag='<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">目标触及</span>';msg=`现价 ${fmt(p)} ≥ 你写下的目标价 ${fmt(e.planTarget)} —— 按计划兑现，还是上移止盈？`;}
+   return `<div class="frow" style="cursor:pointer;border-left:3px solid ${rail};padding-left:9px" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}','journal')"><span class="fsym" style="width:auto;min-width:120px">${x.sym} ${tag}</span><span class="note" style="flex:1">${msg}</span></div>`;}).join('');
+ return `<div class="card"><div class="dh"><span class="t">论点检查点</span><span class="nm">现价 vs 你写下的失效 / 目标价 —— 让离场由你冷静时的规则触发，而非价格噪音</span></div>${rows}
+   <div class="note" style="margin-top:8px">仅对照你在“日志”里写下的计划价，纯描述、不预测；触及不等于必须操作。<b>非投资建议。</b></div></div>`;
+}
 function journalHonesty(){return `<div class="card"><details><summary style="cursor:pointer;color:var(--mut)">怎么读 · 边界说明</summary>
  <div class="note" style="margin-top:8px;line-height:1.65">成熟度评分<b>只看流程、不看盈亏</b>——靠运气赚的钱不会加分。小样本仅描述、非预测（任一分组 n&lt;3 不显示颜色结论）。<b>结果 ≠ 决策质量</b>：别用结果回头改写当时的论点（updatedAt 已标注更新日期；复盘与论点分两个字段正是为此）。不做多维交叉切片（避免在 情绪×周期×信念 里凑出偶然结论）。别过度记录：日志是为了执行计划，不是替代交易。日志与复盘<b>只存在本浏览器本设备</b>，不跨设备、不上传。<b>非投资建议。</b></div></details></div>`;}
-function journalCard(){return weeklyReview()+maturityCard()+killerStatCard()+emotionOutcomeCard()+unjournaledWorklist()+journalHonesty();}
+function journalCard(){return weeklyReview()+maturityCard()+thesisCheckpointCard()+killerStatCard()+emotionOutcomeCard()+unjournaledWorklist()+journalHonesty();}
 function wireJournalTab(){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg)return;
- seg.querySelectorAll('.jwork').forEach(r=>r.onclick=()=>{const sym=r.dataset.jsym;try{localStorage.setItem('ptrak.seg.stk','journal');}catch(e){}sel=sym;renderList();window.scrollTo({top:0,behavior:'smooth'});});
+ seg.querySelectorAll('.jwork').forEach(r=>r.onclick=()=>{stockGo(r.dataset.jsym,'journal');});
  const wk=isoWeek(new Date());
  const sv=seg.querySelector('#rvSave');if(sv)sv.onclick=()=>{const g=id=>{const el=seg.querySelector('#'+id);return el?el.value:'';};
    reviewSave(wk,{best:g('rvBest'),worst:g('rvWorst'),lesson:g('rvLesson'),doNext:g('rvDo'),avoidNext:g('rvAvoid'),
@@ -2412,18 +3452,19 @@ function wireJournalTab(){const seg=document.querySelector('.seg[data-seg="journ
  const cl=seg.querySelector('#rvClear');if(cl)cl.onclick=()=>{if(reviewGet(wk)&&!confirm('清除本周复盘？'))return;reviewClear(wk);rerenderJournalTab();};}
 function rerenderJournalTab(){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=journalCard();wireJournalTab();}}
 function positionJournalEditor(s){
- if(journalDraft===null)journalDraft=Object.assign({},journalEntry(s.sym)||{});
+ if(journalDraft===null)journalDraft=journalDrafts[s.sym]=(journalDrafts[s.sym]||Object.assign({},journalEntry(s.sym)||{}));   // restore in-progress draft if user previously navigated away mid-edit
  const d=journalDraft;
  const chip=(field,val,active)=>`<button data-jf="${field}" data-jv="${val}" aria-pressed="${active?'true':'false'}" style="padding:5px 11px;border-radius:var(--r-ctl);border:1px solid ${active?'#E8B339':'var(--line)'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':'var(--txt)'};cursor:pointer;font-size:12px;margin:0 6px 6px 0">${val}</button>`;
  const row=(lbl,body)=>`<div style="margin:9px 0"><div style="font-size:12px;color:var(--mut);margin-bottom:5px">${lbl}</div>${body}</div>`;
  const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${v==null?'':v}" placeholder="${ph}" aria-label="${ph}" style="width:90px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-right:8px">`;
  const ck=(d.adherence==='计划外'&&((DATA.behavior&&DATA.behavior.biasBySym&&DATA.behavior.biasBySym[s.sym])||[]).some(b=>b.id==='disposition'))?`<div class="note" style="margin:6px 0;color:#E5707A">⚠ 处置效应 + 计划外卖出 = 信号叠加，值得复盘。</div>`:'';
  const ck2=(d.conviction>=4&&d.planStop==null)?`<div class="note" style="margin:6px 0;color:#E8B339">⚠ 高信念却未设失效条件（“看到再说”反模式）。</div>`:'';
- const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:#1f5a40">上次更新 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:#6b5a2f">尚未记录 · 未保存</span>`;
+ const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">上次更新 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">尚未记录 · 未保存</span>`;
  return `<div class="card">
    <div class="dh"><span class="t">交易日志 · ${s.sym}</span><span class="nm">大多是点选，目标 &lt; 1 分钟</span> ${stamp}</div>
    ${row('论点（为什么买/持有）',`<textarea id="jThesis" rows="2" aria-label="论点（为什么买/持有）" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:12.5px;resize:vertical" placeholder="买入时就写下卖出条件，让卖出由逻辑驱动、而非红绿驱动">${jesc(d.thesis)}</textarea>`)}
    ${row('计划（入场 · 目标 · 止损/失效）',num('jEntry',d.planEntry,'入场')+num('jTarget',d.planTarget,'目标')+num('jStop',d.planStop,'止损/失效'))}
+   ${row('计划仓位（占组合）',['≤2%','2–5%','5–10%','＞10%'].map(v=>chip('size',v,d.size===v)).join(''))}
    ${row('信念',[1,2,3,4,5].map(v=>chip('conviction',v,d.conviction===v)).join(''))}
    ${row('时间维度',['日内','波段','核心多年'].map(v=>chip('horizon',v,d.horizon===v)).join(''))}
    ${row('情绪',J_CONSTRUCT.concat(J_DESTRUCT).map(v=>chip('emotion',v,d.emotion===v)).join(''))}
@@ -2436,10 +3477,10 @@ function positionJournalEditor(s){
 }
 function wireJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(!seg||!s)return;
  seg.querySelectorAll('[data-jf]').forEach(b=>b.onclick=()=>{const f=b.dataset.jf;let v=b.dataset.jv;if(f==='conviction')v=+v;journalDraft[f]=(journalDraft[f]===v)?null:v;rerenderJournalEditor(s);});
- [['jEntry','planEntry'],['jTarget','planTarget'],['jStop','planStop']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.onchange=()=>{journalDraft[f]=el.value===''?null:+el.value;};});
+ [['jEntry','planEntry'],['jTarget','planTarget'],['jStop','planStop']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.oninput=()=>{journalDraft[f]=el.value===''?null:+el.value;};});
  [['jThesis','thesis'],['jLesson','lesson']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)el.oninput=()=>{journalDraft[f]=el.value;};});   // sync textareas live so a chip click (which rebuilds the editor) can't wipe typed text
- const sv=seg.querySelector('#jSave');if(sv)sv.onclick=()=>{const t=seg.querySelector('#jThesis'),l=seg.querySelector('#jLesson');if(t)journalDraft.thesis=t.value;if(l)journalDraft.lesson=l.value;journalSaveEntry(s.sym,journalDraft);journalDraft=Object.assign({},journalEntry(s.sym));rerenderJournalEditor(s);};
- const cl=seg.querySelector('#jClear');if(cl)cl.onclick=()=>{if(journalEntry(s.sym)&&!confirm('清除这只持仓的日志？'))return;journalClearEntry(s.sym);journalDraft={};rerenderJournalEditor(s);};}
+ const sv=seg.querySelector('#jSave');if(sv)sv.onclick=()=>{const t=seg.querySelector('#jThesis'),l=seg.querySelector('#jLesson');if(t)journalDraft.thesis=t.value;if(l)journalDraft.lesson=l.value;[['jEntry','planEntry'],['jTarget','planTarget'],['jStop','planStop']].forEach(([id,f])=>{const el=seg.querySelector('#'+id);if(el)journalDraft[f]=el.value===''?null:+el.value;});journalSaveEntry(s.sym,journalDraft);journalDraft=journalDrafts[s.sym]=Object.assign({},journalEntry(s.sym));rerenderJournalEditor(s);};
+ const cl=seg.querySelector('#jClear');if(cl)cl.onclick=()=>{if(journalEntry(s.sym)&&!confirm('清除这只持仓的日志？'))return;journalClearEntry(s.sym);journalDraft=journalDrafts[s.sym]={};rerenderJournalEditor(s);};}
 function rerenderJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=positionJournalEditor(s);wireJournalEditor(s);}}
 function fibChart(s,fmtY){
  const f=s.fib,prices=s.prices;if(!f)return'<div class="note">价格数据不足，无法计算斐波那契指标。</div>';
@@ -2520,7 +3561,7 @@ function renderFib(s){
 }
 function renderDetail(){
  if(sel==='__OV__'){renderOverview();return;}
- CHARTREG={};journalDraft=null;   // per-symbol journal draft must not leak across stocks
+ CHARTREG={};journalDraft=(sel!=='__OV__'?(journalDrafts[sel]||null):null);   // restore previously-typed draft for this symbol (positionJournalEditor lazy-initializes if absent)
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML='';   // banner is overview-only
  const s=stocks.find(x=>x.sym===sel);if(!s){document.getElementById('right').innerHTML='';return;}
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
@@ -2532,6 +3573,7 @@ function renderDetail(){
     <td>${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
     <td class="${cls(t.realized)}">${t.realized==null?'—':fmt(t.realized)}</td></tr>`;}).join('');
  document.getElementById('right').innerHTML=`
+ ${viewBarStock(s)}
  <div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button><button data-seg="journal" title="给这只持仓写下论点、计划与情绪（目标 <1 分钟）">日志</button></div>
  <div class="seg" data-seg="price">
  <div class="card">
@@ -2539,33 +3581,30 @@ function renderDetail(){
      ${s.hasLegacy?'<span class="legacychip">含 '+D0+' 前旧底仓 · 成本按当日市价估算</span>':''}</div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="legend"><span><i style="background:#6B7079"></i>市场价格(Yahoo)</span><span><i style="background:#B89030"></i>持仓平均成本</span>
-     <span><i style="background:#E8B339"></i>当前价</span><span><i style="background:#4FB286"></i>买入(大小=金额)</span><span><i style="background:transparent;border:2px solid #E5707A;box-sizing:border-box"></i>卖出(空心环)</span></div>
-   <div class="chartbox">${chart(s)}</div></div>
+     <span><i style="background:#E8B339"></i>当前价</span><span><i style="background:#4FB286;border-radius:50%"></i>买入(大小=金额)</span><span><i style="background:transparent;border:2px solid #E5707A;border-radius:50%;box-sizing:border-box"></i>卖出(空心环)</span></div>
+   <div class="chartbox">${chart(s)}</div>
+   <div class="note" style="margin-top:8px"><b>怎么读：</b>灰线 = 市场收盘价(Yahoo)，琥珀阶梯 = 你的持仓平均成本，绿实心 = 买入、红空心环 = 卖出（圆点大小 ≈ 成交金额）。价格与成交点都是历史事实，不预测未来。<b>非投资建议。</b></div></div>
  </div>
  <div class="seg" data-seg="tx" hidden>
- <div class="card"><div style="font-weight:650;margin-bottom:6px">交易明细（${s.numTrades} 笔）</div>
+ <div class="card"><div class="dh"><span class="t">交易明细</span><span class="nm">${s.numTrades} 笔交易${s.hasLegacy?' · 另含期初底仓 1 行':''}</span></div>
    <div class="scroll"><table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>数量</th><th>成交价</th><th>金额</th><th>持仓后</th><th>均价后</th><th>已实现</th></tr></thead>
    <tbody>${rows}</tbody></table></div></div>
  </div>
  <div class="seg" data-seg="fib" hidden>`+renderFib(s)+`</div>
  <div class="seg" data-seg="journal" hidden>`+positionJournalEditor(s)+`</div>`;
- bindMarkers();segWire();restoreSeg('stk');bindCharts();updateCtx();wireJournalEditor(s);
+ bindMarkers();segWire();bindCharts();updateCtx();wireJournalEditor(s);renderOptSec();   // restoreSeg removed — URL is source of truth; renderOptSec replaces the MutationObserver
 }
 function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail').forEach(rail=>rail.setAttribute('role','tablist'));
  r.querySelectorAll('.seg-rail button').forEach(b=>{
   b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');
   {const sg=b.dataset.seg,panel=r.querySelector('.seg[data-seg="'+sg+'"]');if(panel){const tid='segtab-'+sg,pid='segpanel-'+sg;b.id=tid;b.setAttribute('aria-controls',pid);panel.id=pid;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',tid);if(!panel.hasAttribute('tabindex'))panel.setAttribute('tabindex','0');}}
-  b.onclick=()=>{
-   r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
-   r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==b.dataset.seg;});
-   try{localStorage.setItem('ptrak.seg.'+(sel==='__OV__'?'ov':'stk'),b.dataset.seg);}catch(e){}updateCtx();};});}
-function restoreSeg(ctx){try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(!want)return;var r=document.getElementById('right'),btn=r.querySelector('.seg-rail [data-seg="'+want+'"]');if(btn&&!btn.classList.contains('on'))btn.click();}catch(e){}}
-function ovGo(seg){var b=document.querySelector('.seg-rail [data-seg="'+seg+'"]');if(b)b.click();window.scrollTo({top:0,behavior:'smooth'});}
+  b.onclick=()=>activateSeg(b.dataset.seg,{push:true});});}
+function restoreSeg(ctx){if(routeApplying)return;try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(want)activateSeg(want,{push:false});}catch(e){}}
 function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}if(done)return'';
  const j=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" style="margin-left:0" onclick="ovGo('${seg}')">${t}</span>`;
  return `<div id="onboard" class="note" style="margin-bottom:14px;padding:10px 13px;background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:var(--r-card);line-height:1.7">
-   <b style="color:var(--accent)">从这里开始</b> · 想知道我赚了多少 → ${j('score','决策一览')} / ${j('nw','净值')}　|　钱和风险集中在哪 → ${j('struct','结构')} / ${j('risk','风险')}　|　该不该调仓 → ${j('beh','行为决策')} / ${j('rebal','再平衡计划')}
+   <b style="color:var(--accent)">从这里开始</b> · 想知道我赚了多少 → ${j('score','决策一览')} / ${j('nw','净值')}　|　QQQ/TQQQ 节奏 → ${j('qt','策略台')}　|　钱和风险集中在哪 → ${j('struct','结构')} / ${j('risk','风险')}　|　该不该调仓 → ${j('beh','行为决策')} / ${j('rebal','再平衡计划')}
    <span role="button" tabindex="0" style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var _i=document.getElementById('insight');if(_i)_i.innerHTML=onboardStrip()+insightBanner()">不再显示 ✕</span></div>`;}
 /* ===== plain-language glossary: hover/tap any .gl term -> reuse the #tt tooltip ===== */
 const GLOSS={
@@ -2583,7 +3622,7 @@ const GLOSS={
  alpha:'超额收益：你的组合相对 S&P500 多赚或少赚的百分点。',
  HHI:'集中度指数：各持仓权重平方和，越大越集中、越靠近押注单一标的。',
  effN:'有效持仓数 ≈ 1 ÷ HHI：把同因子标的合并后，约等于几个独立押注（常远小于名义只数）。',
- beta:'Beta：相对大盘(S&P)的波动倍数，>1 比大盘更猛、<1 更稳。',
+ beta:'Beta：相对大盘(S&P)的波动倍数，>1 比大盘更猛、<1 更稳。窗口内日收益小样本估计，区间窄时不稳定、非预测。',
  dd:'回撤：相对历史最高点跌了多少（描述风险，不预测未来）。',
  vol:'年化波动率：日收益标准差×√252（颠簸幅度，非盈亏）。这里红=高于S&P（更颠簸），绿=低于S&P（更稳）；红≠亏损。',
  rc:'风险贡献：组合总波动按各持仓边际贡献拆开（合计100%），不等于资金权重。',
@@ -2591,22 +3630,40 @@ const GLOSS={
  rsi:'RSI(14)：0–100 的强弱摆动，>70 偏超买、<30 偏超卖（技术参考）。',
  cross:'金叉 / 死叉：快线 EMA5 上穿 / 下穿 EMA13，比传统 50 / 200 日更灵敏。',
  attn:'关注度：四类红色信号的计数，是默认排序键，不是评分也不是买卖建议。',
- res:'共振：趋势排列 + 近3日金 / 死叉 + RSI 未极端 三者同向，确信度更高的技术信号。'
+ res:'共振：趋势排列 + 近3日金 / 死叉 + RSI 未极端 三者同向，确信度更高的技术信号。',
+ atr:'ATR(14)：平均真实波幅，衡量近 14 日每天大约波动多少美元，用来把 EMA 变成价格作战带（技术参考）。',
+ ema:'EMA：指数移动平均，越近的价格权重越大；EMA8 / 21 / 55 的排列用来判断趋势方向（技术参考）。',
+ ccs:'CCS（Call Credit Spread，看涨信用价差）：卖近一档 call、买远一档 call 的定义化风险组合，过热时小仓给多头加一道短线刹车。',
+ dte:'DTE（Days To Expiry）：期权距到期还有几天；越临近到期，时间价值与指派风险变化越快。',
+ breakeven:'盈亏平衡价：到期时不赚不亏的标的价位（行权价 ± 净权利金）。',
+ mark:'Mark（市价）：券商对持仓的当前估值，不是你的成本，也不是 delta / 名义敞口。',
+ notional:'名义本金（Notional）：期权对应的标的总市值（行权价×100×张数），通常远大于期权市价——真实杠杆藏在这里。',
+ marginDebit:'保证金借记（Margin Debit）：向券商借的钱；不在本导出中，若存在会让“可动用现金 / 净值”被高估。',
+ sharpe:'夏普比率（rf=0）：年化收益 ÷ 年化波动，衡量每单位颠簸换来多少回报。小样本、描述性、非预测。',
+ sortino:'索提诺比率（rf=0）：年化收益 ÷ 仅下行波动，只罚“向下”的颠簸。小样本、描述性、非预测。',
+ assign:'指派风险（Assignment）：卖出的期权被对手行权、你被迫买 / 卖正股的风险；越价内、越临近到期越高。',
+ rvr:'收益 / 波动比：年化收益 ÷ 年化波动（rf=0 的近似夏普）。小样本、描述性、非预测。',
+ size:'计划仓位：你在冷静时打算让这笔占组合多大比重，用来事后检查有没有超配。',
+ defrisk:'定义化风险（Defined Risk）：垂直价差等组合最大盈亏被价差宽度封顶，不像裸卖期权那样敞口无限。',
+ PGR:'盈利兑现率（PGR）：把赚钱仓位卖掉的倾向；与 PLR 一起看处置效应（赢家拿不住、输家舍不得割）。',
+ PLR:'亏损兑现率（PLR）：把亏钱仓位卖掉的倾向；PGR≫PLR 是典型处置效应。',
+ turnover:'换手率：一段时间买卖金额相对组合规模的比例；越高越接近过度交易，摩擦成本越大。'
 };
 function gl(k,l){return GLOSS[k]?'<span class="gl" tabindex="0" data-g="'+k+'">'+l+'</span>':l;}
 (function(){
  const tt=document.getElementById('tt');if(!tt)return;let pinned=false;
+ function setPinned(v){pinned=v;window.__ttPinned=v;}   // expose for the Esc-to-back handler so it only defers to PINNED glossary tooltips, not transient hovers
  function show(el,x,y){const d=GLOSS[el.dataset.g];if(!d)return;
    tt.className='tt gl-tt';tt.innerHTML='<span class="gk">'+(el.textContent||'')+'</span>'+d;tt.style.display='block';
    const w=tt.offsetWidth||260;let L=x+14;if(L+w>window.innerWidth-8)L=window.innerWidth-w-8;if(L<8)L=8;
    tt.style.left=L+'px';tt.style.top=(y+14)+'px';}
  function hide(){if(pinned)return;tt.style.display='none';tt.classList.remove('gl-tt');}
- function unpin(){pinned=false;tt.style.display='none';tt.classList.remove('gl-tt');}
+ function unpin(){setPinned(false);tt.style.display='none';tt.classList.remove('gl-tt');}
  document.addEventListener('mouseover',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g&&!pinned)show(g,e.clientX,e.clientY);});
  document.addEventListener('mousemove',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g&&!pinned)show(g,e.clientX,e.clientY);});
  document.addEventListener('mouseout',e=>{const g=e.target.closest&&e.target.closest('.gl');if(g)hide();});
  document.addEventListener('click',e=>{const g=e.target.closest&&e.target.closest('.gl');
-   if(g){unpin();pinned=true;const r=g.getBoundingClientRect();show(g,r.left-14,r.bottom-14);e.stopPropagation();}
+   if(g){unpin();setPinned(true);const r=g.getBoundingClientRect();show(g,r.left-14,r.bottom-14);e.stopPropagation();}
    else if(pinned)unpin();});
  document.addEventListener('keydown',e=>{const a=document.activeElement;
    if((e.key==='Enter'||e.key===' ')&&a&&a.classList&&a.classList.contains('gl')){e.preventDefault();a.click();}
@@ -2648,7 +3705,11 @@ function bindCharts(){
  function clear(svg){const g=svg&&svg.querySelector('.xg');if(g)g.style.display='none';if(!tt.classList.contains('gl-tt'))tt.style.display='none';}
  document.addEventListener('mousemove',e=>{const svg=e.target.closest&&e.target.closest('svg.xh');if(svg)place(svg,e);});
  document.addEventListener('mouseout',e=>{const svg=e.target.closest&&e.target.closest('svg.xh');if(svg&&!svg.contains(e.relatedTarget))clear(svg);});
- document.addEventListener('touchmove',e=>{const t=e.touches[0],el=t&&document.elementFromPoint(t.clientX,t.clientY),s=el&&el.closest&&el.closest('svg.xh');if(s){place(s,t);e.preventDefault();}},{passive:false});
+ document.addEventListener('touchmove',e=>{const t=e.touches[0];if(!t)return;
+   if(t.clientX<24||t.clientX>window.innerWidth-24)return;   // skip the iOS edge-swipe-back/forward zones so the system gesture isn't swallowed by the chart crosshair
+   const el=document.elementFromPoint(t.clientX,t.clientY),s=el&&el.closest&&el.closest('svg.xh');
+   if(s){place(s,t);e.preventDefault();}
+ },{passive:false});
 }
 function renderOptions(){
  if(!DATA.options.length)return'';
@@ -2657,34 +3718,138 @@ function renderOptions(){
      <table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>合约</th><th>权利金</th><th>金额</th></tr></thead><tbody>${tr}</tbody></table></details>`;}).join('');
  return `<div class="card"><div style="font-weight:650;margin-bottom:6px">期权交易（净现金流合计 <span class="${cls(S.optNet)}">${fmt(S.optNet)}</span>）</div>${rows}</div>`;
 }
-document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().trim();renderList();};
-document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderList();};
+/* ===== ptrak telemetry: local-only ring buffer for the trader's back-and-forth flow =====
+   Opt-in. Run window.ptrak_telemetry_on() in DevTools to start, ptrak_stats() to read,
+   ptrak_telemetry_off() to stop, ptrak_telemetry_clear() to wipe. Buffer caps at 500 events
+   in localStorage 'ptrak.nav.v1'. Nothing leaves the browser. */
+const PTRAK_TM={KEY:'ptrak.nav.v1', MAX:500, ON_KEY:'ptrak.telemetry.v1'};
+function _tmOn(){try{return localStorage.getItem(PTRAK_TM.ON_KEY)==='on';}catch(e){return false;}}
+function _tmLog(ev){if(!_tmOn())return;
+ try{let buf=[];try{buf=JSON.parse(localStorage.getItem(PTRAK_TM.KEY)||'[]');if(!Array.isArray(buf))buf=[];}catch(e){buf=[];}
+   buf.push(Object.assign({t:Date.now()},ev));
+   if(buf.length>PTRAK_TM.MAX)buf=buf.slice(buf.length-PTRAK_TM.MAX);
+   localStorage.setItem(PTRAK_TM.KEY,JSON.stringify(buf));
+ }catch(e){}
+}
+window.ptrak_telemetry_on=function(){try{localStorage.setItem(PTRAK_TM.ON_KEY,'on');console.log('%cptrak telemetry: ON — events log locally to localStorage.'+PTRAK_TM.KEY,'color:#4FB286');}catch(e){}};
+window.ptrak_telemetry_off=function(){try{localStorage.setItem(PTRAK_TM.ON_KEY,'off');console.log('%cptrak telemetry: OFF','color:#E5707A');}catch(e){}};
+window.ptrak_telemetry_clear=function(){try{localStorage.removeItem(PTRAK_TM.KEY);console.log('ptrak telemetry buffer cleared');}catch(e){}};
+window.ptrak_stats=function(days){
+ days=days||7;
+ const since=Date.now()-days*86400000;
+ let buf=[];try{buf=JSON.parse(localStorage.getItem(PTRAK_TM.KEY)||'[]');if(!Array.isArray(buf))buf=[];}catch(e){buf=[];}
+ const recent=buf.filter(e=>e&&e.t>=since);
+ const navs=recent.filter(e=>e.type==='nav');
+ const dwell={}, visits={};
+ for(let i=0;i<navs.length;i++){
+   const key=navs[i].sym+'·'+(navs[i].seg||'');
+   visits[key]=(visits[key]||0)+1;
+   if(i<navs.length-1){const ms=navs[i+1].t-navs[i].t;if(ms>0&&ms<3600000)dwell[key]=(dwell[key]||0)+ms;}
+ }
+ const rows=Object.keys(visits).map(k=>({view:k, visits:visits[k], dwell_sec:Math.round((dwell[k]||0)/1000)})).sort((a,b)=>b.visits-a.visits).slice(0,25);
+ const srcCount={};navs.forEach(n=>{srcCount[n.src||'?']=(srcCount[n.src||'?']||0)+1;});
+ const backRate=navs.length?(srcCount.back||0)/navs.length:0;
+ console.log('%c— ptrak '+days+'d telemetry —','font-weight:bold;color:#E8B339');
+ console.log('events:',recent.length,'· navs:',navs.length,'· back-button rate:',(backRate*100).toFixed(1)+'%');
+ console.table(rows);
+ console.log('nav sources:',srcCount,'· filter/sort/search events:',recent.filter(e=>e.type==='filter'||e.type==='sort'||e.type==='search').length);
+ return {events:recent.length, navs:navs.length, backRate, srcCount, topViews:rows};
+};
+['pagehide','visibilitychange','beforeunload'].forEach(ev=>window.addEventListener(ev,()=>{
+ if(ev==='visibilitychange'&&!document.hidden)return;
+ _tmLog({type:'leave',sym:sel,seg:activeSeg()});
+}));
+try{if(!_tmOn())console.log('%cptrak: nav telemetry is OFF (privacy default). Run window.ptrak_telemetry_on() to enable a local-only ring buffer; window.ptrak_stats() to see your own usage.','color:#6B7079;font-style:italic');}catch(e){}
+let __searchT=0;
+function rememberList(){try{localStorage.setItem('ptrak.list.v1',JSON.stringify({q,f:filter,s:sortKey}));}catch(e){}}
+function syncListUI(){   // mirror restored state into the visible controls when the URL/storage rehydrates filter/q/sortKey
+ try{const si=document.getElementById('search');if(si&&si.value!==q)si.value=q;
+   const so=document.getElementById('sort');if(so&&so.value!==sortKey)so.value=sortKey;
+   document.querySelectorAll('.tabs button').forEach(b=>{const on=b.dataset.f===filter; b.classList.toggle('on',on); b.setAttribute('aria-selected',on?'true':'false');});
+ }catch(e){}
+}
+document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().trim();
+ clearTimeout(__searchT);
+ __searchT=setTimeout(()=>{renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'search',q});},150);   // debounce + replaceState (search is view-state, not a page)
+};
+document.getElementById('search').addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(__searchT);renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'search',q});}});
+document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'sort',s:sortKey});};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('.tabs button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
- filter=b.dataset.f;renderList();});
+ filter=b.dataset.f;renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'filter',f:filter});});
+function _inTypingField(el){if(!el)return false;const tag=(el.tagName||'').toLowerCase();return tag==='input'||tag==='textarea'||el.isContentEditable;}
 document.addEventListener('keydown',e=>{
  const a=document.activeElement;
- if(a&&a.id==='search'){if(e.key==='Escape'){a.value='';q='';renderList();}return;}
+ if(a&&a.id==='search'){if(e.key==='Escape'){a.value='';q='';renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);}return;}
  if(a&&a.classList&&a.classList.contains('ib-lk')&&(e.key==='Enter'||e.key===' ')){e.preventDefault();a.click();return;}
- if(e.key==='Escape'){const tt=document.getElementById('tt');if(tt&&tt.style.display==='block')return;if(sel!=='__OV__'){sel='__OV__';renderList();renderDetail();}return;}
- if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&a.parentElement.classList.contains('seg-rail')){
-   const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}}});
-function updateCtx(){var c=document.getElementById('ctx'),t=document.getElementById('ctxt');if(!c||!t)return;var on=document.querySelector('#right .seg-rail button.on');var name=(typeof sel!=='undefined'&&sel!=='__OV__')?sel:'组合总览';t.textContent=name+(on?' · '+on.textContent.trim():'');}
+ // Esc-to-back — but defer to PINNED tooltips (glossary), not hover tooltips, so Esc isn't swallowed by an incidental hover
+ if(e.key==='Escape'){if(window.__ttPinned)return;if(sel!=='__OV__')goBack();return;}
+ if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&(a.parentElement.classList.contains('seg-rail')||a.parentElement.classList.contains('tabs'))){
+   const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}return;}
+ // keyboard listbox on the holdings list: ArrowUp/Down/Home/End cycle row focus; Enter/Space already wired per-row
+ if(a&&a.classList&&a.classList.contains('row')){
+   if(e.key==='ArrowDown'||e.key==='ArrowUp'){const sib=e.key==='ArrowDown'?a.nextElementSibling:a.previousElementSibling;if(sib&&sib.classList&&sib.classList.contains('row')){sib.focus();e.preventDefault();}return;}
+   if(e.key==='Home'){const f=document.querySelector('#list .row');if(f){f.focus();e.preventDefault();}return;}
+   if(e.key==='End'){const all=document.querySelectorAll('#list .row');const l=all[all.length-1];if(l){l.focus();e.preventDefault();}return;}
+ }
+ // global power-user shortcuts when not typing: j/k = adjacent stock, / = focus search, ? = nothing (reserved)
+ if(!_inTypingField(a)){
+   if(e.key==='/'){const si=document.getElementById('search');if(si){si.focus();si.select&&si.select();e.preventDefault();}return;}
+   if(e.key==='j'){adjacentStock(1);e.preventDefault();return;}
+   if(e.key==='k'){adjacentStock(-1);e.preventDefault();return;}
+   if(e.key==='g'&&sel!=='__OV__'){goBack();e.preventDefault();return;}
+ }
+});
+function updateCtx(){var c=document.getElementById('ctx'),t=document.getElementById('ctxt');if(!c||!t)return;var on=document.querySelector('#right .seg-rail button.on');var instk=(typeof sel!=='undefined'&&sel!=='__OV__');var name=instk?sel:'组合总览';t.textContent=(instk?'← ':'↑ ')+name+(on?' · '+on.textContent.trim():'');c.setAttribute('aria-label',instk?'返回组合总览':'回到顶部');}
 window.addEventListener('scroll',function(){var y=window.scrollY||0,c=document.getElementById('ctx'),t=document.getElementById('totop');if(c)c.hidden=y<300;if(t)t.hidden=y<600;},{passive:true});
 (function(){var b=document.getElementById('totop');if(b)b.onclick=function(){window.scrollTo({top:0,behavior:'smooth'});};})();
-renderList();
+function routeFromBrowser(){
+ if(routeApplying)return;
+ const st=history.state;
+ window.__ptrakRestoringScroll=!!(st&&(st.scrollY||st.listScrollY));   // suppress renderList's scrollIntoView while we restore the saved offset
+ applyRoute(parseRoute()||{sym:'__OV__',seg:lastSeg('ov')||DEFAULT_SEG.ov},{scroll:false,fromHistory:true});
+ if(st){
+   requestAnimationFrame(()=>requestAnimationFrame(()=>{   // two RAFs let the layout/optsec append settle before we restore the saved offset
+     if(st.scrollY!=null)window.scrollTo(0,st.scrollY);
+     if(st.listScrollY!=null){const l=document.getElementById('list');if(l)l.scrollTop=st.listScrollY;}
+     window.__ptrakRestoringScroll=false;
+   }));
+ } else {window.__ptrakRestoringScroll=false;}
+}
+try{history.scrollRestoration='manual';}catch(e){}   // we manage scroll restoration ourselves; browser default would race our RAF restore
+window.addEventListener('popstate',routeFromBrowser);   // pushState/replaceState already update the hash, so hashchange would fire routeFromBrowser a second time — single listener is enough
+(function(){   // initial load: if user landed on a deep-linked stock URL, insert a synthetic Overview entry first so the FIRST browser-back goes home rather than out of the dashboard
+ // cold-load restore: when URL has no ?-suffix, rehydrate filter/q/sortKey from the last session so reload doesn't reset filters
+ if(!(window.location.hash||'').includes('?')){
+   try{const st=JSON.parse(localStorage.getItem('ptrak.list.v1')||'{}');
+     if(typeof st.q==='string')q=st.q;
+     if(VALID_F.indexOf(st.f)>=0)filter=st.f;
+     if(VALID_S.indexOf(st.s)>=0)sortKey=st.s;
+     syncListUI();
+   }catch(e){}
+ }
+ const _r=parseRoute();
+ if(_r&&_r.sym!=='__OV__'){
+   writeRoute('__OV__',lastSeg('ov')||DEFAULT_SEG.ov,true);   // replace the entry the browser created on load with our canonical OV entry
+   writeRoute(_r.sym,_r.seg,false);                            // then push the actual deep-linked stock entry on top
+   applyRoute(_r,{scroll:false});
+ } else {
+   applyRoute(_r||{sym:'__OV__',seg:lastSeg('ov')||DEFAULT_SEG.ov},{scroll:false,replace:true});
+ }
+})();
 requestAnimationFrame(()=>document.body.classList.add('ready'));
 setTimeout(()=>document.body.classList.add('done'),1500);
-const obs=()=>{const r=document.getElementById('right');
- if(r&&!document.getElementById('optsec')){const d=document.createElement('div');d.id='optsec';
-   d.innerHTML=renderOptions()+`<div class="card note"><b>计算口径说明</b><br>
-   • 价格曲线为 Yahoo Finance 实际日收盘价；买卖点的 Y 轴为你的真实成交价。<br>
-   • <b>未实现盈亏</b>采用券商最新 Portfolio CSV 实际数据（精确）。<br>
-   • <b>已实现盈亏</b>用平均成本法在数据窗口内计算；标「含旧仓」的股票在数据起点前已有底仓，其成本按起点当日市场价估算，故为近似值。<br>
-   • 数据窗口 ${D0} → ${D1}，可能并非完整开户记录。</div>`;
-   r.appendChild(d);} };
-new MutationObserver(obs).observe(document.getElementById('right'),{childList:true});
-setTimeout(obs,300);
+function renderOptSec(){   // append options-trading card (overview only) + universal data-window note. Direct call from renderOverview/renderDetail replaces the previous MutationObserver which fired on every seg toggle
+ const r=document.getElementById('right');
+ if(!r||document.getElementById('optsec'))return;
+ const d=document.createElement('div');d.id='optsec';
+ d.innerHTML=(sel==='__OV__'?renderOptions():'')+`<div class="card note"><b>计算口径说明</b><br>
+ • 价格曲线为 Yahoo Finance 实际日收盘价；买卖点的 Y 轴为你的真实成交价。<br>
+ • <b>未实现盈亏</b>采用券商最新 Portfolio CSV 实际数据（精确）。<br>
+ • <b>已实现盈亏</b>用平均成本法在数据窗口内计算；标「含旧仓」的股票在数据起点前已有底仓，其成本按起点当日市场价估算，故为近似值。<br>
+ • 数据窗口 ${D0} → ${D1}，可能并非完整开户记录。</div>`;
+ r.appendChild(d);
+}
 </script>
 </body></html>'''
 
@@ -2697,6 +3862,9 @@ def main():
                     help="where to auto-detect CSVs (default: ~/Downloads)")
     ap.add_argument("--out", default=os.path.join(HERE, "output", "portfolio_dashboard.html"))
     ap.add_argument("--no-fetch", action="store_true", help="reuse cached prices (offline)")
+    ap.add_argument("--mark-to-market", action="store_true",
+                    help="revalue held stocks from the latest Yahoo price while keeping shares/cost from the Portfolio CSV")
+    ap.add_argument("--as-of", help="target price date for --mark-to-market (YYYY-MM-DD; default: today)")
     args = ap.parse_args()
 
     portfolio = args.portfolio or newest("Portfolio_Positions*.csv", args.input_dir)
@@ -2707,13 +3875,9 @@ def main():
     # exports are complete in different ways: "History_for_Account" has the full
     # trade log; "Accounts_History" often has the complete cash/dividend record
     # (and may include deposits the other file misses). So pick the best source
-    # for each purpose instead of trusting a single file.
-    if args.history:
-        hist_files = [args.history]
-    else:
-        hist_files = []
-        for pat in ("History_for_Account*.csv", "Accounts_History*.csv"):
-            hist_files += glob.glob(os.path.join(args.input_dir, pat))
+    # for each purpose instead of trusting a single file. An explicit --history
+    # is ADDED to the accumulated local set, not used as a replacement.
+    hist_files = collect_history_files(args.input_dir, args.history)
     if not hist_files:
         sys.exit("!! Could not find any history CSV. Pass --history explicitly.")
     parsed = [parse_history(p) for p in hist_files]
@@ -2724,7 +3888,9 @@ def main():
     # is simply missing those weeks, and reconstructing across it would be wrong.
     txns_all, opt_txns, names = merge_histories(parsed)
     dmin, gaps = continuous_start(txns_all)
-    dmax = max((t["date"] for L in txns_all.values() for t in L), default=None)
+    txn_dmax = max((t["date"] for L in txns_all.values() for t in L), default=None)
+    if not dmin or not txn_dmax:
+        sys.exit("!! Could not find any dated stock transactions in the history exports.")
 
     txns = {s: [t for t in L if t["date"] >= dmin] for s, L in txns_all.items()}
     txns = {s: L for s, L in txns.items() if L}
@@ -2733,29 +3899,62 @@ def main():
     tot_buy = sum(-t["amount"] for L in txns.values() for t in L if t["side"] == "BUY")
     tot_sell = sum(t["amount"] for L in txns.values() for t in L if t["side"] == "SELL")
     totals = (tot_buy, tot_sell)
+
+    n_trades = sum(len(L) for L in txns.values())
+    cur = parse_portfolio(portfolio)
+    acct_extras = parse_account_extras(portfolio)
+    strategy_tickers = {"QQQ", "TQQQ"}
+    tickers = sorted(set(list(txns) + list(cur)))
+
+    target_asof = args.as_of or datetime.date.today().isoformat()
+    try:
+        datetime.date.fromisoformat(target_asof)
+    except ValueError:
+        sys.exit("!! --as-of must be YYYY-MM-DD")
+    fetch_dmax = target_asof if args.mark_to_market else txn_dmax
+
+    # fetch window: a few days before first trade through day after last needed
+    price_start = datetime.date.fromisoformat(dmin) - datetime.timedelta(days=4)
+    # QQQ/TQQQ strategy needs enough daily bars for EMA55/89 + ATR context even
+    # when the latest activity export covers only a short window.
+    strategy_start = datetime.date.fromisoformat(fetch_dmax) - datetime.timedelta(days=260)
+    start = min(price_start, strategy_start).isoformat()
+    end = (datetime.date.fromisoformat(fetch_dmax) + datetime.timedelta(days=1)).isoformat()
+    BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
+    prices = fetch_prices(sorted(set(tickers) | set(BENCH) | strategy_tickers), start, end, no_fetch=args.no_fetch)
+    ohlc = fetch_ohlc(sorted(strategy_tickers), start, end, no_fetch=args.no_fetch)
+
+    dmax = txn_dmax
+    refreshed = {}
+    price_mode = "broker"
+    price_as_of = txn_dmax
+    if args.mark_to_market:
+        price_dmax = latest_price_date(prices, sorted(set(tickers) | set(BENCH) | strategy_tickers), target_asof)
+        if not price_dmax:
+            sys.exit("!! --mark-to-market could not find any downloaded Yahoo prices.")
+        dmax = max(txn_dmax, price_dmax)
+        price_as_of = price_dmax
+        price_mode = "mark-to-market"
+        refreshed = mark_to_market(cur, prices, price_dmax)
+
     deposits, dividends = union_cash(parsed, dmin, dmax)
     life_dep, _ = union_cash(parsed, "0000-00", "9999-99")
 
-    n_trades = sum(len(L) for L in txns.values())
     print(f"· portfolio:  {portfolio}")
     print(f"· merged {len(parsed)} exports → {n_trades} trades, window {dmin}→{dmax}")
+    if args.mark_to_market:
+        print(f"· mark-to-market: refreshed {len(refreshed)}/{len(cur)} held/equity symbols with Yahoo prices as of {price_as_of}")
     if gaps:
         print(f"  (excluded earlier data before {dmin}: coverage gap "
               + ", ".join(f"{a}→{b}" for a, b in gaps) + ")")
     print(f"· deposits {dmin[:7]}→{dmax[:7]}: ${deposits:,.0f}  ·  lifetime deposits ${life_dep:,.0f}  ·  dividends ${dividends:,.2f}")
 
-    cur = parse_portfolio(portfolio)
-    acct_extras = parse_account_extras(portfolio)
-    tickers = sorted(set(list(txns) + list(cur)))
-
-    # fetch window: a few days before first trade through day after last
-    start = (datetime.date.fromisoformat(dmin) - datetime.timedelta(days=4)).isoformat()
-    end = (datetime.date.fromisoformat(dmax) + datetime.timedelta(days=1)).isoformat()
-    BENCH = ["^GSPC", "^IXIC"]   # S&P 500, NASDAQ Composite
-    prices = fetch_prices(sorted(set(tickers) | set(BENCH)), start, end, no_fetch=args.no_fetch)
     sectors = fetch_sectors(tickers, no_fetch=args.no_fetch)
 
-    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax, dividends, life_dep, acct_extras, sectors)
+    payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals,
+                            dmin, dmax, dividends, life_dep, acct_extras, sectors,
+                            ohlc, price_mode=price_mode, price_as_of=price_as_of,
+                            refreshed_prices=refreshed)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]
