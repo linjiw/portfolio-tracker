@@ -1792,6 +1792,16 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
    One rationed amber accent · semantic green/red on numbers only
    ============================================================ */
 :root{
+  /* ============================== DESIGN TOKENS ============================== */
+  /* ---- spacing scale (4 / 8 / 12 / 16 / 20 / 24 / 32 / 44 — every multiple of 4) ---- */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px; --s7:32px;
+  --tap-min:44px;                   /* iOS minimum tap target — used by mobile @media */
+  /* ---- type scale (kept tight: 5 sizes cover the whole UI) ---- */
+  --t-xs:11px; --t-sm:12.5px; --t-base:13px; --t-md:15px; --t-lg:17px; --t-xl:20px;
+  /* ---- masthead height (single source of truth for sticky offsets) ---- */
+  --header-h:84px;
+  /* ---- ticks (rhythm markers) ---- */
+  --tick-s:14px; --tick-l:17px;     /* small = card title; large = masthead */
   /* ---- palette ---- */
   --bg:#0B0C0E; --bg2:#0E1013; --panel:#121316; --panel2:#16181C;
   --line:#23262C; --hair:#1A1C21;
@@ -1843,8 +1853,8 @@ header,.kpis,.wrap{max-width:1480px;margin-left:auto;margin-right:auto}
 
 /* ============================== MASTHEAD ============================== */
 header{
-  padding:14px 28px;
-  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  padding:var(--s4) var(--s7);
+  display:flex; align-items:center; gap:var(--s4); flex-wrap:wrap;
   position:sticky; top:0; z-index:20;
   background:color-mix(in srgb,var(--bg) 80%,transparent);
   -webkit-backdrop-filter:blur(14px) saturate(120%);
@@ -1853,13 +1863,13 @@ header{
   box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
 }
 header h1{
-  font-family:var(--f-disp); font-size:17px; font-weight:600;
+  font-family:var(--f-disp); font-size:var(--t-lg); font-weight:600;
   letter-spacing:.01em; margin:0; line-height:1.1;
-  display:flex; align-items:center; gap:11px;
+  display:flex; align-items:center; gap:var(--s3);
 }
-/* amber index-tick masthead glyph, replaces 📈 (see structural_changes #1) */
+/* amber index-tick masthead glyph: largest of the tick family (--tick-l) — the masthead is the one always-live anchor */
 header h1::before{
-  content:""; width:3px; height:17px; border-radius:1px;
+  content:""; width:3px; height:var(--tick-l); border-radius:1px;
   background:var(--accent); box-shadow:0 0 10px var(--accent-line); flex:none;
 }
 header .sub{
@@ -1880,7 +1890,7 @@ header .sub b,header .sub .mono{
   grid-template-columns:repeat(4,1fr);
   gap:0;
   padding:0;
-  margin:20px 28px 4px;
+  margin:var(--s5) var(--s7) var(--s1);
   background:var(--panel);
   border:1px solid var(--line);
   border-radius:var(--r-card);
@@ -1889,7 +1899,7 @@ header .sub b,header .sub .mono{
 .kpi{
   position:relative;
   background:none; border:0; border-radius:0; box-shadow:none;
-  padding:15px 20px;
+  padding:var(--s4) var(--s5);
   border-left:1px solid var(--line);
   border-top:1px solid var(--line);
   transition:background-color .18s var(--ease);
@@ -2049,24 +2059,23 @@ body.ready .row.sel .pnl,body.ready .row.sel .meta{animation:dataFlick .26s ease
   background:var(--panel);
   border:1px solid var(--line);
   border-radius:var(--r-card);
-  padding:20px 22px;
-  margin-bottom:16px;
+  padding:var(--s5);
+  margin-bottom:var(--s4);
   box-shadow:none;
 }
-.dh{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:4px}
+.dh{display:flex; align-items:baseline; gap:var(--s3); flex-wrap:wrap; margin-bottom:var(--s1)}
 .dh .t{
-  font-family:var(--f-disp); font-size:20px; font-weight:600;
+  font-family:var(--f-disp); font-size:var(--t-xl); font-weight:600;
   letter-spacing:-.01em; color:var(--txt);
-  display:flex; align-items:center; gap:9px;
+  display:flex; align-items:center; gap:var(--s2);
   margin:0; padding:0;   /* h2 default margins reset — visual unchanged from when .t was a div/span */
 }
-/* card-title tick: decorative, NOT state. Demoted from --accent to --faint so amber stays rationed for "you are here / live / active" cues only (one-rationed-accent contract).
-   The ::before is kept as a structural rhythm marker; it just doesn't compete with the live-amber elements for attention. */
+/* card-title tick: decorative rhythm marker only — neutral grey, not amber (amber is reserved for live/active state cues) */
 .dh .t::before{
-  content:""; width:3px; height:15px; border-radius:1px;
+  content:""; width:3px; height:var(--tick-s); border-radius:1px;
   background:var(--line); flex:none;
 }
-.dh .nm{font-family:var(--f-ui); color:var(--mut); font-size:11.5px; font-weight:400}
+.dh .nm{font-family:var(--f-ui); color:var(--mut); font-size:var(--t-xs); font-weight:400}
 
 /* a section caption helper to replace inline font-weight:650 divs (structural_changes #3) */
 /* NOTE: legacy caption normalizer — matches by inline-style substring, a foot-gun.
@@ -2087,20 +2096,20 @@ body.ready .row.sel .pnl,body.ready .row.sel .meta{animation:dataFlick .26s ease
 .seg input:focus,.seg textarea:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft)}
 
 /* ============================== BADGES ============================== */
-.badges{display:flex; gap:28px; row-gap:14px; flex-wrap:wrap; margin:18px 0 8px}
+.badges{display:flex; gap:var(--s6); row-gap:var(--s3); flex-wrap:wrap; margin:var(--s4) 0 var(--s2)}
 .badge .l{
   font-family:var(--f-ui); color:var(--mut); font-size:10px; font-weight:600;
-  text-transform:uppercase; letter-spacing:.07em; margin-bottom:4px;
+  text-transform:uppercase; letter-spacing:.07em; margin-bottom:var(--s1);
 }
-.badge .v{font-family:var(--f-mono); font-size:16px; font-weight:500; color:var(--txt)}
-.badge .v .note{font-family:var(--f-ui); font-size:11px}
+.badge .v{font-family:var(--f-mono); font-size:var(--t-md); font-weight:500; color:var(--txt)}
+.badge .v .note{font-family:var(--f-ui); font-size:var(--t-xs)}
 .pos{color:var(--green)} .neg{color:var(--red)}
 
 /* ============================== LEGEND ============================== */
 .legend{
-  display:flex; gap:14px; row-gap:6px; flex-wrap:wrap;
+  display:flex; gap:var(--s3); row-gap:var(--s1); flex-wrap:wrap;
   font-family:var(--f-ui); font-size:10.5px; color:var(--mut);
-  margin:10px 0 6px; align-items:center;
+  margin:var(--s2) 0 var(--s1); align-items:center;
 }
 .legend i{
   display:inline-block; width:9px; height:9px; border-radius:2px;
@@ -2178,7 +2187,7 @@ tbody tr:hover{background:var(--panel2)}
 .tag.b{background:rgba(79,178,134,.12); color:var(--green)}
 .tag.s{background:rgba(229,112,122,.12); color:var(--red)}
 .tag.o{background:var(--panel2); color:var(--mut)}
-.note{font-family:var(--f-ui); color:var(--mut); font-size:11.5px; line-height:1.7}
+.note{font-family:var(--f-ui); color:var(--mut); font-size:var(--t-sm); line-height:1.7}
 .note b{color:var(--txt); font-weight:600}
 .scroll{max-height:420px; overflow:auto; border-radius:var(--r-card); border:1px solid var(--hair)}
 details{margin-top:6px}
@@ -2299,7 +2308,8 @@ details[open] summary::before{content:"▾ "}
 :root{--viewbar-h:50px}
 /* Desktop: hide the inline attn chip (the dedicated 关注度 column carries the signal) */
 .attn-inline{display:none}
-@media (max-width:980px){
+/* Tablet / landscape phone breakpoint: extend to landscape iPhones (max-height:500px) so they don't drop into desktop layout */
+@media (max-width:980px), (orientation:landscape) and (max-height:500px){
   .kpis{grid-template-columns:repeat(2,1fr)}
   .kpi:nth-child(4n+1){border-left:1px solid var(--line)}
   .kpi:nth-child(2n+1){border-left:0}
@@ -2314,24 +2324,36 @@ details[open] summary::before{content:"▾ "}
   .seg-rail button.on::after{left:11px; right:11px}
   header .sub{margin-left:0; text-align:left; width:100%; overflow-wrap:anywhere; text-transform:none; letter-spacing:.04em}
 }
-@media (max-width:560px){
+/* Phone breakpoint: also fires on landscape iPhones so the mobile chrome diet applies there too */
+@media (max-width:560px), (orientation:landscape) and (max-height:500px){
   /* phone: single-column KPIs with clamped values, no clipping */
   .kpis{grid-template-columns:1fr; margin:12px 12px 4px}
   /* on a stock detail view, the portfolio-wide KPI strip is irrelevant context — hide it so stock data is the first thing seen.
      Push #right down by the header height so the sticky viewbar (top:84) doesn't render behind the sticky header at scrollY=0 */
   body[data-view="stock"] .kpis{display:none}
   body[data-view="stock"] .right{padding-top:8px}   /* small breathing room above viewbar at top of page */
-  body[data-view="stock"] .wrap{padding-top:96px}   /* push past the sticky header so the viewbar's natural position is below it (sticky's resting state) */
+  body[data-view="stock"] .wrap{padding-top:calc(var(--header-h) + var(--s3))}   /* push past the sticky header so the viewbar's natural position is below it */
   .kpi{border-left:0!important; padding:12px 14px}
   .kpi:nth-child(-n+2){border-top:1px solid var(--line)}
   .kpi:first-child{border-top:0}
   .kpi .v{font-size:18px; white-space:normal; overflow-wrap:anywhere}
   .kpi:first-child .v{font-size:20px}
-  .wrap{padding:12px 12px 40px; gap:14px}
-  header{padding:14px 14px 0}
+  .wrap{padding:var(--s3) var(--s3) var(--s7); gap:var(--s3)}
+  /* MOBILE CHROME DIET: ~80px saved before content shows.
+     header: padding tightened, .sub hidden, h1 ticked down — claws back ~36px
+     viewbar: recent-chips strip hidden (still on the chip strip in overview, but not eating sticky real estate)
+     --header-h overridden so the sticky-stack (viewbar at top:--header-h, seg-rail below it) auto-recomputes. */
+  :root{--header-h:48px}
+  header{padding:var(--s2) var(--s3); gap:var(--s2)}
+  header h1{font-size:var(--t-md)}
+  header h1::before{height:14px}
+  header .sub{display:none}
+  /* on stock view, hide the secondary "最近" chips row in the viewbar (still reachable via overview banner) */
+  body[data-view="stock"] .viewbar .view-actions .recent-chip,
+  body[data-view="stock"] .viewbar .view-actions:nth-of-type(2){display:none}
   /* keep the back-button + breadcrumb visible after scrolling so the trader is never trapped below the fold.
-     top:84px sits BELOW the sticky page header (header is z:20, height ≈84px); z:16 keeps us under header and above content */
-  .viewbar{position:sticky; top:84px; z-index:16; background:var(--bg); align-items:center; flex-direction:row; flex-wrap:wrap; gap:8px; padding:10px 0 8px; margin:0 0 10px; border-bottom:1px solid var(--hair)}
+     top:var(--header-h) sits BELOW the sticky page header (z:20); viewbar z:16 keeps it under header and above content */
+  .viewbar{position:sticky; top:var(--header-h); z-index:16; background:var(--bg); align-items:center; flex-direction:row; flex-wrap:wrap; gap:var(--s2); padding:var(--s2) 0; margin:0 0 var(--s2); border-bottom:1px solid var(--hair)}
   .viewbar .trail{flex:1 1 auto; min-width:0}
   .view-actions{justify-content:flex-end}
   .microbtn{min-height:44px; padding:11px 14px; font-size:13px}   /* 44pt iOS-recommended tap target */
@@ -2341,7 +2363,7 @@ details[open] summary::before{content:"▾ "}
   .seg-rail{
     flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden;
     scroll-snap-type:x proximity; -webkit-overflow-scrolling:touch;
-    position:sticky; top:calc(84px + var(--viewbar-h, 50px)); z-index:14; background:var(--bg);
+    position:sticky; top:calc(var(--header-h) + var(--viewbar-h, 50px)); z-index:14; background:var(--bg);
   }
   .seg-rail::after{content:"›"; position:sticky; right:0; padding:6px 8px; color:var(--mut); background:linear-gradient(90deg,transparent,var(--bg) 40%); pointer-events:none; align-self:center; font-size:18px}
   .seg-rail button{flex:0 0 auto; min-height:44px; padding:13px 14px; font-size:13px; scroll-snap-align:start}   /* 44pt min-height for one-handed thumb hits */
@@ -2554,6 +2576,8 @@ function activateSeg(seg,opts){
  let b=r.querySelector('.seg-rail [data-seg="'+seg+'"]')||r.querySelector('.seg-rail button');
  if(!b)return null;
  const chosen=b.dataset.seg;
+ // overview panels are lazy-rendered — if the user clicks before idle-prefetch fills this panel, render it now
+ if(sel==='__OV__'&&typeof ensureOvPanel==='function')ensureOvPanel(chosen);
  r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
  r.querySelectorAll('.seg').forEach(p=>{p.hidden=p.dataset.seg!==chosen;});
  if(!routeApplying)rememberSeg(sel==='__OV__'?'ov':'stk',chosen);   // don't overwrite user's last-chosen tab during back/forward replay
@@ -3146,54 +3170,84 @@ function qqqTqqqTab(){
  ${spreadCard}
  ${legs}`;
 }
-function renderOverview(){
- CHARTREG={};
- const ser=DATA.series||[],right=document.getElementById('right');
- if(ser.length<2){const _ins0=document.getElementById('insight');if(_ins0)_ins0.innerHTML=onboardStrip();right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
- const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn;
+// Panel renderers for the overview: each returns HTML for its seg panel. Called on demand by ensureOvPanel().
+// Lazy-rendering cuts initial paint from ~267KB innerHTML to ~30KB; deferred panels populate after first paint via requestIdleCallback.
+function _ovPanelEnv(){
+ const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,ser=DATA.series||[];
  const cards=[
   ['当前持仓市值',fmt(S.netWorthNow)],
   ['期初持仓市值',fmt(S.netWorthStart)],
   ['选股策略本身的收益 ('+gl('TWR','时间加权 TWR')+')',`<span class="${cls(pr)}">${pct(pr)}</span>`],
   ['你的钱实际经历的收益 ('+gl('MWR','资金加权 MWR')+')',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`],
   ['你的钱年化收益 ('+gl('XIRR','XIRR')+')',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span> <span class="note">数月年化·非预测</span>`],
-  /* gap tile colored by NEGATED gap on purpose: +gap = dollars lagged TWR -> red. Do NOT change to cls(S.behaviorGap). */
   ['择时帮了还是拖了 ('+gl('gap','行为缺口')+')',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
   ['同期 纳斯达克',nq==null?'—':`<span class="${cls(nq)}">${pct(nq)}</span>`],
   ['比大盘多赚 / 少赚 ('+gl('alpha','超额 vs S&P500')+')',sp==null?'—':`<span class="${cls(pr-sp)}">${ppf(pr-sp)}</span>`],
  ];
+ return {pr,sp,nq,ser,cards};
+}
+const PANEL_RENDERERS_OV={
+ score: ()=>scorecardCard(),
+ qt:    ()=>qqqTqqqTab(),
+ nw:    ()=>{const e=_ovPanelEnv();
+   return wholeAccountCard()+optionsExposureCard()+optionsSpreadLedgerCard()+diagnosticsCard()+
+     `<div class="card"><div class="dh"><h2 class="t">组合总览</h2><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部"全账户"卡片）</span></div>`+
+     `<div class="badges">${e.cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div></div>`+
+     `<div class="card"><div class="cap" style="margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>`+
+     `<div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#E8B339">琥珀=强(&gt;15)</span> / <span style="color:#9A8A4A">浅琥珀=中性</span> / <span style="color:#6B7079">灰=弱(&lt;-15)</span>，用来对照净值看择时节奏</span></div>`+
+     nwChart(e.ser)+
+     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这条是<b>持仓总市值（$，含入金）</b>——净值上升可能来自<b>入金而非盈利</b>。要看真金白银的回报，去"指数对比"的 ${gl('TWR','TWR')} 与本卡下方"真金白银桥"的 ${gl('MWR','MWR')}。底部色带 = 组合加权动能，仅供对照择时节奏。<b>非投资建议。</b></div></div>`+
+     bridgeCard();
+ },
+ pfib:  ()=>portfolioFibCard(),
+ cmp:   ()=>{const e=_ovPanelEnv();
+   return `<div class="card"><div class="cap" style="margin-bottom:4px">累计收益率对比（%，时间加权）</div>`+
+     `<div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&amp;P 500</span><span><i style="background:#B6BAC1"></i>纳斯达克综合</span></div>`+
+     svgLines(e.ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#B6BAC1',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})+
+     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这三条都是<b>时间加权(TWR)</b>——只评判选股 / 策略本身，<b>剔除了你出入金的时点</b>，所以 ≠ 你的钱实际赚到的回报（你的钱真实经历看"净值"里的 <b>MWR</b>）。虚线为基准，<b>悬停看超额(pp)</b>，即我的组合(琥珀)与 S&amp;P(灰虚线)之间的差距。<b>非投资建议。</b></div></div>`+
+     contributionCard();
+ },
+ sig:   ()=>positionSignalsCard()+resonanceCard()+fibRanking(),
+ beh:   ()=>behaviorCard(),
+ risk:  ()=>riskCard(),
+ struct:()=>structureCard(),
+ journal:()=>journalCard(),
+ rebal: ()=>rebalancePlanner(),
+};
+const PANEL_AFTER_RENDER_OV={
+ rebal: ()=>{try{wireRebal();}catch(e){}},
+ journal:()=>{try{wireJournalTab();}catch(e){}},
+};
+// Ensure a single OV panel is rendered; called on first activation. No-op if already populated.
+function ensureOvPanel(seg){
+ if(sel!=='__OV__')return;
+ const panel=document.querySelector('#right .seg[data-seg="'+seg+'"]');
+ if(!panel||panel.innerHTML.trim()!=='')return;
+ const rdr=PANEL_RENDERERS_OV[seg];if(!rdr)return;
+ try{panel.innerHTML=rdr();}catch(e){console.warn('panel render failed',seg,e);panel.innerHTML='<div class="note">面板渲染失败</div>';return;}
+ const after=PANEL_AFTER_RENDER_OV[seg];if(after)after();
+}
+function renderOverview(){
+ CHARTREG={};
+ const ser=DATA.series||[],right=document.getElementById('right');
+ if(ser.length<2){const _ins0=document.getElementById('insight');if(_ins0)_ins0.innerHTML=onboardStrip();right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=onboardStrip()+insightBanner();
+ // Render skeleton: viewbar + seg-rail + 11 empty seg panels. ensureOvPanel() populates each on first activate.
+ // activeSeg from URL is rendered eagerly so the initial paint has actual content.
+ const initialSeg=lastSeg('ov')||DEFAULT_SEG.ov;
+ const segs=['score','qt','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'];
+ const panelMarkup=segs.map(s=>`<div class="seg" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
  ${viewBarOverview()}
  <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><span class="seg-grp">决策</span><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><span class="seg-grp">风险</span><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值 · 全账户</button><button data-seg="risk" title="哪只仓位贡献了最多波动">风险</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><span class="seg-grp">表现</span><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">斐波那契·技术</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><span class="seg-grp">记录</span><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
- <div class="seg" data-seg="score">`+scorecardCard()+`</div>
- <div class="seg" data-seg="qt" hidden>`+qqqTqqqTab()+`</div>
- <div class="seg" data-seg="nw" hidden>`+wholeAccountCard()+optionsExposureCard()+optionsSpreadLedgerCard()+diagnosticsCard()+`
- <div class="card">
-   <div class="dh"><h2 class="t">组合总览</h2><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部“全账户”卡片）</span></div>
-   <div class="badges">${cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div>
- </div>
- <div class="card"><div class="cap" style="margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>
-   <div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#E8B339">琥珀=强(>15)</span> / <span style="color:#9A8A4A">浅琥珀=中性</span> / <span style="color:#6B7079">灰=弱(<-15)</span>，用来对照净值看择时节奏</span></div>
-   ${nwChart(ser)}
-   <div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这条是<b>持仓总市值（$，含入金）</b>——净值上升可能来自<b>入金而非盈利</b>。要看真金白银的回报，去“指数对比”的 ${gl('TWR','TWR')} 与本卡下方“真金白银桥”的 ${gl('MWR','MWR')}。底部色带 = 组合加权动能，仅供对照择时节奏。<b>非投资建议。</b></div></div>${bridgeCard()}
- </div>
- <div class="seg" data-seg="pfib" hidden>`+portfolioFibCard()+`</div>
- <div class="seg" data-seg="cmp" hidden>
- <div class="card"><div class="cap" style="margin-bottom:4px">累计收益率对比（%，时间加权）</div>
-   <div class="legend"><span><i style="background:#E8B339"></i>我的组合</span><span><i style="background:#888D96"></i>S&P 500</span><span><i style="background:#B6BAC1"></i>纳斯达克综合</span></div>
-   ${svgLines(ser,[{key:'ret',color:'#E8B339',label:'我的组合'},{key:'sp500',color:'#888D96',dash:1,label:'S&P'},{key:'nasdaq',color:'#B6BAC1',dash:1,label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})}
-   <div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这三条都是<b>时间加权(TWR)</b>——只评判选股 / 策略本身，<b>剔除了你出入金的时点</b>，所以 ≠ 你的钱实际赚到的回报（你的钱真实经历看“净值”里的 <b>MWR</b>）。虚线为基准，<b>悬停看超额(pp)</b>，即我的组合(琥珀)与 S&P(灰虚线)之间的差距。<b>非投资建议。</b></div></div>
- `+contributionCard()+`
- </div>
- <div class="seg" data-seg="sig" hidden>`+positionSignalsCard()+resonanceCard()+fibRanking()+`</div>
- <div class="seg" data-seg="beh" hidden>`+behaviorCard()+`</div>
- <div class="seg" data-seg="risk" hidden>`+riskCard()+`</div>
- <div class="seg" data-seg="struct" hidden>`+structureCard()+`</div>
- <div class="seg" data-seg="journal" hidden>`+journalCard()+`</div>
- <div class="seg" data-seg="rebal" hidden>`+rebalancePlanner()+`</div>`;
- segWire();wireRebal();wireJournalTab();bindCharts();updateCtx();renderOptSec();   // restoreSeg removed — URL is now source of truth; applyRoute already activated the right seg
+ ${panelMarkup}`;
+ // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
+ ensureOvPanel(initialSeg);
+ segWire();bindCharts();updateCtx();renderOptSec();
+ // Idle-prefetch other panels so subsequent tab clicks are instant. Skipped on browsers without rIC.
+ const _ric=window.requestIdleCallback||function(cb){return setTimeout(()=>cb({didTimeout:false,timeRemaining:()=>1}),200);};
+ segs.forEach((s,i)=>{if(s===initialSeg)return;_ric(()=>ensureOvPanel(s),{timeout:1500+i*250});});
 }
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
