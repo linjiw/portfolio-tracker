@@ -88,6 +88,65 @@ class AiSemiQuantTests(unittest.TestCase):
         self.assertIn("AI-SemiQuant Reference Report", report)
         self.assertIn("Capital Waterfall", report)
 
+    def test_small_peer_group_percentile_display_is_not_rank_like(self):
+        rows, _ = aiq.build_scores(prices=None, exposures={})
+        tsm = next(row for row in rows if row["ticker"] == "TSM")
+
+        self.assertEqual(tsm["peerGroupSize"], 1)
+        self.assertEqual(tsm["peerPercentileDisplay"], "N/A · n=1")
+
+    def test_allow_dd_reason_includes_peer_confirmation_when_available(self):
+        rows = [
+            {
+                "ticker": "A",
+                "finalScore": 69,
+                "strategicRankScore": 83,
+                "tacticalScore": 50,
+                "peerGroup": "HBM Equipment",
+                "gate": "ALLOW_DD",
+                "gateReasons": [{"rule": "dd_candidate", "detail": "old reason"}],
+            },
+            {"ticker": "B", "finalScore": 60, "strategicRankScore": 65, "tacticalScore": 40, "peerGroup": "HBM Equipment", "gate": "BLOCK", "gateReasons": []},
+            {"ticker": "C", "finalScore": 62, "strategicRankScore": 66, "tacticalScore": 42, "peerGroup": "HBM Equipment", "gate": "BLOCK", "gateReasons": []},
+            {"ticker": "D", "finalScore": 64, "strategicRankScore": 67, "tacticalScore": 44, "peerGroup": "HBM Equipment", "gate": "BLOCK", "gateReasons": []},
+        ]
+
+        aiq.annotate_percentiles(rows)
+        detail = rows[0]["gateReasons"][0]["detail"]
+
+        self.assertIn("ALLOW_DD because strategic score 83 >= 82", detail)
+        self.assertIn("peer percentile P88 >= 70", detail)
+        self.assertIn("below WATCH threshold", detail)
+
+    def test_model_card_lists_named_data_quality_flags(self):
+        rows = [
+            {
+                "ticker": "MU",
+                "name": "Micron",
+                "gate": "WATCH_RESET",
+                "trendScore": 70,
+                "market": {"available": True, "marketCapUsd": 1},
+                "dataQualitySeverity": "soft_review",
+                "dataQualityReasons": [{"rule": "price_band_outlier", "detail": "price 4.4x 252D median"}],
+            },
+            {
+                "ticker": "WYN",
+                "name": "Wiwynn",
+                "gate": "DATA_REVIEW",
+                "trendScore": 40,
+                "market": {"available": True, "marketCapUsd": 1},
+                "dataQualitySeverity": "hard_review",
+                "dataQualityReasons": [{"rule": "daily_return_outlier", "detail": "1D return 210%"}],
+            },
+        ]
+
+        card = aiq.model_card(rows, latest_date="2026-06-22")
+
+        self.assertEqual(card["softDataReviewCount"], 1)
+        self.assertEqual(card["softDataFlags"][0]["ticker"], "MU")
+        self.assertEqual(card["softDataFlags"][0]["rule"], "price_band_outlier")
+        self.assertEqual(card["hardDataFlags"][0]["ticker"], "WYN")
+
     def test_non_usd_local_price_display_does_not_use_usd_symbol(self):
         self.assertEqual(aiq.fmt_local_money(349500, "KRW"), "₩349,500")
         self.assertEqual(aiq.fmt_local_money(4865, "TWD"), "NT$4,865")

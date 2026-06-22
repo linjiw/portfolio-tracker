@@ -51,17 +51,17 @@ The structural Alpha Score is a weighted score from 0 to 100:
 
 | Factor | Weight | Question |
 | --- | ---: | --- |
-| Pricing Power | 25% | Can the company raise price or ration scarce capacity? |
-| Profit Elasticity | 20% | Does incremental revenue drop quickly to profit after utilization rises? |
-| Capex Conversion | 20% | Does customer/fab capex become this company's backlog and revenue? |
-| Valuation/Growth | 20% | Is expected growth still reasonable versus valuation and expectations? |
-| Size/Growth Torque | 15% | Does a smaller market cap create credible upside elasticity, after growth quality and business quality are checked? |
+| Pricing Power | 30% | Can the company raise price or ration scarce capacity? |
+| Profit Elasticity | 24% | Does incremental revenue drop quickly to profit after utilization rises? |
+| Capex Conversion | 24% | Does customer/fab capex become this company's backlog and revenue? |
+| Valuation/Growth | 22% | Is expected growth still reasonable versus valuation and expectations? |
 
-The new Size/Growth Torque factor exists because the same business growth rate
-can produce very different equity outcomes at different starting market caps. A
-$15B company with a real bottleneck position can compound or re-rate faster than
-a $2T company, but a small cap without pricing power or capex conversion should
-not be rewarded just for being small.
+Size/Growth Torque is a separate overlay, not a fifth structural factor. It
+exists because the same business growth rate can produce very different equity
+outcomes at different starting market caps. A $15B company with a real
+bottleneck position can compound or re-rate faster than a $2T company, but a
+small cap without pricing power or capex conversion should not be rewarded just
+for being small.
 
 The factor is therefore computed as:
 
@@ -109,6 +109,8 @@ structuralBaseScore
 torqueAdjustedScore
 universePercentile
 peerPercentile
+peerGroupSize
+peerPercentileDisplay
 ```
 
 Momentum is peer-relative rather than a simple absolute trend score. The
@@ -121,7 +123,7 @@ Data-quality issues do not become silent zero scores. Missing prices, missing
 FX conversion, missing market cap, extreme 1D/5D returns, extreme 3M returns or
 price bands far outside the trailing median reduce `dataQualityScore`; severe
 anomalies produce `DATA_REVIEW` instead of a normal `BLOCK`. Soft anomalies stay
-ranked but are listed in the model card.
+ranked but are listed by ticker, rule and reason in the model card.
 
 v0.3 also separates structural quality from payoff convexity:
 
@@ -132,6 +134,41 @@ torqueAdjustedScore = structuralBaseScore + size/growth torque bonus - fragility
 
 `sizeGrowthTorque` is an overlay, not a moat. It can help smaller high-quality
 names, but customer concentration, volatility, and overextension can offset it.
+
+## v0.3.1 Audit Cleanup
+
+Peer percentiles are only user-facing when the peer group has enough breadth.
+The raw `peerPercentile` remains in JSON for diagnostics, but the dashboard uses
+`peerPercentileDisplay`:
+
+```text
+peerGroupSize < 3  ->  N/A · n=1 or N/A · n=2
+peerGroupSize >= 3 ->  P83 · n=6
+```
+
+This prevents a single-company peer group such as TSMC's advanced
+foundry/CoWoS bucket from looking like a statistically meaningful median rank.
+
+`ALLOW_DD` explanations now state why the name is in due diligence instead of
+an execution plan. A peer-confirmed case is phrased like:
+
+```text
+ALLOW_DD because strategic score 83 >= 82 and peer percentile P75 >= 70;
+despite adjusted score 69 below WATCH threshold.
+```
+
+Small-sample or weak-peer cases say that explicitly. This keeps `ALLOW_DD` as a
+research permission, not a buy signal.
+
+The model card now exports:
+
+```text
+softDataFlags[]
+hardDataFlags[]
+```
+
+Each flag carries ticker, company name, severity, rule and detail so the audit
+panel can be inspected without opening the raw JSON.
 
 ## Research Gates
 

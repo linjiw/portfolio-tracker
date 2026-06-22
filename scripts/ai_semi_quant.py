@@ -77,7 +77,7 @@ CURRENCY_SYMBOLS = {
 }
 
 GATE_ORDER = ("ALLOW_PLAN", "ALLOW_DD", "WATCH", "WATCH_RESET", "PORTFOLIO_BLOCK", "BLOCK", "DATA_REVIEW")
-MODEL_VERSION = "0.3"
+MODEL_VERSION = "0.3.1"
 RISK_FLOOR = 35
 MAX_SINGLE_POSITION_WEIGHT = 20.0
 
@@ -505,6 +505,14 @@ def percentile_int(value: Optional[float], values: Iterable[Optional[float]]) ->
     if not finite(value):
         return None
     return int(round(clamp(pct_rank(value, values))))
+
+
+def peer_percentile_display(percentile: Optional[int], peer_count: int) -> str:
+    if peer_count < 3:
+        return f"N/A · n={peer_count}"
+    if percentile is None:
+        return f"— · n={peer_count}"
+    return f"P{percentile} · n={peer_count}"
 
 
 def pct_change(values, days: int) -> Optional[float]:
@@ -1113,11 +1121,48 @@ def annotate_percentiles(rows: List[dict]) -> None:
         by_peer.setdefault(row.get("peerGroup") or "Other", []).append(row)
     for row in rows:
         peers = by_peer.get(row.get("peerGroup") or "Other", [])
+        peer_count = len(peers)
+        peer_pct = percentile_int(row.get("finalScore"), [p.get("finalScore") for p in peers])
+        peer_strategic_pct = percentile_int(row.get("strategicRankScore"), [p.get("strategicRankScore") for p in peers])
         row["universePercentile"] = percentile_int(row.get("finalScore"), final_scores)
         row["strategicPercentile"] = percentile_int(row.get("strategicRankScore"), strategic_scores)
         row["tacticalPercentile"] = percentile_int(row.get("tacticalScore"), tactical_scores)
-        row["peerPercentile"] = percentile_int(row.get("finalScore"), [p.get("finalScore") for p in peers])
-        row["peerStrategicPercentile"] = percentile_int(row.get("strategicRankScore"), [p.get("strategicRankScore") for p in peers])
+        row["peerGroupSize"] = peer_count
+        row["peerPercentile"] = peer_pct
+        row["peerStrategicPercentile"] = peer_strategic_pct
+        row["peerPercentileDisplay"] = peer_percentile_display(peer_pct, peer_count)
+        row["peerStrategicPercentileDisplay"] = peer_percentile_display(peer_strategic_pct, peer_count)
+        if row.get("gate") == "ALLOW_DD":
+            row["gateReasons"] = allow_dd_gate_reasons(row)
+
+
+def allow_dd_gate_reasons(row: dict) -> List[dict]:
+    strategic = row.get("strategicRankScore")
+    final = row.get("finalScore")
+    peer_count = row.get("peerGroupSize") or 0
+    peer_pct = row.get("peerPercentile")
+    if peer_count < 3:
+        peer_clause = f"; peer sample n={peer_count} is too small for percentile confirmation"
+        row["allowDdBasis"] = "strategic_small_peer_sample"
+    elif peer_pct is not None and peer_pct >= 70:
+        peer_clause = f" and peer percentile P{peer_pct} >= 70"
+        row["allowDdBasis"] = "strategic_peer_confirmed"
+    else:
+        peer_label = f"P{peer_pct}" if peer_pct is not None else "unavailable"
+        peer_clause = f"; peer percentile {peer_label} is not a strong peer confirmation"
+        row["allowDdBasis"] = "strategic_only"
+    if final is not None and final < 70:
+        score_clause = f"despite adjusted score {final} below WATCH threshold."
+    elif final is not None and final < 82:
+        score_clause = f"adjusted score {final} remains below ALLOW_PLAN threshold and still needs trigger/risk review."
+    else:
+        score_clause = "ALLOW_PLAN still needs trend, valuation, or risk confirmation."
+    reason = {
+        "rule": "dd_candidate",
+        "detail": f"ALLOW_DD because strategic score {strategic} >= 82{peer_clause}; {score_clause}",
+    }
+    existing = [r for r in (row.get("gateReasons") or []) if r.get("rule") != "dd_candidate"]
+    return [reason, *existing[:2]]
 
 
 def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], Optional[str]]:
@@ -1250,7 +1295,9 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
     anomalies = []
     for r in rows:
         for reason in r.get("dataQualityReasons") or []:
-            anomalies.append({"ticker": r["ticker"], "severity": r.get("dataQualitySeverity"), **reason})
+            anomalies.append({"ticker": r["ticker"], "name": r.get("name"), "severity": r.get("dataQualitySeverity"), **reason})
+    soft_flags = [a for a in anomalies if a.get("severity") == "soft_review"]
+    hard_flags = [a for a in anomalies if a.get("severity") == "hard_review"]
     return {
         "modelVersion": MODEL_VERSION,
         "dataDate": latest_date,
@@ -1270,6 +1317,8 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
             "allowDdStrategicScore": 82,
         },
         "largestDataAnomalies": anomalies[:8],
+        "softDataFlags": soft_flags[:8],
+        "hardDataFlags": hard_flags[:8],
     }
 
 
@@ -1315,8 +1364,8 @@ def render_report(doc: dict) -> str:
             "",
             "## Top Ranked Names",
             "",
-            "| Rank | Ticker | Company | Node | Gate | Final | %ile | Standalone | Structural | Torque Adj. | Size/Growth | Mkt Cap | Price | Tactical | Risk | Main Gate Reason |",
-            "| ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |",
+            "| Rank | Ticker | Company | Node | Gate | Final | %ile | Peer rank | Standalone | Structural | Torque Adj. | Size/Growth | Mkt Cap | Price | Tactical | Risk | Main Gate Reason |",
+            "| ---: | --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |",
         ]
     )
     for i, row in enumerate(top_rows, 1):
@@ -1324,7 +1373,7 @@ def render_report(doc: dict) -> str:
         reason = (row.get("gateReasons") or [{}])[0]
         lines.append(
             f"| {i} | {row['ticker']} | {row['name']} | {row['node']} | {row['gate']} | "
-            f"{row['finalScore']} | {row.get('universePercentile', '-')} | {row['standaloneScore']} | {row['structuralScore']} | {row.get('torqueAdjustedScore', '-')} | {row['factors'].get('sizeGrowthTorque', '-')} | "
+            f"{row['finalScore']} | {row.get('universePercentile', '-')} | {row.get('peerPercentileDisplay', '-')} | {row['standaloneScore']} | {row['structuralScore']} | {row.get('torqueAdjustedScore', '-')} | {row['factors'].get('sizeGrowthTorque', '-')} | "
             f"{fmt_cap(m.get('marketCapUsd'))} | {m.get('displayPrice') or '-'} | {row['tacticalScore']} | {row['riskScore']} | "
             f"{reason.get('detail', '-')} |"
         )
@@ -1370,12 +1419,15 @@ def render_report(doc: dict) -> str:
             f"- Max single-name portfolio weight: {(card.get('thresholds') or {}).get('maxSinglePositionWeight', '-')}%",
         ]
     )
-    anomalies = card.get("largestDataAnomalies") or []
-    if anomalies:
+    soft_flags = card.get("softDataFlags") or []
+    hard_flags = card.get("hardDataFlags") or []
+    if soft_flags or hard_flags:
         lines.append("")
-        lines.append("Largest data-quality flags:")
-        for anomaly in anomalies:
-            lines.append(f"- {anomaly.get('ticker')}: {anomaly.get('detail')}")
+        lines.append("Named data-quality flags:")
+        for anomaly in hard_flags:
+            lines.append(f"- HARD {anomaly.get('ticker')}: {anomaly.get('rule')} — {anomaly.get('detail')}")
+        for anomaly in soft_flags:
+            lines.append(f"- SOFT {anomaly.get('ticker')}: {anomaly.get('rule')} — {anomaly.get('detail')}")
 
     lines.extend(
         [

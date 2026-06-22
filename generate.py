@@ -3974,6 +3974,7 @@ function aiSemiQuantCard(){
  const gateChip=g=>{const c=aiqTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${g}</span>`;};
  const capFmt=v=>{if(v==null)return'—';v=Number(v);if(!isFinite(v))return'—';if(v>=1e12)return'$'+(v/1e12).toFixed(2)+'T';if(v>=1e9)return'$'+(v/1e9).toFixed(1)+'B';if(v>=1e6)return'$'+(v/1e6).toFixed(0)+'M';return'$'+Math.round(v).toLocaleString('en-US');};
  const reasonTxt=r=>{const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return x.length>92?x.slice(0,89)+'...':x;};
+ const peerRankTxt=r=>r.peerPercentileDisplay||((r.peerGroupSize!=null&&r.peerGroupSize<3)?`N/A · n=${r.peerGroupSize}`:`P${r.peerPercentile??'—'}${r.peerGroupSize!=null?' · n='+r.peerGroupSize:''}`);
  const top=leaders.map(x=>`<span class="chip" style="color:${aiqScoreColor(x.score)};border-color:${chipBd(aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' ');
  const rankChips=(arr,key)=>((arr||[]).map(x=>`<span class="chip" style="color:${key==='tactical'?'#6FA8DC':aiqScoreColor(x.score)};border-color:${chipBd(key==='tactical'?'#6FA8DC':aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' '));
  const cards=[
@@ -3989,7 +3990,7 @@ function aiSemiQuantCard(){
    <td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td>
    <td class="l">${r.node}<br><span class="note">${r.role}</span></td>
    <td>${gateChip(r.gate)}</td>
-   <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore}</span><br><span class="note">P${r.universePercentile??'—'} / peer P${r.peerPercentile??'—'}</span></td>
+   <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore}</span><br><span class="note">P${r.universePercentile??'—'} / peer ${peerRankTxt(r)}</span></td>
    <td>${r.structuralScore??'—'} → ${r.torqueAdjustedScore??'—'}<br><span class="note">torque +${r.torqueBonus||0} / fragile -${r.fragilityPenalty||0}</span></td>
    <td>${(r.factors||{}).sizeGrowthTorque??'—'}<br><span class="note">${capFmt(m.marketCapUsd)} · ${m.marketCapBucket||'—'}</span></td>
    <td>${r.tacticalScore}<br><span class="note">趋 ${r.trendScore} / 险 ${r.riskScore}</span></td>
@@ -4020,6 +4021,8 @@ function aiSemiQuantCard(){
   ['Risk floor',(model.thresholds||{}).riskFloor??'—'],
   ['Single-name cap',((model.thresholds||{}).maxSinglePositionWeight??'—')+'%'],
  ].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+ const hardFlags=(model.hardDataFlags||[]).slice(0,8),softFlags=(model.softDataFlags||[]).slice(0,8);
+ const flagRows=hardFlags.concat(softFlags).map(f=>`<tr><td class="l"><b>${f.ticker||'—'}</b><br><span class="note">${f.name||''}</span></td><td>${f.severity||'—'}</td><td class="l">${f.rule||'—'}</td><td class="l">${f.detail||'—'}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No named data-quality flags.</td></tr>';
  const tacticalRaw=sum.tacticalLeadersRaw||[],tacticalInv=sum.tacticalLeadersInvestable||[];
  const tacticalRows=Array.from({length:Math.max(tacticalRaw.length,tacticalInv.length)}).map((_,i)=>{const a=tacticalRaw[i]||{},b=tacticalInv[i]||{};return `<tr><td>${i+1}</td><td class="l">${a.ticker||'—'}</td><td>${a.score??'—'}</td><td>${a.gate?gateChip(a.gate):'—'}</td><td class="l">${b.ticker||'—'}</td><td>${b.score??'—'}</td><td>${b.gate?gateChip(b.gate):'—'}</td></tr>`;}).join('');
  const riskRows=D.scores.slice(0,12).map(r=>{const b=r.riskBreakdown||{};return `<tr><td class="l">${r.ticker}</td><td>${r.riskScore}</td><td>${b.technicalOverextension||'—'}</td><td>${b.cycle||'—'}</td><td>${b.valuation||'—'}</td><td>${b.geopolitical||'—'}</td><td>${b.portfolioConcentration||'—'}</td></tr>`;}).join('');
@@ -4038,11 +4041,11 @@ function aiSemiQuantCard(){
   <div class="note" style="margin-top:10px;line-height:1.65">ALLOW_PLAN = 可进入分批计划评估；ALLOW_DD = 进入深度尽调；WATCH_RESET = 结构强但过热/风险/趋势需重置；PORTFOLIO_BLOCK = 公司质量不一定差，但组合集中度禁止继续加。任何实际下单仍要叠加 QQQ regime、组合集中度、止损和仓位上限。</div>
  </div>
  ${foldCard('资金瀑布 Capital Waterfall','钱从云厂 capex 流到瓶颈节点',`<div class="scroll"><table><thead><tr><th class="l">阶段</th><th class="l">受益标的</th><th class="l">领先指标</th></tr></thead><tbody>${wRows}</tbody></table></div>`,0,(D.capitalWaterfall||[]).length+' 段')}
- ${foldCard('资本流边权 Capital Flow Edges','静态研究图开始量化：边权 × 置信度',`<div class="scroll"><table><thead><tr><th class="l">Source</th><th class="l">Target</th><th class="l">Edge</th><th>权重</th><th>置信度</th></tr></thead><tbody>${eRows}</tbody></table></div><div class="note" style="margin-top:8px">这是 v0.2 的第一版产业资金边权；后续可接入真实订单、capex、13F/ETF/外资流来替代人工先验。</div>`,0,(D.capitalFlowEdges||[]).length+' edges')}
+ ${foldCard('资本流边权 Capital Flow Edges','静态研究图开始量化：边权 × 置信度',`<div class="scroll"><table><thead><tr><th class="l">Source</th><th class="l">Target</th><th class="l">Edge</th><th>权重</th><th>置信度</th></tr></thead><tbody>${eRows}</tbody></table></div><div class="note" style="margin-top:8px">这是 v0.3.1 的第一版产业资金边权；后续可接入真实订单、capex、13F/ETF/外资流来替代人工先验。</div>`,0,(D.capitalFlowEdges||[]).length+' edges')}
  ${foldCard('因子权重与节点均分','结构评分口径',`<div class="scroll"><table><thead><tr><th class="l">因子</th><th>权重</th><th class="l">含义</th></tr></thead><tbody>${fRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">节点</th><th>公司数</th><th>均分</th><th class="l">代表</th></tr></thead><tbody>${nRows}</tbody></table></div>`,0,'5 因子')}
  ${foldCard('Raw vs Investable Tactical','战术强弱不等于可加仓',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">Raw Tactical</th><th>分</th><th>Gate</th><th class="l">Investable Tactical</th><th>分</th><th>Gate</th></tr></thead><tbody>${tacticalRows}</tbody></table></div><div class="note" style="margin-top:8px">Raw tactical 可以包含 BLOCK / DATA_REVIEW；Investable tactical 排除 hard BLOCK、PORTFOLIO_BLOCK 和 DATA_REVIEW，避免把“信号强”误读成“可以加”。</div>`,0,'v0.3')}
  ${foldCard('风险拆分 Risk Breakdown','不是“公司好坏”，而是风险类型叠加',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>风险分</th><th>技术拥挤</th><th>周期</th><th>估值/体量</th><th>地缘</th><th>组合集中</th></tr></thead><tbody>${riskRows}</tbody></table></div>`,0,'top 12')}
- ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div>`,0,`v${model.modelVersion||'—'}`)}
+ ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flagRows}</tbody></table></div>`,0,`v${model.modelVersion||'—'}`)}
  ${foldCard('来源与边界','当前事实需要随财报 / 产业数据更新',`<ul style="margin:0;padding-left:18px;line-height:1.8">${src}</ul><div class="note" style="margin-top:10px">结构因子来自本次目标文件和参考研究的人工先验；价格和趋势来自 Yahoo Finance（如果可用）。请在财报、法说会、TrendForce/SEMI/Counterpoint 数据更新后重跑并复核。<b>非投资建议。</b></div>`,0,(D.sources||[]).length+' sources')}`;
 }
 const PANEL_RENDERERS_OV={
