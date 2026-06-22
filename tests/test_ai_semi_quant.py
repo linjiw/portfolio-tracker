@@ -190,6 +190,183 @@ class AiSemiQuantTests(unittest.TestCase):
         self.assertIn("Score +7", attr["summary"])
         self.assertGreaterEqual(len(attr["topDrivers"]), 2)
         self.assertTrue(any(d["key"] == "structureTorque" for d in attr["components"]))
+        self.assertTrue(any(d["bucket"] == "strategic_delta" for d in attr["components"]))
+        self.assertEqual(attr["bucketImpacts"]["score_delta"], 7)
+        self.assertEqual(attr["bucketImpacts"]["gate_delta"], 1.0)
+
+    def test_synthetic_delta_paths_cover_gate_risk_portfolio_and_data_quality(self):
+        rows = [
+            {
+                "companyId": "tsm",
+                "ticker": "TSM",
+                "name": "TSMC",
+                "finalScore": 82,
+                "torqueAdjustedScore": 84,
+                "tacticalScore": 62,
+                "riskScore": 68,
+                "riskPenalty": 0,
+                "portfolioPenalty": 0,
+                "gate": "ALLOW_PLAN",
+                "dataQualitySeverity": "clean",
+                "dataQualityReasons": [],
+            },
+            {
+                "companyId": "nvda",
+                "ticker": "NVDA",
+                "name": "NVIDIA",
+                "finalScore": 82,
+                "torqueAdjustedScore": 88,
+                "tacticalScore": 55,
+                "riskScore": 60,
+                "riskPenalty": 0,
+                "portfolioPenalty": 0,
+                "gate": "ALLOW_DD",
+                "dataQualitySeverity": "clean",
+                "dataQualityReasons": [],
+            },
+            {
+                "companyId": "mu",
+                "ticker": "MU",
+                "name": "Micron",
+                "finalScore": 76,
+                "torqueAdjustedScore": 76,
+                "tacticalScore": 60,
+                "riskScore": 38,
+                "riskPenalty": 0,
+                "portfolioPenalty": 0,
+                "gate": "WATCH",
+                "dataQualitySeverity": "clean",
+                "dataQualityReasons": [],
+            },
+            {
+                "companyId": "wiwynn",
+                "ticker": "6669.TW",
+                "name": "Wiwynn",
+                "finalScore": 50,
+                "torqueAdjustedScore": 50,
+                "tacticalScore": 50,
+                "riskScore": 40,
+                "riskPenalty": 0,
+                "portfolioPenalty": 0,
+                "gate": "BLOCK",
+                "dataQualitySeverity": "clean",
+                "dataQualityReasons": [],
+            },
+        ]
+        previous = {
+            "schemaVersion": 3,
+            "generatedAt": "2026-06-21T00:00:00-07:00",
+            "modelCard": {"modelVersion": "0.4"},
+            "scores": [
+                {
+                    "companyId": "tsm",
+                    "ticker": "TSM",
+                    "finalScore": 78,
+                    "torqueAdjustedScore": 82,
+                    "tacticalScore": 54,
+                    "riskScore": 66,
+                    "riskPenalty": 0,
+                    "portfolioPenalty": 0,
+                    "gate": "ALLOW_DD",
+                    "dataQualitySeverity": "clean",
+                    "dataQualityReasons": [],
+                },
+                {
+                    "companyId": "nvda",
+                    "ticker": "NVDA",
+                    "finalScore": 70,
+                    "torqueAdjustedScore": 88,
+                    "tacticalScore": 55,
+                    "riskScore": 60,
+                    "riskPenalty": 0,
+                    "portfolioPenalty": 12,
+                    "gate": "PORTFOLIO_BLOCK",
+                    "dataQualitySeverity": "clean",
+                    "dataQualityReasons": [],
+                },
+                {
+                    "companyId": "mu",
+                    "ticker": "MU",
+                    "finalScore": 71,
+                    "torqueAdjustedScore": 76,
+                    "tacticalScore": 60,
+                    "riskScore": 27,
+                    "riskPenalty": 5,
+                    "portfolioPenalty": 0,
+                    "gate": "WATCH_RESET",
+                    "dataQualitySeverity": "clean",
+                    "dataQualityReasons": [],
+                },
+                {
+                    "companyId": "wiwynn",
+                    "ticker": "6669.TW",
+                    "finalScore": 46,
+                    "torqueAdjustedScore": 50,
+                    "tacticalScore": 50,
+                    "riskScore": 40,
+                    "riskPenalty": 0,
+                    "portfolioPenalty": 0,
+                    "gate": "DATA_REVIEW",
+                    "dataQualitySeverity": "hard_review",
+                    "dataQualityReasons": [{"rule": "price_band_outlier", "detail": "bad price band"}],
+                },
+            ],
+        }
+
+        for row in rows:
+            row["strategicRankScore"] = row["torqueAdjustedScore"]
+            row["node"] = "Synthetic"
+            row["gateFamily"] = aiq.gate_family(row["gate"])
+
+        aiq.annotate_score_deltas(rows, previous)
+        summary = aiq.summarize(rows)
+        card = aiq.model_card(rows, latest_date="2026-06-22", previous_doc=previous, generated_at="2026-06-22T00:00:00-07:00")
+
+        nvda = next(r for r in rows if r["ticker"] == "NVDA")["scoreDeltaAttribution"]
+        mu = next(r for r in rows if r["ticker"] == "MU")["scoreDeltaAttribution"]
+        wiwynn = next(r for r in rows if r["ticker"] == "6669.TW")["scoreDeltaAttribution"]
+
+        self.assertEqual(nvda["bucketImpacts"]["portfolio_delta"], 12.0)
+        self.assertEqual(mu["riskScoreDelta"], 11.0)
+        self.assertTrue(wiwynn["dataQualityChanged"])
+        self.assertEqual(wiwynn["clearedDataFlags"], ["price_band_outlier"])
+
+        top_changes = summary["scoreDeltaTopChanges"]
+        self.assertEqual(top_changes["portfolioBlocksRemoved"][0]["ticker"], "NVDA")
+        self.assertTrue(any(r["ticker"] == "MU" for r in top_changes["riskImprovements"]))
+        self.assertTrue(any(r["ticker"] == "6669.TW" for r in top_changes["dataQualityChanges"]))
+        self.assertTrue(any(r["ticker"] == "TSM" for r in top_changes["gateChanges"]))
+        self.assertTrue(card["scoreDeltaAttribution"]["schemaCompatible"])
+        self.assertEqual(card["scoreDeltaAttribution"]["matchedTickerCount"], 4)
+
+    def test_incompatible_prior_schema_resets_attribution_baseline(self):
+        rows = [
+            {
+                "companyId": "a",
+                "ticker": "A",
+                "name": "Alpha",
+                "finalScore": 67,
+                "torqueAdjustedScore": 84,
+                "tacticalScore": 50,
+                "riskPenalty": 8,
+                "portfolioPenalty": 0,
+                "gate": "WATCH",
+                "dataQualitySeverity": "clean",
+            }
+        ]
+        previous = {
+            "generatedAt": "2026-06-21T00:00:00-07:00",
+            "modelCard": {"modelVersion": "0.2"},
+            "scores": [{"companyId": "a", "ticker": "A", "finalScore": 60, "gate": "BLOCK"}],
+        }
+
+        aiq.annotate_score_deltas(rows, previous)
+        card = aiq.model_card(rows, latest_date="2026-06-22", previous_doc=previous)
+
+        self.assertIsNone(rows[0]["scoreDelta"])
+        self.assertEqual(rows[0]["scoreDeltaAttribution"]["status"], "baseline_reset")
+        self.assertFalse(card["scoreDeltaAttribution"]["schemaCompatible"])
+        self.assertIn("torqueAdjustedScore", card["scoreDeltaAttribution"]["missingRequiredFields"])
 
     def test_summary_and_report_include_score_delta_section(self):
         rows, latest = aiq.build_scores(prices=None, exposures={})
@@ -217,7 +394,7 @@ class AiSemiQuantTests(unittest.TestCase):
             "marketDataAsOf": latest,
             "scores": rows,
             "summary": aiq.summarize(rows),
-            "modelCard": aiq.model_card(rows, latest),
+            "modelCard": aiq.model_card(rows, latest, previous_doc=previous),
             "capitalWaterfall": list(aiq.CAPITAL_WATERFALL),
             "sources": list(aiq.SOURCE_LINKS),
         }

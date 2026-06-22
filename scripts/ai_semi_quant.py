@@ -82,10 +82,27 @@ RISK_FLOOR = 35
 MAX_SINGLE_POSITION_WEIGHT = 20.0
 
 SCORE_DELTA_COMPONENTS = (
-    ("structureTorque", "Structure/torque", "torqueAdjustedScore", 0.76),
-    ("tactical", "Tactical", "tacticalScore", 0.24),
-    ("riskPenalty", "Risk penalty", "riskPenalty", -1.0),
-    ("portfolioPenalty", "Portfolio penalty", "portfolioPenalty", -1.0),
+    ("structureTorque", "strategic_delta", "Structure/torque", "torqueAdjustedScore", 0.76),
+    ("tactical", "tactical_delta", "Tactical", "tacticalScore", 0.24),
+    ("riskPenalty", "risk_delta", "Risk penalty", "riskPenalty", -1.0),
+    ("portfolioPenalty", "portfolio_delta", "Portfolio penalty", "portfolioPenalty", -1.0),
+)
+ATTRIBUTION_BUCKETS = (
+    "score_delta",
+    "gate_delta",
+    "strategic_delta",
+    "tactical_delta",
+    "risk_delta",
+    "portfolio_delta",
+    "data_quality_delta",
+)
+REQUIRED_ATTRIBUTION_FIELDS = (
+    "finalScore",
+    "gate",
+    "torqueAdjustedScore",
+    "tacticalScore",
+    "riskPenalty",
+    "portfolioPenalty",
 )
 
 
@@ -1181,6 +1198,49 @@ def load_previous_document(path: Path) -> Optional[dict]:
         return None
 
 
+def attribution_key(row: dict) -> Optional[str]:
+    key = row.get("companyId") or row.get("ticker")
+    return str(key) if key else None
+
+
+def data_quality_rank(severity: Optional[str]) -> int:
+    return {"clean": 0, "soft_review": 1, "hard_review": 2}.get(str(severity or "clean"), 0)
+
+
+def data_quality_rules(row: dict) -> set:
+    return {r.get("rule") for r in (row.get("dataQualityReasons") or []) if r.get("rule")}
+
+
+def score_delta_run_metadata(rows: List[dict], previous_doc: Optional[dict], current_generated_at: Optional[str] = None) -> dict:
+    previous_rows = (previous_doc or {}).get("scores") or []
+    current_by_key = {attribution_key(r): r for r in rows if attribution_key(r)}
+    previous_by_key = {attribution_key(r): r for r in previous_rows if attribution_key(r)}
+    matched_keys = sorted(set(current_by_key) & set(previous_by_key))
+    new_keys = sorted(set(current_by_key) - set(previous_by_key))
+    removed_keys = sorted(set(previous_by_key) - set(current_by_key))
+    matched_previous = [previous_by_key[k] for k in matched_keys]
+    missing_fields = sorted({field for r in matched_previous for field in REQUIRED_ATTRIBUTION_FIELDS if field not in r})
+    schema_compatible = (not missing_fields) if previous_rows else None
+    return {
+        "enabled": True,
+        "currentModelVersion": MODEL_VERSION,
+        "priorModelVersion": ((previous_doc or {}).get("modelCard") or {}).get("modelVersion"),
+        "currentRunDate": current_generated_at,
+        "priorRunDate": (previous_doc or {}).get("generatedAt"),
+        "priorSchemaVersion": (previous_doc or {}).get("schemaVersion"),
+        "currentUniverseCount": len(rows),
+        "priorUniverseCount": len(previous_rows),
+        "matchedTickerCount": len(matched_keys),
+        "newTickerCount": len(new_keys),
+        "removedTickerCount": len(removed_keys),
+        "newTickers": [current_by_key[k].get("ticker") for k in new_keys],
+        "removedTickers": [previous_by_key[k].get("ticker") for k in removed_keys],
+        "schemaCompatible": schema_compatible,
+        "missingRequiredFields": missing_fields,
+        "baselineReset": bool(previous_rows) and not schema_compatible,
+    }
+
+
 def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> None:
     """Attach per-company score delta attribution versus the prior JSON run."""
     previous_rows = (previous_doc or {}).get("scores") or []
@@ -1188,6 +1248,19 @@ def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> Non
     previous_by_ticker = {r.get("ticker"): r for r in previous_rows if r.get("ticker")}
     previous_generated_at = (previous_doc or {}).get("generatedAt")
     previous_model_version = ((previous_doc or {}).get("modelCard") or {}).get("modelVersion")
+    run_meta = score_delta_run_metadata(rows, previous_doc)
+
+    if previous_rows and not run_meta["schemaCompatible"]:
+        for row in rows:
+            row["scoreDelta"] = None
+            row["scoreDeltaAttribution"] = {
+                "status": "baseline_reset",
+                "previousGeneratedAt": previous_generated_at,
+                "previousModelVersion": previous_model_version,
+                "detail": "Attribution baseline reset: prior schema incompatible.",
+                "missingRequiredFields": run_meta["missingRequiredFields"],
+            }
+        return
 
     for row in rows:
         prev = previous_by_id.get(row.get("companyId")) or previous_by_ticker.get(row.get("ticker"))
@@ -1214,22 +1287,28 @@ def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> Non
         final_delta = int(round(float(current_final) - float(previous_final)))
         components = []
         contribution_sum = 0.0
-        for key, label, field, multiplier in SCORE_DELTA_COMPONENTS:
+        bucket_impacts = {bucket: 0.0 for bucket in ATTRIBUTION_BUCKETS}
+        bucket_impacts["score_delta"] = final_delta
+        for key, bucket, label, field, multiplier in SCORE_DELTA_COMPONENTS:
             current_value = row.get(field)
             previous_value = prev.get(field)
             raw_delta = rn(float(current_value) - float(previous_value), 2) if finite(current_value) and finite(previous_value) else None
             contribution = rn((raw_delta or 0.0) * multiplier, 1) if raw_delta is not None else None
             if contribution is not None:
                 contribution_sum += contribution
+                bucket_impacts[bucket] = rn(bucket_impacts.get(bucket, 0.0) + contribution, 1)
             components.append(
                 {
                     "key": key,
+                    "bucket": bucket,
                     "label": label,
                     "field": field,
                     "current": current_value,
                     "previous": previous_value,
                     "rawDelta": raw_delta,
                     "contribution": contribution,
+                    "impact": contribution,
+                    "reason": f"{label} changed from {previous_value} to {current_value}.",
                 }
             )
         residual = rn(final_delta - contribution_sum, 1)
@@ -1237,24 +1316,80 @@ def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> Non
             components.append(
                 {
                     "key": "roundingOther",
+                    "bucket": "score_delta",
                     "label": "Rounding/other",
                     "field": "finalScore",
                     "current": current_final,
                     "previous": previous_final,
                     "rawDelta": final_delta,
                     "contribution": residual,
+                    "impact": residual,
+                    "reason": "Residual from rounding, thresholds, or non-formula effects.",
                 }
             )
 
-        drivers = [
+        formula_drivers = [
             c
             for c in sorted(components, key=lambda x: abs(x.get("contribution") or 0.0), reverse=True)
             if c.get("contribution") is not None and abs(c.get("contribution") or 0.0) >= 0.5
         ][:4]
-        if not drivers:
-            drivers = [{"key": "flat", "label": "No material driver", "contribution": 0.0}]
-
         gate_changed = prev.get("gate") != row.get("gate")
+        current_rules = data_quality_rules(row)
+        previous_rules = data_quality_rules(prev)
+        added_flags = sorted(current_rules - previous_rules)
+        cleared_flags = sorted(previous_rules - current_rules)
+        data_quality_delta = data_quality_rank(prev.get("dataQualitySeverity")) - data_quality_rank(row.get("dataQualitySeverity"))
+        data_quality_changed = prev.get("dataQualitySeverity") != row.get("dataQualitySeverity") or bool(added_flags or cleared_flags)
+        risk_score_delta = rn(float(row.get("riskScore")) - float(prev.get("riskScore")), 1) if finite(row.get("riskScore")) and finite(prev.get("riskScore")) else None
+        if gate_changed:
+            bucket_impacts["gate_delta"] = 1.0
+        if data_quality_changed:
+            bucket_impacts["data_quality_delta"] = float(data_quality_delta)
+
+        event_drivers = []
+        if gate_changed:
+            event_drivers.append(
+                {
+                    "key": "gateChange",
+                    "bucket": "gate_delta",
+                    "label": "Gate change",
+                    "contribution": None,
+                    "impact": None,
+                    "reason": f"Gate changed from {prev.get('gate') or '-'} to {row.get('gate') or '-'}.",
+                }
+            )
+        if risk_score_delta is not None and abs(risk_score_delta) >= 3:
+            event_drivers.append(
+                {
+                    "key": "riskScoreChange",
+                    "bucket": "risk_delta",
+                    "label": "Risk score change",
+                    "contribution": None,
+                    "impact": risk_score_delta,
+                    "reason": f"Risk score changed from {prev.get('riskScore')} to {row.get('riskScore')}.",
+                }
+            )
+        if data_quality_changed:
+            flag_bits = []
+            if cleared_flags:
+                flag_bits.append("cleared " + ", ".join(cleared_flags))
+            if added_flags:
+                flag_bits.append("added " + ", ".join(added_flags))
+            event_drivers.append(
+                {
+                    "key": "dataQualityChange",
+                    "bucket": "data_quality_delta",
+                    "label": "Data quality change",
+                    "contribution": None,
+                    "impact": data_quality_delta,
+                    "reason": f"Data quality changed from {prev.get('dataQualitySeverity') or 'clean'} to {row.get('dataQualitySeverity') or 'clean'}"
+                    + (f" ({'; '.join(flag_bits)})." if flag_bits else "."),
+                }
+            )
+
+        drivers = formula_drivers + event_drivers
+        if not drivers:
+            drivers = [{"key": "flat", "bucket": "score_delta", "label": "No material driver", "contribution": 0.0, "impact": 0.0}]
         row["scoreDelta"] = final_delta
         row["scoreDeltaAttribution"] = {
             "status": "attributed",
@@ -1268,8 +1403,13 @@ def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> Non
             "gateChanged": gate_changed,
             "previousDataQualitySeverity": prev.get("dataQualitySeverity"),
             "currentDataQualitySeverity": row.get("dataQualitySeverity"),
-            "dataQualityChanged": prev.get("dataQualitySeverity") != row.get("dataQualitySeverity"),
+            "dataQualityChanged": data_quality_changed,
+            "addedDataFlags": added_flags,
+            "clearedDataFlags": cleared_flags,
+            "riskScoreDelta": risk_score_delta,
+            "bucketImpacts": bucket_impacts,
             "components": components,
+            "drivers": drivers,
             "topDrivers": drivers,
             "summary": score_delta_summary(final_delta, drivers, prev.get("gate"), row.get("gate")),
         }
@@ -1283,17 +1423,73 @@ def score_delta_summary(final_delta: int, drivers: List[dict], previous_gate: Op
     else:
         prefix = f"Score {final_delta}"
     driver_bits = []
+    event_bits = []
     for driver in drivers[:3]:
         contribution = driver.get("contribution")
-        if contribution is None or driver.get("key") == "flat":
+        if driver.get("key") == "flat":
+            continue
+        if contribution is None:
+            if driver.get("bucket") != "gate_delta":
+                event_bits.append(driver.get("reason") or driver.get("label"))
             continue
         sign = "+" if contribution > 0 else ""
         driver_bits.append(f"{driver.get('label')} {sign}{contribution}")
     if driver_bits:
         prefix += ": " + ", ".join(driver_bits)
+    elif event_bits:
+        prefix += ": " + "; ".join(event_bits[:2])
     if previous_gate != current_gate:
         prefix += f"; gate {previous_gate or '-'} -> {current_gate or '-'}"
     return prefix + "."
+
+
+def score_delta_entry(row: dict) -> dict:
+    attr = row.get("scoreDeltaAttribution") or {}
+    return {
+        "ticker": row.get("ticker"),
+        "name": row.get("name"),
+        "delta": row.get("scoreDelta"),
+        "finalScore": row.get("finalScore"),
+        "previousFinalScore": attr.get("previousFinalScore"),
+        "gate": row.get("gate"),
+        "previousGate": attr.get("previousGate"),
+        "summary": attr.get("summary"),
+        "topDrivers": attr.get("topDrivers") or [],
+        "bucketImpacts": attr.get("bucketImpacts") or {},
+        "riskScoreDelta": attr.get("riskScoreDelta"),
+        "previousDataQualitySeverity": attr.get("previousDataQualitySeverity"),
+        "currentDataQualitySeverity": attr.get("currentDataQualitySeverity"),
+        "addedDataFlags": attr.get("addedDataFlags") or [],
+        "clearedDataFlags": attr.get("clearedDataFlags") or [],
+    }
+
+
+def score_delta_top_changes(rows: List[dict]) -> dict:
+    delta_rows = [r for r in rows if finite(r.get("scoreDelta"))]
+    increases = sorted([r for r in delta_rows if (r.get("scoreDelta") or 0) > 0], key=lambda r: (-(r.get("scoreDelta") or 0), r.get("ticker") or ""))[:3]
+    decreases = sorted([r for r in delta_rows if (r.get("scoreDelta") or 0) < 0], key=lambda r: ((r.get("scoreDelta") or 0), r.get("ticker") or ""))[:3]
+    gate_changes = [r for r in delta_rows if (r.get("scoreDeltaAttribution") or {}).get("gateChanged")]
+    data_quality_changes = [r for r in delta_rows if (r.get("scoreDeltaAttribution") or {}).get("dataQualityChanged")]
+    risk_improvements = sorted(
+        [r for r in delta_rows if ((r.get("scoreDeltaAttribution") or {}).get("riskScoreDelta") or 0) > 0],
+        key=lambda r: (-((r.get("scoreDeltaAttribution") or {}).get("riskScoreDelta") or 0), r.get("ticker") or ""),
+    )[:3]
+    risk_deteriorations = sorted(
+        [r for r in delta_rows if ((r.get("scoreDeltaAttribution") or {}).get("riskScoreDelta") or 0) < 0],
+        key=lambda r: (((r.get("scoreDeltaAttribution") or {}).get("riskScoreDelta") or 0), r.get("ticker") or ""),
+    )[:3]
+    portfolio_added = [r for r in gate_changes if r.get("gate") == "PORTFOLIO_BLOCK" and (r.get("scoreDeltaAttribution") or {}).get("previousGate") != "PORTFOLIO_BLOCK"]
+    portfolio_removed = [r for r in gate_changes if r.get("gate") != "PORTFOLIO_BLOCK" and (r.get("scoreDeltaAttribution") or {}).get("previousGate") == "PORTFOLIO_BLOCK"]
+    return {
+        "topScoreIncreases": [score_delta_entry(r) for r in increases],
+        "topScoreDecreases": [score_delta_entry(r) for r in decreases],
+        "gateChanges": [score_delta_entry(r) for r in gate_changes[:6]],
+        "riskImprovements": [score_delta_entry(r) for r in risk_improvements],
+        "riskDeteriorations": [score_delta_entry(r) for r in risk_deteriorations],
+        "dataQualityChanges": [score_delta_entry(r) for r in data_quality_changes[:6]],
+        "portfolioBlocksAdded": [score_delta_entry(r) for r in portfolio_added[:3]],
+        "portfolioBlocksRemoved": [score_delta_entry(r) for r in portfolio_removed[:3]],
+    }
 
 
 def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], Optional[str]]:
@@ -1414,27 +1610,15 @@ def summarize(rows: List[dict]) -> dict:
         "tacticalLeaders": [{"ticker": r["ticker"], "name": r["name"], "score": r["tacticalScore"], "percentile": r.get("tacticalPercentile"), "gate": r["gate"]} for r in tactical_investable],
         "resetWatchlist": [{"ticker": r["ticker"], "name": r["name"], "score": r["strategicRankScore"], "gate": r["gate"]} for r in reset_watch],
         "scoreDeltaCoverage": {"attributed": len(delta_rows), "total": len(rows)},
-        "scoreDeltaLeaders": [
-            {
-                "ticker": r["ticker"],
-                "name": r["name"],
-                "delta": r.get("scoreDelta"),
-                "finalScore": r["finalScore"],
-                "previousFinalScore": (r.get("scoreDeltaAttribution") or {}).get("previousFinalScore"),
-                "gate": r["gate"],
-                "previousGate": (r.get("scoreDeltaAttribution") or {}).get("previousGate"),
-                "summary": (r.get("scoreDeltaAttribution") or {}).get("summary"),
-                "topDrivers": (r.get("scoreDeltaAttribution") or {}).get("topDrivers") or [],
-            }
-            for r in delta_ranked
-        ],
+        "scoreDeltaLeaders": [score_delta_entry(r) for r in delta_ranked],
+        "scoreDeltaTopChanges": score_delta_top_changes(rows),
         "byNode": sorted(by_node.values(), key=lambda x: -x["avgScore"]),
         "gateCounts": {g: sum(1 for r in rows if r["gate"] == g) for g in GATE_ORDER},
         "gateFamilyCounts": {g: sum(1 for r in rows if r.get("gateFamily") == g) for g in ("ALLOW", "WATCH", "BLOCK", "DATA_REVIEW")},
     }
 
 
-def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
+def model_card(rows: List[dict], latest_date: Optional[str], previous_doc: Optional[dict] = None, generated_at: Optional[str] = None) -> dict:
     missing_price = sum(1 for r in rows if not (r.get("market") or {}).get("available"))
     missing_market_cap = sum(1 for r in rows if (r.get("market") or {}).get("marketCapUsd") is None)
     data_review = sum(1 for r in rows if r.get("gate") == "DATA_REVIEW")
@@ -1448,6 +1632,10 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
     hard_flags = [a for a in anomalies if a.get("severity") == "hard_review"]
     delta_rows = [r for r in rows if finite(r.get("scoreDelta"))]
     previous_meta = next(((r.get("scoreDeltaAttribution") or {}) for r in rows if (r.get("scoreDeltaAttribution") or {}).get("previousGeneratedAt")), {})
+    run_meta = score_delta_run_metadata(rows, previous_doc, generated_at)
+    if previous_meta:
+        run_meta["priorRunDate"] = previous_meta.get("previousGeneratedAt")
+        run_meta["priorModelVersion"] = previous_meta.get("previousModelVersion")
     return {
         "modelVersion": MODEL_VERSION,
         "dataDate": latest_date,
@@ -1475,6 +1663,7 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
             "totalCount": len(rows),
             "previousGeneratedAt": previous_meta.get("previousGeneratedAt"),
             "previousModelVersion": previous_meta.get("previousModelVersion"),
+            **run_meta,
             "method": "Approximate final-score attribution from structure/torque, tactical score, risk penalty, and portfolio penalty deltas.",
         },
     }
@@ -1562,6 +1751,16 @@ def render_report(doc: dict) -> str:
 
     delta_meta = (doc.get("modelCard") or {}).get("scoreDeltaAttribution") or {}
     delta_rows = doc["summary"].get("scoreDeltaLeaders") or []
+    top_changes = doc["summary"].get("scoreDeltaTopChanges") or {}
+    fmt_items = lambda items, fn: ", ".join(fn(r) for r in (items or [])) or "none"
+    score_increases = fmt_items(top_changes.get("topScoreIncreases"), lambda r: f"{r.get('ticker')} {r.get('delta'):+}")
+    score_decreases = fmt_items(top_changes.get("topScoreDecreases"), lambda r: f"{r.get('ticker')} {r.get('delta'):+}")
+    gate_changes = fmt_items(top_changes.get("gateChanges"), lambda r: f"{r.get('ticker')} {r.get('previousGate')} -> {r.get('gate')}")
+    risk_improvements = fmt_items(top_changes.get("riskImprovements"), lambda r: f"{r.get('ticker')} +{r.get('riskScoreDelta')}")
+    data_quality_changes = fmt_items(
+        top_changes.get("dataQualityChanges"),
+        lambda r: f"{r.get('ticker')} {r.get('previousDataQualitySeverity')} -> {r.get('currentDataQualitySeverity')}",
+    )
     lines.extend(
         [
             "",
@@ -1569,6 +1768,16 @@ def render_report(doc: dict) -> str:
             "",
             f"Compared with prior run: {delta_meta.get('previousGeneratedAt') or 'unavailable'} "
             f"(model {delta_meta.get('previousModelVersion') or '-'}).",
+            f"Compatibility: matched {delta_meta.get('matchedTickerCount', 0)}/{delta_meta.get('currentUniverseCount', len(rows))} current names; "
+            f"new {delta_meta.get('newTickerCount', 0)}, removed {delta_meta.get('removedTickerCount', 0)}, "
+            f"schema compatible: {delta_meta.get('schemaCompatible')}.",
+            "",
+            "Top changes:",
+            f"- Score increases: {score_increases}",
+            f"- Score decreases: {score_decreases}",
+            f"- Gate changes: {gate_changes}",
+            f"- Risk improvements: {risk_improvements}",
+            f"- Data-quality changes: {data_quality_changes}",
             "",
             "| Ticker | Δ Final | Final | Prior | Gate | Main Drivers |",
             "| --- | ---: | ---: | ---: | --- | --- |",
@@ -1705,7 +1914,7 @@ def build_document(args) -> dict:
         "capitalWaterfall": list(CAPITAL_WATERFALL),
         "capitalFlowEdges": list(CAPITAL_FLOW_EDGES),
         "summary": summarize(scores),
-        "modelCard": model_card(scores, latest_date),
+        "modelCard": model_card(scores, latest_date, previous_doc=previous_doc, generated_at=generated_at),
         "scores": scores,
         "sources": list(SOURCE_LINKS),
         "disclaimer": "Research framework only. Not investment advice, not a recommendation, and not a guarantee of future return.",

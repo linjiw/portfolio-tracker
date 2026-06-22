@@ -3976,7 +3976,7 @@ function aiSemiQuantCard(){
  const reasonTxt=r=>{const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return x.length>92?x.slice(0,89)+'...':x;};
  const peerRankTxt=r=>r.peerPercentileDisplay||((r.peerGroupSize!=null&&r.peerGroupSize<3)?`N/A · n=${r.peerGroupSize}`:`P${r.peerPercentile??'—'}${r.peerGroupSize!=null?' · n='+r.peerGroupSize:''}`);
  const deltaFmt=v=>{if(v==null)return'—';v=Number(v);if(!isFinite(v))return'—';return(v>0?'+':'')+v.toFixed(0);};
- const driverTxt=ds=>(ds||[]).filter(d=>d.key!=='flat'&&d.contribution!=null).slice(0,3).map(d=>`${d.label} ${Number(d.contribution)>0?'+':''}${Number(d.contribution).toFixed(1)}`).join(' · ');
+ const driverTxt=ds=>(ds||[]).filter(d=>d.key!=='flat').slice(0,3).map(d=>d.contribution!=null?`${d.label} ${Number(d.contribution)>0?'+':''}${Number(d.contribution).toFixed(1)}`:(d.reason||d.label||'')).join(' · ');
  const top=leaders.map(x=>`<span class="chip" style="color:${aiqScoreColor(x.score)};border-color:${chipBd(aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' ');
  const rankChips=(arr,key)=>((arr||[]).map(x=>`<span class="chip" style="color:${key==='tactical'?'#6FA8DC':aiqScoreColor(x.score)};border-color:${chipBd(key==='tactical'?'#6FA8DC':aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' '));
  const deltaMeta=model.scoreDeltaAttribution||{},deltaCoverage=sum.scoreDeltaCoverage||{};
@@ -4020,17 +4020,30 @@ function aiSemiQuantCard(){
   ['Universe',model.universeSize??'—'],
   ['Missing price',model.missingPriceCount??'—'],
   ['Missing market cap',model.missingMarketCapCount??'—'],
-  ['DATA_REVIEW',model.dataReviewCount??'—'],
-  ['Soft data flags',model.softDataReviewCount??'—'],
-  ['Momentum = 100',model.momentumScoreAt100Count??'—'],
-  ['Risk floor',(model.thresholds||{}).riskFloor??'—'],
-  ['Single-name cap',((model.thresholds||{}).maxSinglePositionWeight??'—')+'%'],
+ ['DATA_REVIEW',model.dataReviewCount??'—'],
+ ['Soft data flags',model.softDataReviewCount??'—'],
+ ['Momentum = 100',model.momentumScoreAt100Count??'—'],
+ ['Δ matched',`${deltaMeta.matchedTickerCount??0}/${deltaMeta.currentUniverseCount??model.universeSize??'—'}`],
+ ['Δ schema',deltaMeta.priorUniverseCount? (deltaMeta.schemaCompatible===false?'reset / incompatible':'compatible'):'no prior'],
+ ['Risk floor',(model.thresholds||{}).riskFloor??'—'],
+ ['Single-name cap',((model.thresholds||{}).maxSinglePositionWeight??'—')+'%'],
  ].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]}</td></tr>`).join('');
  const hardFlags=(model.hardDataFlags||[]).slice(0,8),softFlags=(model.softDataFlags||[]).slice(0,8);
  const flagRows=hardFlags.concat(softFlags).map(f=>`<tr><td class="l"><b>${f.ticker||'—'}</b><br><span class="note">${f.name||''}</span></td><td>${f.severity||'—'}</td><td class="l">${f.rule||'—'}</td><td class="l">${f.detail||'—'}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No named data-quality flags.</td></tr>';
  const tacticalRaw=sum.tacticalLeadersRaw||[],tacticalInv=sum.tacticalLeadersInvestable||[];
  const tacticalRows=Array.from({length:Math.max(tacticalRaw.length,tacticalInv.length)}).map((_,i)=>{const a=tacticalRaw[i]||{},b=tacticalInv[i]||{};return `<tr><td>${i+1}</td><td class="l">${a.ticker||'—'}</td><td>${a.score??'—'}</td><td>${a.gate?gateChip(a.gate):'—'}</td><td class="l">${b.ticker||'—'}</td><td>${b.score??'—'}</td><td>${b.gate?gateChip(b.gate):'—'}</td></tr>`;}).join('');
  const deltaRows=(sum.scoreDeltaLeaders||[]).map(r=>`<tr><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name||''}</span></td><td class="${Number(r.delta||0)>=0?'pos':'neg'}">${deltaFmt(r.delta)}</td><td>${r.finalScore??'—'}</td><td>${r.previousFinalScore??'—'}</td><td>${r.previousGate||'—'} → ${r.gate||'—'}</td><td class="l"><span class="note">${driverTxt(r.topDrivers)||r.summary||'—'}</span></td></tr>`).join('')||'<tr><td class="l" colspan="6">No prior score snapshot available for attribution.</td></tr>';
+ const topChanges=sum.scoreDeltaTopChanges||{};
+ const changeList=(items,fn)=>(items||[]).map(fn).join('<br>')||'<span class="note">none</span>';
+ const topChangeRows=[
+  ['Top Score Increases',changeList(topChanges.topScoreIncreases,r=>`<b>${r.ticker}</b> ${deltaFmt(r.delta)} · ${driverTxt(r.topDrivers)||r.summary||''}`)],
+  ['Top Score Decreases',changeList(topChanges.topScoreDecreases,r=>`<b>${r.ticker}</b> ${deltaFmt(r.delta)} · ${driverTxt(r.topDrivers)||r.summary||''}`)],
+  ['Gate Changes',changeList(topChanges.gateChanges,r=>`<b>${r.ticker}</b> ${r.previousGate||'—'} → ${r.gate||'—'}`)],
+  ['Risk Improvements',changeList(topChanges.riskImprovements,r=>`<b>${r.ticker}</b> +${r.riskScoreDelta} risk score`)],
+  ['Risk Deteriorations',changeList(topChanges.riskDeteriorations,r=>`<b>${r.ticker}</b> ${r.riskScoreDelta} risk score`)],
+  ['Data Flags Added / Cleared',changeList(topChanges.dataQualityChanges,r=>`<b>${r.ticker}</b> ${r.previousDataQualitySeverity||'clean'} → ${r.currentDataQualitySeverity||'clean'}${(r.clearedDataFlags||[]).length?' · cleared '+r.clearedDataFlags.join(', '):''}${(r.addedDataFlags||[]).length?' · added '+r.addedDataFlags.join(', '):''}`)],
+  ['Portfolio Blocks',changeList([...(topChanges.portfolioBlocksAdded||[]),...(topChanges.portfolioBlocksRemoved||[])],r=>`<b>${r.ticker}</b> ${r.previousGate||'—'} → ${r.gate||'—'}`)],
+ ].map(r=>`<tr><td class="l">${r[0]}</td><td class="l">${r[1]}</td></tr>`).join('');
  const riskRows=D.scores.slice(0,12).map(r=>{const b=r.riskBreakdown||{};return `<tr><td class="l">${r.ticker}</td><td>${r.riskScore}</td><td>${b.technicalOverextension||'—'}</td><td>${b.cycle||'—'}</td><td>${b.valuation||'—'}</td><td>${b.geopolitical||'—'}</td><td>${b.portfolioConcentration||'—'}</td></tr>`;}).join('');
  const src=(D.sources||[]).map(s=>`<li><a href="${s.url}" target="_blank" rel="noreferrer">${s.name}</a> <span class="note">${s.use||''}</span></li>`).join('');
  return `<div class="card t1">
@@ -4050,7 +4063,8 @@ function aiSemiQuantCard(){
  ${foldCard('资本流边权 Capital Flow Edges','静态研究图开始量化：边权 × 置信度',`<div class="scroll"><table><thead><tr><th class="l">Source</th><th class="l">Target</th><th class="l">Edge</th><th>权重</th><th>置信度</th></tr></thead><tbody>${eRows}</tbody></table></div><div class="note" style="margin-top:8px">这是 v0.4 仍沿用的静态产业资金边权；后续可接入真实订单、capex、13F/ETF/外资流来替代人工先验。</div>`,0,(D.capitalFlowEdges||[]).length+' edges')}
  ${foldCard('因子权重与节点均分','结构评分口径',`<div class="scroll"><table><thead><tr><th class="l">因子</th><th>权重</th><th class="l">含义</th></tr></thead><tbody>${fRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">节点</th><th>公司数</th><th>均分</th><th class="l">代表</th></tr></thead><tbody>${nRows}</tbody></table></div>`,0,'5 因子')}
  ${foldCard('Raw vs Investable Tactical','战术强弱不等于可加仓',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">Raw Tactical</th><th>分</th><th>Gate</th><th class="l">Investable Tactical</th><th>分</th><th>Gate</th></tr></thead><tbody>${tacticalRows}</tbody></table></div><div class="note" style="margin-top:8px">Raw tactical 可以包含 BLOCK / DATA_REVIEW；Investable tactical 排除 hard BLOCK、PORTFOLIO_BLOCK 和 DATA_REVIEW，避免把“信号强”误读成“可以加”。</div>`,0,`v${model.modelVersion||'—'}`)}
- ${foldCard('Score Delta Attribution','分数为什么变了',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>Δ Final</th><th>当前</th><th>前次</th><th>Gate</th><th class="l">主要驱动</th></tr></thead><tbody>${deltaRows}</tbody></table></div><div class="note" style="margin-top:8px">v0.4 先做轻量归因：结构/torque、战术、风险惩罚、组合惩罚。对比基准：${deltaMeta.previousGeneratedAt||'prior JSON unavailable'}。</div>`,0,'v0.4')}
+ ${foldCard('Top Changes','这次复跑哪里变了',`<div class="scroll"><table><thead><tr><th class="l">类别</th><th class="l">变化</th></tr></thead><tbody>${topChangeRows}</tbody></table></div><div class="note" style="margin-top:8px">首个 attribution run 因为评分公式刻意继承 v0.3.1，可能大多 unchanged；未来复跑会突出 score、gate、risk、tactical、portfolio、data-quality 的移动。</div>`,0,`${deltaCount}/${deltaTotal}`)}
+ ${foldCard('Score Delta Attribution','分数为什么变了',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>Δ Final</th><th>当前</th><th>前次</th><th>Gate</th><th class="l">主要驱动</th></tr></thead><tbody>${deltaRows}</tbody></table></div><div class="note" style="margin-top:8px">v0.4 轻量归因：结构/torque、战术、风险惩罚、组合惩罚，并标记 gate / data-quality 变化。对比基准：${deltaMeta.previousGeneratedAt||'prior JSON unavailable'}；schema：${deltaMeta.priorUniverseCount?(deltaMeta.schemaCompatible===false?'baseline reset / incompatible':'compatible'):'no prior'}。</div>`,0,'v0.4')}
  ${foldCard('风险拆分 Risk Breakdown','不是“公司好坏”，而是风险类型叠加',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>风险分</th><th>技术拥挤</th><th>周期</th><th>估值/体量</th><th>地缘</th><th>组合集中</th></tr></thead><tbody>${riskRows}</tbody></table></div>`,0,'top 12')}
  ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flagRows}</tbody></table></div>`,0,`v${model.modelVersion||'—'}`)}
  ${foldCard('来源与边界','当前事实需要随财报 / 产业数据更新',`<ul style="margin:0;padding-left:18px;line-height:1.8">${src}</ul><div class="note" style="margin-top:10px">结构因子来自本次目标文件和参考研究的人工先验；价格和趋势来自 Yahoo Finance（如果可用）。请在财报、法说会、TrendForce/SEMI/Counterpoint 数据更新后重跑并复核。<b>非投资建议。</b></div>`,0,(D.sources||[]).length+' sources')}`;

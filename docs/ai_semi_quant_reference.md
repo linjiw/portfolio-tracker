@@ -187,8 +187,13 @@ scoreDeltaAttribution{
   previousGate
   currentGate
   gateChanged
+  bucketImpacts
   components[]
+  drivers[]
   topDrivers[]
+  addedDataFlags
+  clearedDataFlags
+  riskScoreDelta
   summary
 }
 ```
@@ -206,6 +211,49 @@ Portfolio penalty contribution= -Δ portfolioPenalty
 The attribution is approximate because final scores are rounded and gates can
 change for data-quality or threshold reasons. Those non-formula effects are
 shown as gate/data-quality changes and, when needed, a rounding/other residual.
+
+v0.4 slice 2 hardens the change taxonomy. Attribution drivers are grouped into
+stable buckets:
+
+```text
+score_delta
+gate_delta
+strategic_delta
+tactical_delta
+risk_delta
+portfolio_delta
+data_quality_delta
+```
+
+The summary object now exposes `scoreDeltaTopChanges` so the dashboard can show:
+
+```text
+Top Score Increases
+Top Score Decreases
+Gate Changes
+Risk Improvements / Deteriorations
+Data Flags Added / Cleared
+Portfolio Blocks Added / Removed
+```
+
+The model card also records prior/current run metadata:
+
+```text
+priorModelVersion
+currentModelVersion
+priorRunDate
+currentRunDate
+priorUniverseCount
+currentUniverseCount
+matchedTickerCount
+newTickerCount
+removedTickerCount
+schemaCompatible
+```
+
+If the prior JSON is missing fields required for formula attribution, the system
+sets `baselineReset=true` and rows use `status=baseline_reset` instead of
+pretending to produce precise deltas.
 
 This answers the first v0.4 question:
 
