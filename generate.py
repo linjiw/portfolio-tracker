@@ -4035,7 +4035,8 @@ function aiSemiQuantCard(){
  const deltaRows=(sum.scoreDeltaLeaders||[]).map(r=>`<tr><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name||''}</span></td><td class="${Number(r.delta||0)>=0?'pos':'neg'}">${deltaFmt(r.delta)}</td><td>${r.finalScore??'—'}</td><td>${r.previousFinalScore??'—'}</td><td>${r.previousGate||'—'} → ${r.gate||'—'}</td><td class="l"><span class="note">${driverTxt(r.topDrivers)||r.summary||'—'}</span></td></tr>`).join('')||'<tr><td class="l" colspan="6">No prior score snapshot available for attribution.</td></tr>';
  const topChanges=sum.scoreDeltaTopChanges||{};
  const changeList=(items,fn)=>(items||[]).map(fn).join('<br>')||'<span class="note">none</span>';
- const topChangeRows=[
+ const hasTopChanges=['topScoreIncreases','topScoreDecreases','gateChanges','riskImprovements','riskDeteriorations','dataQualityChanges','portfolioBlocksAdded','portfolioBlocksRemoved'].some(k=>(topChanges[k]||[]).length);
+ const topChangeRows=(hasTopChanges?[
   ['Top Score Increases',changeList(topChanges.topScoreIncreases,r=>`<b>${r.ticker}</b> ${deltaFmt(r.delta)} · ${driverTxt(r.topDrivers)||r.summary||''}`)],
   ['Top Score Decreases',changeList(topChanges.topScoreDecreases,r=>`<b>${r.ticker}</b> ${deltaFmt(r.delta)} · ${driverTxt(r.topDrivers)||r.summary||''}`)],
   ['Gate Changes',changeList(topChanges.gateChanges,r=>`<b>${r.ticker}</b> ${r.previousGate||'—'} → ${r.gate||'—'}`)],
@@ -4043,7 +4044,7 @@ function aiSemiQuantCard(){
   ['Risk Deteriorations',changeList(topChanges.riskDeteriorations,r=>`<b>${r.ticker}</b> ${r.riskScoreDelta} risk score`)],
   ['Data Flags Added / Cleared',changeList(topChanges.dataQualityChanges,r=>`<b>${r.ticker}</b> ${r.previousDataQualitySeverity||'clean'} → ${r.currentDataQualitySeverity||'clean'}${(r.clearedDataFlags||[]).length?' · cleared '+r.clearedDataFlags.join(', '):''}${(r.addedDataFlags||[]).length?' · added '+r.addedDataFlags.join(', '):''}`)],
   ['Portfolio Blocks',changeList([...(topChanges.portfolioBlocksAdded||[]),...(topChanges.portfolioBlocksRemoved||[])],r=>`<b>${r.ticker}</b> ${r.previousGate||'—'} → ${r.gate||'—'}`)],
- ].map(r=>`<tr><td class="l">${r[0]}</td><td class="l">${r[1]}</td></tr>`).join('');
+ ]:[['No material changes','No material score, gate, risk, data-quality, or portfolio changes versus the prior baseline.']]).map(r=>`<tr><td class="l">${r[0]}</td><td class="l">${r[1]}</td></tr>`).join('');
  const riskRows=D.scores.slice(0,12).map(r=>{const b=r.riskBreakdown||{};return `<tr><td class="l">${r.ticker}</td><td>${r.riskScore}</td><td>${b.technicalOverextension||'—'}</td><td>${b.cycle||'—'}</td><td>${b.valuation||'—'}</td><td>${b.geopolitical||'—'}</td><td>${b.portfolioConcentration||'—'}</td></tr>`;}).join('');
  const src=(D.sources||[]).map(s=>`<li><a href="${s.url}" target="_blank" rel="noreferrer">${s.name}</a> <span class="note">${s.use||''}</span></li>`).join('');
  return `<div class="card t1">

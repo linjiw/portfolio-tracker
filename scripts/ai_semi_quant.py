@@ -1761,6 +1761,17 @@ def render_report(doc: dict) -> str:
         top_changes.get("dataQualityChanges"),
         lambda r: f"{r.get('ticker')} {r.get('previousDataQualitySeverity')} -> {r.get('currentDataQualitySeverity')}",
     )
+    top_change_groups = (
+        "topScoreIncreases",
+        "topScoreDecreases",
+        "gateChanges",
+        "riskImprovements",
+        "riskDeteriorations",
+        "dataQualityChanges",
+        "portfolioBlocksAdded",
+        "portfolioBlocksRemoved",
+    )
+    no_material_changes = not any(top_changes.get(k) for k in top_change_groups)
     lines.extend(
         [
             "",
@@ -1773,6 +1784,11 @@ def render_report(doc: dict) -> str:
             f"schema compatible: {delta_meta.get('schemaCompatible')}.",
             "",
             "Top changes:",
+            *(
+                ["- No material score, gate, risk, data-quality, or portfolio changes versus the prior baseline."]
+                if no_material_changes
+                else []
+            ),
             f"- Score increases: {score_increases}",
             f"- Score decreases: {score_decreases}",
             f"- Gate changes: {gate_changes}",
