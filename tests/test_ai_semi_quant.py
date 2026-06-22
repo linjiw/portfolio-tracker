@@ -147,6 +147,87 @@ class AiSemiQuantTests(unittest.TestCase):
         self.assertEqual(card["softDataFlags"][0]["rule"], "price_band_outlier")
         self.assertEqual(card["hardDataFlags"][0]["ticker"], "WYN")
 
+    def test_score_delta_attribution_explains_component_changes(self):
+        rows = [
+            {
+                "companyId": "a",
+                "ticker": "A",
+                "name": "Alpha",
+                "finalScore": 67,
+                "torqueAdjustedScore": 84,
+                "tacticalScore": 50,
+                "riskPenalty": 8,
+                "portfolioPenalty": 0,
+                "gate": "WATCH",
+                "dataQualitySeverity": "clean",
+            }
+        ]
+        previous = {
+            "generatedAt": "2026-06-21T00:00:00-07:00",
+            "modelCard": {"modelVersion": "0.3.1"},
+            "scores": [
+                {
+                    "companyId": "a",
+                    "ticker": "A",
+                    "finalScore": 60,
+                    "torqueAdjustedScore": 80,
+                    "tacticalScore": 40,
+                    "riskPenalty": 10,
+                    "portfolioPenalty": 0,
+                    "gate": "BLOCK",
+                    "dataQualitySeverity": "clean",
+                }
+            ],
+        }
+
+        aiq.annotate_score_deltas(rows, previous)
+        attr = rows[0]["scoreDeltaAttribution"]
+
+        self.assertEqual(rows[0]["scoreDelta"], 7)
+        self.assertTrue(attr["gateChanged"])
+        self.assertEqual(attr["previousGate"], "BLOCK")
+        self.assertEqual(attr["currentGate"], "WATCH")
+        self.assertIn("Score +7", attr["summary"])
+        self.assertGreaterEqual(len(attr["topDrivers"]), 2)
+        self.assertTrue(any(d["key"] == "structureTorque" for d in attr["components"]))
+
+    def test_summary_and_report_include_score_delta_section(self):
+        rows, latest = aiq.build_scores(prices=None, exposures={})
+        previous = {
+            "generatedAt": "2026-06-21T00:00:00-07:00",
+            "modelCard": {"modelVersion": "0.3.1"},
+            "scores": [
+                {
+                    "companyId": row["companyId"],
+                    "ticker": row["ticker"],
+                    "finalScore": max(0, row["finalScore"] - 1),
+                    "torqueAdjustedScore": row["torqueAdjustedScore"],
+                    "tacticalScore": row["tacticalScore"],
+                    "riskPenalty": row["riskPenalty"],
+                    "portfolioPenalty": row["portfolioPenalty"],
+                    "gate": row["gate"],
+                    "dataQualitySeverity": row["dataQualitySeverity"],
+                }
+                for row in rows
+            ],
+        }
+        aiq.annotate_score_deltas(rows, previous)
+        doc = {
+            "generatedAt": "2026-06-22T00:00:00-07:00",
+            "marketDataAsOf": latest,
+            "scores": rows,
+            "summary": aiq.summarize(rows),
+            "modelCard": aiq.model_card(rows, latest),
+            "capitalWaterfall": list(aiq.CAPITAL_WATERFALL),
+            "sources": list(aiq.SOURCE_LINKS),
+        }
+        report = aiq.render_report(doc)
+
+        self.assertEqual(doc["summary"]["scoreDeltaCoverage"]["attributed"], len(rows))
+        self.assertTrue(doc["summary"]["scoreDeltaLeaders"])
+        self.assertIn("Score Delta Attribution", report)
+        self.assertIn("Score delta attribution", report)
+
     def test_non_usd_local_price_display_does_not_use_usd_symbol(self):
         self.assertEqual(aiq.fmt_local_money(349500, "KRW"), "₩349,500")
         self.assertEqual(aiq.fmt_local_money(4865, "TWD"), "NT$4,865")

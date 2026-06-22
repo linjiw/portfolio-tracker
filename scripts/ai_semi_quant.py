@@ -77,9 +77,16 @@ CURRENCY_SYMBOLS = {
 }
 
 GATE_ORDER = ("ALLOW_PLAN", "ALLOW_DD", "WATCH", "WATCH_RESET", "PORTFOLIO_BLOCK", "BLOCK", "DATA_REVIEW")
-MODEL_VERSION = "0.3.1"
+MODEL_VERSION = "0.4"
 RISK_FLOOR = 35
 MAX_SINGLE_POSITION_WEIGHT = 20.0
+
+SCORE_DELTA_COMPONENTS = (
+    ("structureTorque", "Structure/torque", "torqueAdjustedScore", 0.76),
+    ("tactical", "Tactical", "tacticalScore", 0.24),
+    ("riskPenalty", "Risk penalty", "riskPenalty", -1.0),
+    ("portfolioPenalty", "Portfolio penalty", "portfolioPenalty", -1.0),
+)
 
 
 @dataclass(frozen=True)
@@ -1165,6 +1172,130 @@ def allow_dd_gate_reasons(row: dict) -> List[dict]:
     return [reason, *existing[:2]]
 
 
+def load_previous_document(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def annotate_score_deltas(rows: List[dict], previous_doc: Optional[dict]) -> None:
+    """Attach per-company score delta attribution versus the prior JSON run."""
+    previous_rows = (previous_doc or {}).get("scores") or []
+    previous_by_id = {r.get("companyId"): r for r in previous_rows if r.get("companyId")}
+    previous_by_ticker = {r.get("ticker"): r for r in previous_rows if r.get("ticker")}
+    previous_generated_at = (previous_doc or {}).get("generatedAt")
+    previous_model_version = ((previous_doc or {}).get("modelCard") or {}).get("modelVersion")
+
+    for row in rows:
+        prev = previous_by_id.get(row.get("companyId")) or previous_by_ticker.get(row.get("ticker"))
+        if not prev:
+            row["scoreDelta"] = None
+            row["scoreDeltaAttribution"] = {
+                "status": "no_prior",
+                "detail": "No prior row was available for attribution.",
+            }
+            continue
+
+        current_final = row.get("finalScore")
+        previous_final = prev.get("finalScore")
+        if not finite(current_final) or not finite(previous_final):
+            row["scoreDelta"] = None
+            row["scoreDeltaAttribution"] = {
+                "status": "not_comparable",
+                "previousGeneratedAt": previous_generated_at,
+                "previousModelVersion": previous_model_version,
+                "detail": "Current or prior final score was unavailable.",
+            }
+            continue
+
+        final_delta = int(round(float(current_final) - float(previous_final)))
+        components = []
+        contribution_sum = 0.0
+        for key, label, field, multiplier in SCORE_DELTA_COMPONENTS:
+            current_value = row.get(field)
+            previous_value = prev.get(field)
+            raw_delta = rn(float(current_value) - float(previous_value), 2) if finite(current_value) and finite(previous_value) else None
+            contribution = rn((raw_delta or 0.0) * multiplier, 1) if raw_delta is not None else None
+            if contribution is not None:
+                contribution_sum += contribution
+            components.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "field": field,
+                    "current": current_value,
+                    "previous": previous_value,
+                    "rawDelta": raw_delta,
+                    "contribution": contribution,
+                }
+            )
+        residual = rn(final_delta - contribution_sum, 1)
+        if residual is not None and abs(residual) >= 0.6:
+            components.append(
+                {
+                    "key": "roundingOther",
+                    "label": "Rounding/other",
+                    "field": "finalScore",
+                    "current": current_final,
+                    "previous": previous_final,
+                    "rawDelta": final_delta,
+                    "contribution": residual,
+                }
+            )
+
+        drivers = [
+            c
+            for c in sorted(components, key=lambda x: abs(x.get("contribution") or 0.0), reverse=True)
+            if c.get("contribution") is not None and abs(c.get("contribution") or 0.0) >= 0.5
+        ][:4]
+        if not drivers:
+            drivers = [{"key": "flat", "label": "No material driver", "contribution": 0.0}]
+
+        gate_changed = prev.get("gate") != row.get("gate")
+        row["scoreDelta"] = final_delta
+        row["scoreDeltaAttribution"] = {
+            "status": "attributed",
+            "previousGeneratedAt": previous_generated_at,
+            "previousModelVersion": previous_model_version,
+            "previousFinalScore": previous_final,
+            "currentFinalScore": current_final,
+            "finalDelta": final_delta,
+            "previousGate": prev.get("gate"),
+            "currentGate": row.get("gate"),
+            "gateChanged": gate_changed,
+            "previousDataQualitySeverity": prev.get("dataQualitySeverity"),
+            "currentDataQualitySeverity": row.get("dataQualitySeverity"),
+            "dataQualityChanged": prev.get("dataQualitySeverity") != row.get("dataQualitySeverity"),
+            "components": components,
+            "topDrivers": drivers,
+            "summary": score_delta_summary(final_delta, drivers, prev.get("gate"), row.get("gate")),
+        }
+
+
+def score_delta_summary(final_delta: int, drivers: List[dict], previous_gate: Optional[str], current_gate: Optional[str]) -> str:
+    if final_delta == 0:
+        prefix = "Score unchanged"
+    elif final_delta > 0:
+        prefix = f"Score +{final_delta}"
+    else:
+        prefix = f"Score {final_delta}"
+    driver_bits = []
+    for driver in drivers[:3]:
+        contribution = driver.get("contribution")
+        if contribution is None or driver.get("key") == "flat":
+            continue
+        sign = "+" if contribution > 0 else ""
+        driver_bits.append(f"{driver.get('label')} {sign}{contribution}")
+    if driver_bits:
+        prefix += ": " + ", ".join(driver_bits)
+    if previous_gate != current_gate:
+        prefix += f"; gate {previous_gate or '-'} -> {current_gate or '-'}"
+    return prefix + "."
+
+
 def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], Optional[str]]:
     profiles = profiles or {}
     bench = None
@@ -1273,6 +1404,8 @@ def summarize(rows: List[dict]) -> dict:
             bucket["leaders"].append(row["ticker"])
     for bucket in by_node.values():
         bucket["avgScore"] = rn(bucket["avgScore"] / bucket["count"], 1)
+    delta_rows = [r for r in rows if finite(r.get("scoreDelta"))]
+    delta_ranked = sorted(delta_rows, key=lambda r: (-abs(r.get("scoreDelta") or 0), r["ticker"]))[:8]
     return {
         "leaders": [{"ticker": r["ticker"], "name": r["name"], "score": r["finalScore"], "percentile": r.get("universePercentile"), "gate": r["gate"]} for r in top],
         "strategicLeaders": [{"ticker": r["ticker"], "name": r["name"], "score": r["strategicRankScore"], "percentile": r.get("strategicPercentile"), "gate": r["gate"]} for r in strategic],
@@ -1280,6 +1413,21 @@ def summarize(rows: List[dict]) -> dict:
         "tacticalLeadersInvestable": [{"ticker": r["ticker"], "name": r["name"], "score": r["tacticalScore"], "percentile": r.get("tacticalPercentile"), "gate": r["gate"]} for r in tactical_investable],
         "tacticalLeaders": [{"ticker": r["ticker"], "name": r["name"], "score": r["tacticalScore"], "percentile": r.get("tacticalPercentile"), "gate": r["gate"]} for r in tactical_investable],
         "resetWatchlist": [{"ticker": r["ticker"], "name": r["name"], "score": r["strategicRankScore"], "gate": r["gate"]} for r in reset_watch],
+        "scoreDeltaCoverage": {"attributed": len(delta_rows), "total": len(rows)},
+        "scoreDeltaLeaders": [
+            {
+                "ticker": r["ticker"],
+                "name": r["name"],
+                "delta": r.get("scoreDelta"),
+                "finalScore": r["finalScore"],
+                "previousFinalScore": (r.get("scoreDeltaAttribution") or {}).get("previousFinalScore"),
+                "gate": r["gate"],
+                "previousGate": (r.get("scoreDeltaAttribution") or {}).get("previousGate"),
+                "summary": (r.get("scoreDeltaAttribution") or {}).get("summary"),
+                "topDrivers": (r.get("scoreDeltaAttribution") or {}).get("topDrivers") or [],
+            }
+            for r in delta_ranked
+        ],
         "byNode": sorted(by_node.values(), key=lambda x: -x["avgScore"]),
         "gateCounts": {g: sum(1 for r in rows if r["gate"] == g) for g in GATE_ORDER},
         "gateFamilyCounts": {g: sum(1 for r in rows if r.get("gateFamily") == g) for g in ("ALLOW", "WATCH", "BLOCK", "DATA_REVIEW")},
@@ -1298,6 +1446,8 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
             anomalies.append({"ticker": r["ticker"], "name": r.get("name"), "severity": r.get("dataQualitySeverity"), **reason})
     soft_flags = [a for a in anomalies if a.get("severity") == "soft_review"]
     hard_flags = [a for a in anomalies if a.get("severity") == "hard_review"]
+    delta_rows = [r for r in rows if finite(r.get("scoreDelta"))]
+    previous_meta = next(((r.get("scoreDeltaAttribution") or {}) for r in rows if (r.get("scoreDeltaAttribution") or {}).get("previousGeneratedAt")), {})
     return {
         "modelVersion": MODEL_VERSION,
         "dataDate": latest_date,
@@ -1319,6 +1469,14 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
         "largestDataAnomalies": anomalies[:8],
         "softDataFlags": soft_flags[:8],
         "hardDataFlags": hard_flags[:8],
+        "scoreDeltaAttribution": {
+            "enabled": True,
+            "attributedCount": len(delta_rows),
+            "totalCount": len(rows),
+            "previousGeneratedAt": previous_meta.get("previousGeneratedAt"),
+            "previousModelVersion": previous_meta.get("previousModelVersion"),
+            "method": "Approximate final-score attribution from structure/torque, tactical score, risk penalty, and portfolio penalty deltas.",
+        },
     }
 
 
@@ -1402,6 +1560,34 @@ def render_report(doc: dict) -> str:
             f"{inv.get('ticker', '-')} | {inv.get('score', '-')} | {inv.get('gate', '-')} |"
         )
 
+    delta_meta = (doc.get("modelCard") or {}).get("scoreDeltaAttribution") or {}
+    delta_rows = doc["summary"].get("scoreDeltaLeaders") or []
+    lines.extend(
+        [
+            "",
+            "## Score Delta Attribution",
+            "",
+            f"Compared with prior run: {delta_meta.get('previousGeneratedAt') or 'unavailable'} "
+            f"(model {delta_meta.get('previousModelVersion') or '-'}).",
+            "",
+            "| Ticker | Δ Final | Final | Prior | Gate | Main Drivers |",
+            "| --- | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    if delta_rows:
+        for row in delta_rows:
+            drivers = "; ".join(
+                f"{d.get('label')} {d.get('contribution'):+.1f}"
+                for d in row.get("topDrivers") or []
+                if d.get("contribution") is not None and d.get("key") != "flat"
+            )
+            lines.append(
+                f"| {row.get('ticker')} | {row.get('delta')} | {row.get('finalScore')} | {row.get('previousFinalScore', '-')} | "
+                f"{row.get('previousGate', '-')} → {row.get('gate', '-')} | {drivers or row.get('summary', '-')} |"
+            )
+    else:
+        lines.append("| - | - | - | - | - | No prior run available. |")
+
     card = doc.get("modelCard") or {}
     lines.extend(
         [
@@ -1415,6 +1601,7 @@ def render_report(doc: dict) -> str:
             f"- DATA_REVIEW count: {card.get('dataReviewCount', '-')}",
             f"- Soft data-review flags: {card.get('softDataReviewCount', '-')}",
             f"- Momentum scores at 100: {card.get('momentumScoreAt100Count', '-')}",
+            f"- Score delta attribution: {delta_meta.get('attributedCount', 0)}/{delta_meta.get('totalCount', 0)} names",
             f"- Risk floor: {(card.get('thresholds') or {}).get('riskFloor', '-')}",
             f"- Max single-name portfolio weight: {(card.get('thresholds') or {}).get('maxSinglePositionWeight', '-')}%",
         ]
@@ -1497,11 +1684,13 @@ def fmt_pct(value: Optional[float]) -> str:
 def build_document(args) -> dict:
     company_tickers = [c.ticker for c in UNIVERSE]
     tickers = company_tickers + ["SOXX"]
+    previous_doc = load_previous_document(Path(args.out_json))
     prices = load_market_data(tickers, args.period, no_fetch=args.no_fetch)
     profiles = load_market_profiles(company_tickers, no_fetch=args.no_fetch)
     payload = read_dashboard_payload(Path(args.dashboard)) if args.dashboard else None
     exposures = portfolio_exposure(payload)
     scores, latest_date = build_scores(prices, exposures, profiles)
+    annotate_score_deltas(scores, previous_doc)
     generated_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     return {
         "schemaVersion": 3,

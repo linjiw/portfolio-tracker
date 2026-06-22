@@ -170,6 +170,53 @@ hardDataFlags[]
 Each flag carries ticker, company name, severity, rule and detail so the audit
 panel can be inspected without opening the raw JSON.
 
+## v0.4 Score Delta Attribution
+
+v0.4 keeps the v0.3.1 scoring/gate framework intact and adds a dynamic monitor:
+each run compares the current rows with the prior `output/ai_semi_quant.json`
+snapshot before overwriting it.
+
+Each row now includes:
+
+```text
+scoreDelta
+scoreDeltaAttribution{
+  previousFinalScore
+  currentFinalScore
+  finalDelta
+  previousGate
+  currentGate
+  gateChanged
+  components[]
+  topDrivers[]
+  summary
+}
+```
+
+The first attribution model is intentionally lightweight. It decomposes the
+final-score change into the parts that directly drive the existing formula:
+
+```text
+Structure/torque contribution = Δ torqueAdjustedScore × 0.76
+Tactical contribution         = Δ tacticalScore × 0.24
+Risk penalty contribution     = -Δ riskPenalty
+Portfolio penalty contribution= -Δ portfolioPenalty
+```
+
+The attribution is approximate because final scores are rounded and gates can
+change for data-quality or threshold reasons. Those non-formula effects are
+shown as gate/data-quality changes and, when needed, a rounding/other residual.
+
+This answers the first v0.4 question:
+
+```text
+分数为什么变了？
+```
+
+It does not yet claim that real capital has confirmed the move. Dynamic
+capital-flow edge weights, live capex/holdings confirmation, and the first
+lightweight backtest remain separate v0.4 follow-up modules.
+
 ## Research Gates
 
 `ALLOW_PLAN` means the name can enter staged plan review. It is not an automatic
