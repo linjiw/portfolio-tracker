@@ -1,0 +1,3131 @@
+[
+  {
+    "companyId": "samsung_electro_mechanics",
+    "name": "Samsung Electro-Mechanics",
+    "ticker": "009150.KS",
+    "aliases": [],
+    "bucket": "Advanced packaging / substrates",
+    "oldLabel": "Phone components, MLCC, package substrates",
+    "aiBottleneck": "AI/server FCBGA substrates and high-reliability MLCCs",
+    "thesis": "Phone component and substrate know-how can migrate into AI server FCBGA and high-layer package substrates.",
+    "factors": {
+      "bottleneckFit": 84,
+      "proofPoints": 76,
+      "monetizationPath": 72,
+      "underappreciation": 82,
+      "executionRiskControl": 56
+    },
+    "riskFlags": [
+      "Korea listing and FX",
+      "substrate cycle"
+    ],
+    "watchKpis": [
+      "AI/server FCBGA revenue",
+      "high-layer substrate capacity",
+      "MLCC AI server mix"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Advanced packaging / substrates / materials",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "capex_expansion",
+    "conviction": "high",
+    "catalysts": [
+      "server FCBGA capacity utilization",
+      "AI substrate customer wins",
+      "MLCC mix shift to servers"
+    ],
+    "rebuttalChecks": [
+      "FCBGA cycle rolls over",
+      "AI substrate revenue remains immaterial",
+      "commodity MLCC cycle dominates"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Samsung Electro-Mechanics is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "Samsung Electro-Mechanics FCBGA"
+    ]
+  },
+  {
+    "companyId": "ajinomoto",
+    "name": "Ajinomoto",
+    "ticker": "2802.T",
+    "aliases": [],
+    "bucket": "Advanced packaging / substrates",
+    "oldLabel": "Food and specialty chemicals",
+    "aiBottleneck": "ABF material for build-up substrates",
+    "thesis": "Ajinomoto is a classic old-label mismatch: a food/chemical group controls ABF material used in advanced package substrates.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 78,
+      "monetizationPath": 74,
+      "underappreciation": 84,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "conglomerate dilution",
+      "Japan listing and FX"
+    ],
+    "watchKpis": [
+      "ABF demand and pricing",
+      "advanced substrate capacity additions",
+      "materials margin"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Advanced packaging / substrates / materials",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "capex_expansion",
+    "conviction": "high",
+    "catalysts": [
+      "ABF volume/pricing disclosure",
+      "advanced substrate capex cycle",
+      "materials segment margin"
+    ],
+    "rebuttalChecks": [
+      "ABF share or pricing weakens",
+      "food/conglomerate segments dominate valuation",
+      "alternative substrate materials reduce scarcity"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Ajinomoto is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "Ajinomoto ABF"
+    ]
+  },
+  {
+    "companyId": "ibiden",
+    "name": "Ibiden",
+    "ticker": "4062.T",
+    "aliases": [],
+    "bucket": "Advanced packaging / substrates",
+    "oldLabel": "ABF and IC package substrates",
+    "aiBottleneck": "High-performance AI/server IC package substrates",
+    "thesis": "AI accelerators require larger, higher-layer package substrates, directly matching Ibiden expansion plans.",
+    "factors": {
+      "bottleneckFit": 88,
+      "proofPoints": 82,
+      "monetizationPath": 78,
+      "underappreciation": 72,
+      "executionRiskControl": 58
+    },
+    "riskFlags": [
+      "Japan listing and FX",
+      "substrate cycle"
+    ],
+    "watchKpis": [
+      "2026-2028 substrate capex",
+      "AI/server substrate utilization",
+      "customer prepayments"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Advanced packaging / substrates / materials",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "capex_expansion",
+    "conviction": "high",
+    "catalysts": [
+      "high-performance substrate capex execution",
+      "AI/server utilization",
+      "customer prepayment or backlog"
+    ],
+    "rebuttalChecks": [
+      "substrate shortage eases faster than expected",
+      "capex creates overcapacity",
+      "pricing power fades"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Ibiden is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "Ibiden substrate capex"
+    ]
+  },
+  {
+    "companyId": "mediatek",
+    "name": "MediaTek",
+    "ticker": "2454.TW",
+    "aliases": [
+      "MDTKF"
+    ],
+    "bucket": "Custom AI silicon / SoC integration",
+    "oldLabel": "Handset SoC vendor",
+    "aiBottleneck": "Customer-defined AI SoC engineering, advanced packaging coordination, and low-conflict ASIC service",
+    "thesis": "The core asset is not only handset share; it is the ability to turn customer-owned AI IP into manufacturable SoCs across foundry and packaging routes.",
+    "factors": {
+      "bottleneckFit": 90,
+      "proofPoints": 82,
+      "monetizationPath": 78,
+      "underappreciation": 88,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "Taiwan listing and FX",
+      "custom silicon revenue timing"
+    ],
+    "watchKpis": [
+      "custom AI chip revenue guide",
+      "NVIDIA or Google project evidence",
+      "CoWoS/EMIB support"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / SoC landing partners",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "high",
+    "catalysts": [
+      "2026 cloud AI chip revenue toward $1B",
+      "2027 accelerator ASIC revenue guide",
+      "non-phone ASIC customer disclosure"
+    ],
+    "rebuttalChecks": [
+      "AI ASIC revenue slips or stays immaterial",
+      "project economics resemble low-margin services",
+      "customer concentration rises without multi-year visibility"
+    ],
+    "researchQuestions": [
+      "What percent of MediaTek revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "MediaTek cloud AI revenue",
+      "NVIDIA GB10",
+      "custom ASIC"
+    ]
+  },
+  {
+    "companyId": "nxp",
+    "name": "NXP Semiconductors",
+    "ticker": "NXPI",
+    "aliases": [],
+    "bucket": "Physical AI / auto and industrial edge",
+    "oldLabel": "Auto and industrial semiconductors",
+    "aiBottleneck": "Automotive edge processing, secure MCUs, connectivity, and industrial AI control",
+    "thesis": "NXP is a slower physical-AI candidate: less explosive than cloud suppliers, but well positioned if cars and factories absorb more local inference.",
+    "factors": {
+      "bottleneckFit": 68,
+      "proofPoints": 62,
+      "monetizationPath": 66,
+      "underappreciation": 64,
+      "executionRiskControl": 68
+    },
+    "riskFlags": [
+      "auto cycle",
+      "slower adoption"
+    ],
+    "watchKpis": [
+      "auto processor wins",
+      "industrial IoT growth",
+      "edge AI MCU attach"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Auto / industrial edge control",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium-high",
+    "catalysts": [
+      "industrial IoT growth stays above core company growth",
+      "auto processor/security design wins",
+      "edge AI attach in MCUs/MPUs"
+    ],
+    "rebuttalChecks": [
+      "auto cycle recovery is the whole story",
+      "industrial AI stays pilot-only",
+      "gross margin fails to improve with mix"
+    ],
+    "researchQuestions": [
+      "What percent of NXP Semiconductors revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "physical AI control",
+      "auto/industrial edge"
+    ]
+  },
+  {
+    "companyId": "stmicro",
+    "name": "STMicroelectronics",
+    "ticker": "STM",
+    "aliases": [
+      "STMPA.PA"
+    ],
+    "bucket": "Physical AI / auto and industrial edge",
+    "oldLabel": "MCU, analog, power, and sensors",
+    "aiBottleneck": "Industrial sensors, MCUs, power devices, and embedded AI at the edge",
+    "thesis": "STMicro's sensors, MCUs, and power chips fit physical AI, though near-term auto/industrial cycles can dominate the AI thesis.",
+    "factors": {
+      "bottleneckFit": 66,
+      "proofPoints": 58,
+      "monetizationPath": 60,
+      "underappreciation": 68,
+      "executionRiskControl": 60
+    },
+    "riskFlags": [
+      "auto/industrial downturn",
+      "Europe listing/FX mix"
+    ],
+    "watchKpis": [
+      "edge AI MCU revenue",
+      "sensor growth",
+      "auto/industrial orders"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Auto / industrial edge control",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium-high",
+    "catalysts": [
+      "data-center revenue guide moves toward $1B+",
+      "power/management chip margin lift",
+      "auto/industrial order recovery"
+    ],
+    "rebuttalChecks": [
+      "data center remains too small versus auto/industrial drag",
+      "MCU cycle weakens further",
+      "AI narrative does not show in segment disclosures"
+    ],
+    "researchQuestions": [
+      "What percent of STMicroelectronics revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "ST data center revenue target",
+      "power management"
+    ]
+  },
+  {
+    "companyId": "qualcomm",
+    "name": "Qualcomm",
+    "ticker": "QCOM",
+    "aliases": [],
+    "bucket": "Edge AI / low-power inference",
+    "oldLabel": "Mobile SoC, modem, licensing",
+    "aiBottleneck": "Low-power heterogeneous inference, edge NPU, and data-center inference optionality",
+    "thesis": "Mobile SoC integration, Hexagon NPU, connectivity, and acquired high-speed silicon IP can be reused as AI inference moves from cloud-only training into devices and power-constrained racks.",
+    "factors": {
+      "bottleneckFit": 88,
+      "proofPoints": 78,
+      "monetizationPath": 76,
+      "underappreciation": 84,
+      "executionRiskControl": 60
+    },
+    "riskFlags": [
+      "cloud software ecosystem is unproven",
+      "phone cycle still matters"
+    ],
+    "watchKpis": [
+      "AI200/AI250 customer wins",
+      "Alphawave integration",
+      "edge AI attach rate"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Edge AI chips / low-power inference",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "major_customer_deployment",
+    "conviction": "high",
+    "catalysts": [
+      "AI200/AI250 commercial shipment",
+      "HUMAIN 200MW deployment progress",
+      "second hyperscaler inference customer"
+    ],
+    "rebuttalChecks": [
+      "No second large customer after HUMAIN",
+      "software ecosystem fails to attract cloud inference workloads",
+      "handset weakness absorbs AI optionality"
+    ],
+    "researchQuestions": [
+      "What percent of Qualcomm revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "QCOM AI200/AI250",
+      "low-power inference",
+      "HUMAIN deployment"
+    ]
+  },
+  {
+    "companyId": "sony",
+    "name": "Sony",
+    "ticker": "SONY",
+    "aliases": [
+      "6758.T"
+    ],
+    "bucket": "AI sensing / physical-world data",
+    "oldLabel": "Entertainment, gaming, consumer electronics",
+    "aiBottleneck": "Image sensors and in-sensor AI for robots, glasses, cars, and industrial vision",
+    "thesis": "If physical AI needs eyes, Sony's image sensor franchise can become a scarce data-ingestion layer rather than a generic consumer-electronics component.",
+    "factors": {
+      "bottleneckFit": 82,
+      "proofPoints": 70,
+      "monetizationPath": 72,
+      "underappreciation": 78,
+      "executionRiskControl": 68
+    },
+    "riskFlags": [
+      "mixed conglomerate exposure",
+      "sensor cycle"
+    ],
+    "watchKpis": [
+      "intelligent vision sensor revenue",
+      "robotics/auto sensor wins",
+      "image-sensor margin"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Physical AI sensing / machine vision",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "capex_expansion",
+    "conviction": "high",
+    "catalysts": [
+      "image sensor capex tied to physical AI",
+      "robotics/auto/global shutter design wins",
+      "sensor segment margin expansion"
+    ],
+    "rebuttalChecks": [
+      "sensor growth remains smartphone-cycle driven",
+      "gaming/entertainment dominates valuation narrative",
+      "robotics/physical AI adoption remains too slow"
+    ],
+    "researchQuestions": [
+      "What percent of Sony revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "physical AI sensing",
+      "image sensor subsidy"
+    ]
+  },
+  {
+    "companyId": "infineon",
+    "name": "Infineon",
+    "ticker": "IFX.DE",
+    "aliases": [
+      "IFNNY"
+    ],
+    "bucket": "Physical AI / power semiconductors",
+    "oldLabel": "Power, auto, and industrial semiconductors",
+    "aiBottleneck": "Power semiconductors for data centers, EVs, robotics, and industrial automation",
+    "thesis": "Physical AI and AI factories both need efficient power conversion; Infineon is positioned, but current auto/industrial softness may mask the thesis.",
+    "factors": {
+      "bottleneckFit": 68,
+      "proofPoints": 60,
+      "monetizationPath": 62,
+      "underappreciation": 66,
+      "executionRiskControl": 62
+    },
+    "riskFlags": [
+      "auto cycle",
+      "industrial cycle",
+      "Europe listing and FX"
+    ],
+    "watchKpis": [
+      "SiC/power module demand",
+      "data-center power exposure",
+      "auto order recovery"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Power semiconductors / physical AI",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "high",
+    "catalysts": [
+      "AI data-center revenue toward EUR2.5B",
+      "power module backlog",
+      "auto/industrial trough stabilizes"
+    ],
+    "rebuttalChecks": [
+      "AI power revenue cannot offset auto weakness",
+      "European cost base compresses margins",
+      "SiC/power cycle deteriorates"
+    ],
+    "researchQuestions": [
+      "What percent of Infineon revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "AI data center power",
+      "Infineon revenue guide"
+    ]
+  },
+  {
+    "companyId": "onsemi",
+    "name": "Onsemi",
+    "ticker": "ON",
+    "aliases": [],
+    "bucket": "Physical AI / power semiconductors",
+    "oldLabel": "Auto/industrial power and image sensors",
+    "aiBottleneck": "Power and sensing chips for AI data centers, autos, industrial automation, and physical AI",
+    "thesis": "Onsemi can be re-rated if AI data-center power and sensing become visible enough to offset auto/SiC cyclicality.",
+    "factors": {
+      "bottleneckFit": 72,
+      "proofPoints": 64,
+      "monetizationPath": 66,
+      "underappreciation": 78,
+      "executionRiskControl": 54
+    },
+    "riskFlags": [
+      "auto/SiC cycle",
+      "margin volatility"
+    ],
+    "watchKpis": [
+      "AI data-center revenue growth",
+      "power solutions growth",
+      "image sensor/auto recovery"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Power semiconductors / physical AI",
+    "priorityTier": "T1 immediate deep dive",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium-high",
+    "catalysts": [
+      "AI data-center power revenue",
+      "Power Solutions margin trend",
+      "auto/industrial order bottom"
+    ],
+    "rebuttalChecks": [
+      "SiC weakness overwhelms AI growth",
+      "AI data-center exposure stays too small",
+      "customer concentration or pricing worsens"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Onsemi is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "ON AI data center demand"
+    ]
+  },
+  {
+    "companyId": "tsmc",
+    "name": "TSMC",
+    "ticker": "TSM",
+    "aliases": [
+      "2330.TW"
+    ],
+    "bucket": "Advanced manufacturing / packaging",
+    "oldLabel": "Foundry",
+    "aiBottleneck": "Advanced logic, CoWoS, SoIC, and leading-node manufacturing capacity",
+    "thesis": "TSMC is not hidden anymore, but it remains the cleanest physical bottleneck in advanced AI silicon manufacturing.",
+    "factors": {
+      "bottleneckFit": 96,
+      "proofPoints": 92,
+      "monetizationPath": 90,
+      "underappreciation": 42,
+      "executionRiskControl": 78
+    },
+    "riskFlags": [
+      "Taiwan geopolitics",
+      "already consensus"
+    ],
+    "watchKpis": [
+      "CoWoS capacity",
+      "3nm/2nm utilization",
+      "AI customer prepayments"
+    ],
+    "stage": "Stage 1/2 - compute foundation",
+    "direction": "Advanced manufacturing / packaging",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "CoWoS capacity",
+      "3nm/2nm utilization",
+      "AI customer prepayments"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for TSM",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of TSMC revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "sk_hynix",
+    "name": "SK hynix",
+    "ticker": "000660.KS",
+    "aliases": [],
+    "bucket": "HBM / memory bandwidth",
+    "oldLabel": "Cyclical memory",
+    "aiBottleneck": "HBM leadership and AI accelerator memory supply",
+    "thesis": "SK hynix has the strongest direct HBM exposure in this watchlist, but stock access, FX, and memory-cycle risk remain important.",
+    "factors": {
+      "bottleneckFit": 94,
+      "proofPoints": 90,
+      "monetizationPath": 88,
+      "underappreciation": 48,
+      "executionRiskControl": 58
+    },
+    "riskFlags": [
+      "Korea listing and FX",
+      "memory cycle",
+      "NVIDIA customer concentration"
+    ],
+    "watchKpis": [
+      "HBM4/HBM4E qualification",
+      "HBM capacity allocation",
+      "customer mix"
+    ],
+    "stage": "Stage 1/2 - compute foundation",
+    "direction": "HBM / memory bandwidth",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "HBM4/HBM4E qualification",
+      "HBM capacity allocation",
+      "customer mix"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 000660.KS",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of SK hynix revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "samsung",
+    "name": "Samsung Electronics",
+    "ticker": "005930.KS",
+    "aliases": [
+      "SMSN.L"
+    ],
+    "bucket": "HBM / memory bandwidth",
+    "oldLabel": "Memory, mobile, display, and foundry conglomerate",
+    "aiBottleneck": "HBM catch-up, DRAM scale, foundry second source, and advanced packaging",
+    "thesis": "Samsung has massive optionality if HBM and foundry execution recover, but its score is held back by execution uncertainty.",
+    "factors": {
+      "bottleneckFit": 82,
+      "proofPoints": 62,
+      "monetizationPath": 78,
+      "underappreciation": 72,
+      "executionRiskControl": 52
+    },
+    "riskFlags": [
+      "HBM qualification",
+      "foundry losses",
+      "conglomerate complexity"
+    ],
+    "watchKpis": [
+      "HBM qualification",
+      "foundry customer wins",
+      "memory margin"
+    ],
+    "stage": "Stage 1/2 - compute foundation",
+    "direction": "HBM / memory bandwidth",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "HBM qualification",
+      "foundry customer wins",
+      "memory margin"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 005930.KS",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Samsung Electronics revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "micron",
+    "name": "Micron",
+    "ticker": "MU",
+    "aliases": [],
+    "bucket": "HBM / memory bandwidth",
+    "oldLabel": "Cyclical memory",
+    "aiBottleneck": "HBM and DRAM bandwidth for training and inference memory walls",
+    "thesis": "AI makes HBM a strategic bottleneck, giving Micron US-listed share-gain torque if qualifications and pricing hold.",
+    "factors": {
+      "bottleneckFit": 90,
+      "proofPoints": 82,
+      "monetizationPath": 84,
+      "underappreciation": 58,
+      "executionRiskControl": 54
+    },
+    "riskFlags": [
+      "memory cycle",
+      "capex intensity"
+    ],
+    "watchKpis": [
+      "HBM share",
+      "HBM pricing",
+      "DRAM contract prices"
+    ],
+    "stage": "Stage 1/2 - compute foundation",
+    "direction": "HBM / memory bandwidth",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "HBM share",
+      "HBM pricing",
+      "DRAM contract prices"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for MU",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Micron revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "arista",
+    "name": "Arista Networks",
+    "ticker": "ANET",
+    "aliases": [],
+    "bucket": "AI interconnect / data movement",
+    "oldLabel": "Cloud Ethernet switching",
+    "aiBottleneck": "Ethernet switching and network OS for large AI clusters",
+    "thesis": "As AI clusters shift toward Ethernet alternatives and massive east-west traffic, Arista remains a core networking beneficiary with stronger quality but less hidden upside.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 86,
+      "monetizationPath": 84,
+      "underappreciation": 54,
+      "executionRiskControl": 76
+    },
+    "riskFlags": [
+      "cloud capex timing",
+      "valuation"
+    ],
+    "watchKpis": [
+      "AI networking revenue",
+      "cloud titan concentration",
+      "gross margin trend"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "AI networking / high-speed interconnect",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "AI networking revenue",
+      "cloud titan concentration",
+      "gross margin trend"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for ANET",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Arista Networks revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "AI Ethernet switching",
+      "cloud networking demand"
+    ]
+  },
+  {
+    "companyId": "unimicron",
+    "name": "Unimicron",
+    "ticker": "3037.TW",
+    "aliases": [],
+    "bucket": "Advanced packaging / substrates",
+    "oldLabel": "PCB and IC substrates",
+    "aiBottleneck": "AI/HPC IC substrates and server PCB demand",
+    "thesis": "Unimicron is a Taiwan substrate/PCB route into AI server complexity, with more cyclicality than pure material chokepoints.",
+    "factors": {
+      "bottleneckFit": 78,
+      "proofPoints": 68,
+      "monetizationPath": 68,
+      "underappreciation": 76,
+      "executionRiskControl": 52
+    },
+    "riskFlags": [
+      "Taiwan listing",
+      "substrate/PCB cycle"
+    ],
+    "watchKpis": [
+      "AI/HPC substrate mix",
+      "server PCB orders",
+      "margin recovery"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Advanced packaging / substrates / materials",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium-high",
+    "catalysts": [
+      "AI/HPC substrate mix shift",
+      "server PCB orders",
+      "margin recovery"
+    ],
+    "rebuttalChecks": [
+      "PCB cycle dominates",
+      "AI/HPC mix remains low",
+      "pricing competition rises"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Unimicron is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "Unimicron AI/HPC substrate"
+    ]
+  },
+  {
+    "companyId": "arm",
+    "name": "Arm",
+    "ticker": "ARM",
+    "aliases": [],
+    "bucket": "CPU IP / custom SoC tax",
+    "oldLabel": "Smartphone CPU IP",
+    "aiBottleneck": "Low-power CPU IP for hyperscaler custom silicon, AI server CPUs, and edge devices",
+    "thesis": "Arm collects an IP toll as custom CPUs, DPUs, control processors, and accelerator companion SoCs proliferate across cloud and edge AI.",
+    "factors": {
+      "bottleneckFit": 87,
+      "proofPoints": 84,
+      "monetizationPath": 86,
+      "underappreciation": 60,
+      "executionRiskControl": 70
+    },
+    "riskFlags": [
+      "valuation",
+      "RISC-V substitution in some control cores"
+    ],
+    "watchKpis": [
+      "cloud CPU royalty growth",
+      "v9 royalty mix",
+      "custom AI SoC design wins"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / EDA / IP",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "cloud CPU royalty growth",
+      "v9 royalty mix",
+      "custom AI SoC design wins"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for ARM",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Arm revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "cadence",
+    "name": "Cadence Design Systems",
+    "ticker": "CDNS",
+    "aliases": [],
+    "bucket": "EDA / custom chip design tools",
+    "oldLabel": "EDA software",
+    "aiBottleneck": "Design, simulation, verification, IP, and system analysis for custom AI chips",
+    "thesis": "Every new custom AI chip project increases EDA, verification, and IP demand; Cadence is a toll road on chip design complexity.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 88,
+      "monetizationPath": 88,
+      "underappreciation": 46,
+      "executionRiskControl": 82
+    },
+    "riskFlags": [
+      "valuation",
+      "already well understood"
+    ],
+    "watchKpis": [
+      "EDA backlog",
+      "AI design win commentary",
+      "hardware emulation demand"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / EDA / IP",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "EDA backlog",
+      "AI design win commentary",
+      "hardware emulation demand"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for CDNS",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Cadence Design Systems revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "synopsys",
+    "name": "Synopsys",
+    "ticker": "SNPS",
+    "aliases": [],
+    "bucket": "EDA / custom chip design tools",
+    "oldLabel": "EDA and semiconductor IP",
+    "aiBottleneck": "EDA, verification, IP, security, and multiphysics design flows for custom AI silicon",
+    "thesis": "Synopsys monetizes the custom silicon wave through EDA and IP royalties, with durable quality but less hiddenness.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 88,
+      "monetizationPath": 88,
+      "underappreciation": 44,
+      "executionRiskControl": 82
+    },
+    "riskFlags": [
+      "valuation",
+      "deal integration"
+    ],
+    "watchKpis": [
+      "EDA revenue growth",
+      "IP growth",
+      "AI design automation commentary"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / EDA / IP",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "EDA revenue growth",
+      "IP growth",
+      "AI design automation commentary"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for SNPS",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Synopsys revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "broadcom",
+    "name": "Broadcom",
+    "ticker": "AVGO",
+    "aliases": [],
+    "bucket": "Custom AI silicon / networking",
+    "oldLabel": "Communications chips and infrastructure software",
+    "aiBottleneck": "Hyperscaler custom ASICs, Ethernet networking, SerDes, and AI rack connectivity",
+    "thesis": "Broadcom is already partly re-rated, but multi-generation custom AI chip and networking relationships make it a core control point in AI factories.",
+    "factors": {
+      "bottleneckFit": 94,
+      "proofPoints": 92,
+      "monetizationPath": 90,
+      "underappreciation": 48,
+      "executionRiskControl": 76
+    },
+    "riskFlags": [
+      "expectations already high",
+      "customer concentration"
+    ],
+    "watchKpis": [
+      "custom AI silicon backlog",
+      "networking attach rate",
+      "hyperscaler contract duration"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / networking",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "major_customer_contract",
+    "conviction": "medium",
+    "catalysts": [
+      "custom AI silicon backlog",
+      "networking attach rate",
+      "hyperscaler contract duration"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for AVGO",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Broadcom revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "marvell",
+    "name": "Marvell",
+    "ticker": "MRVL",
+    "aliases": [],
+    "bucket": "Custom AI silicon / networking",
+    "oldLabel": "Storage and networking chips",
+    "aiBottleneck": "Custom silicon, DSPs, optical interconnect, SerDes, and data-center networking",
+    "thesis": "Marvell has the right assets for AI data movement and custom silicon, but the score depends on whether large customer projects become durable multi-generation revenue.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 72,
+      "monetizationPath": 74,
+      "underappreciation": 72,
+      "executionRiskControl": 58
+    },
+    "riskFlags": [
+      "project timing",
+      "large-customer concentration"
+    ],
+    "watchKpis": [
+      "custom silicon revenue",
+      "optical DSP growth",
+      "AI customer concentration"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Custom ASIC / networking",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "custom silicon revenue",
+      "optical DSP growth",
+      "AI customer concentration"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for MRVL",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Marvell revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "custom chip FY2029 target",
+      "optical DSP"
+    ]
+  },
+  {
+    "companyId": "amphenol",
+    "name": "Amphenol",
+    "ticker": "APH",
+    "aliases": [],
+    "bucket": "Connectors / physical data movement",
+    "oldLabel": "Connectors and interconnect components",
+    "aiBottleneck": "High-density connectors and interconnects inside AI servers, racks, and data centers",
+    "thesis": "AI factories are physical systems; connector density and reliability become higher-value infrastructure rather than generic industrial parts.",
+    "factors": {
+      "bottleneckFit": 76,
+      "proofPoints": 78,
+      "monetizationPath": 76,
+      "underappreciation": 58,
+      "executionRiskControl": 78
+    },
+    "riskFlags": [
+      "valuation",
+      "broad industrial mix"
+    ],
+    "watchKpis": [
+      "IT/data-communications growth",
+      "AI server connector mix",
+      "margin stability"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / connectors / physical data movement",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "IT/data-communications growth",
+      "AI server connector mix",
+      "margin stability"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for APH",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Amphenol revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "te_connectivity",
+    "name": "TE Connectivity",
+    "ticker": "TEL",
+    "aliases": [],
+    "bucket": "Connectors / physical data movement",
+    "oldLabel": "Industrial connectors and sensors",
+    "aiBottleneck": "Connectors, sensors, and rugged interconnects for data centers, autos, and robots",
+    "thesis": "TE is a steadier interconnect and sensor compounder that can benefit as AI moves into data centers and physical systems.",
+    "factors": {
+      "bottleneckFit": 66,
+      "proofPoints": 64,
+      "monetizationPath": 68,
+      "underappreciation": 58,
+      "executionRiskControl": 74
+    },
+    "riskFlags": [
+      "lower AI purity",
+      "industrial/auto cycle"
+    ],
+    "watchKpis": [
+      "data and devices growth",
+      "AI server connector content",
+      "industrial sensor recovery"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / connectors / physical data movement",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "data-center connector content",
+      "industrial recovery",
+      "sensor mix improvement"
+    ],
+    "rebuttalChecks": [
+      "AI exposure remains too diluted",
+      "auto/industrial downturn persists",
+      "valuation already reflects quality"
+    ],
+    "researchQuestions": [
+      "What reported line item proves TE Connectivity is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "connectors AI infrastructure"
+    ]
+  },
+  {
+    "companyId": "corning",
+    "name": "Corning",
+    "ticker": "GLW",
+    "aliases": [],
+    "bucket": "Optics / photonics",
+    "oldLabel": "Glass, fiber, display materials",
+    "aiBottleneck": "Fiber, glass, and optical materials for high-density AI data-center networks",
+    "thesis": "Corning is less pure than component suppliers, but AI data-center fiber intensity can re-rate an old materials franchise.",
+    "factors": {
+      "bottleneckFit": 70,
+      "proofPoints": 62,
+      "monetizationPath": 68,
+      "underappreciation": 66,
+      "executionRiskControl": 70
+    },
+    "riskFlags": [
+      "mixed end markets",
+      "lower AI purity"
+    ],
+    "watchKpis": [
+      "optical communications growth",
+      "data-center fiber demand",
+      "display-cycle drag"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / photonics / data movement",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "major_customer_contract",
+    "conviction": "medium",
+    "catalysts": [
+      "optical communications growth",
+      "data-center fiber demand",
+      "display-cycle drag"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for GLW",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Corning revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "Meta fiber agreement",
+      "AI optical infrastructure"
+    ]
+  },
+  {
+    "companyId": "delta_electronics",
+    "name": "Delta Electronics",
+    "ticker": "2308.TW",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Power supplies and industrial electronics",
+    "aiBottleneck": "High-efficiency power supplies, thermal modules, and data-center infrastructure",
+    "thesis": "Delta's power and thermal capabilities fit AI server density, but Taiwan listing access and mixed end markets matter.",
+    "factors": {
+      "bottleneckFit": 78,
+      "proofPoints": 72,
+      "monetizationPath": 74,
+      "underappreciation": 68,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "Taiwan listing and FX",
+      "industrial mix"
+    ],
+    "watchKpis": [
+      "AI server power revenue",
+      "data-center thermal wins",
+      "gross margin mix"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "AI server power revenue",
+      "data-center thermal wins",
+      "gross margin mix"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 2308.TW",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Delta Electronics revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "eaton",
+    "name": "Eaton",
+    "ticker": "ETN",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Electrical equipment and power management",
+    "aiBottleneck": "Power distribution, UPS, switchgear, and thermal integration for AI data centers",
+    "thesis": "AI power density and grid constraints pull Eaton's electrical franchise into the AI capex stack.",
+    "factors": {
+      "bottleneckFit": 82,
+      "proofPoints": 82,
+      "monetizationPath": 80,
+      "underappreciation": 56,
+      "executionRiskControl": 76
+    },
+    "riskFlags": [
+      "industrial multiple",
+      "large-cap re-rating"
+    ],
+    "watchKpis": [
+      "data-center electrical orders",
+      "liquid-cooling integration",
+      "backlog conversion"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "data-center electrical orders",
+      "liquid-cooling integration",
+      "backlog conversion"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for ETN",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Eaton revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "ge_vernova",
+    "name": "GE Vernova",
+    "ticker": "GEV",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Power generation and grid equipment",
+    "aiBottleneck": "Grid, power generation, and electrification capacity for AI data centers",
+    "thesis": "GE Vernova is a grid/power constraint beneficiary when AI data centers need utility-scale power and grid upgrades.",
+    "factors": {
+      "bottleneckFit": 66,
+      "proofPoints": 66,
+      "monetizationPath": 70,
+      "underappreciation": 54,
+      "executionRiskControl": 60
+    },
+    "riskFlags": [
+      "power equipment cycle",
+      "valuation after rerating"
+    ],
+    "watchKpis": [
+      "grid backlog",
+      "gas turbine/data-center power demand",
+      "margin execution"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "grid backlog growth",
+      "data-center power demand",
+      "margin execution"
+    ],
+    "rebuttalChecks": [
+      "AI power demand shifts to other vendors",
+      "grid project timing slips",
+      "valuation already discounts power scarcity"
+    ],
+    "researchQuestions": [
+      "What reported line item proves GE Vernova is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "AI power generation grid"
+    ]
+  },
+  {
+    "companyId": "mpwr",
+    "name": "Monolithic Power Systems",
+    "ticker": "MPWR",
+    "aliases": [],
+    "bucket": "Power semiconductors / AI server power",
+    "oldLabel": "High-performance power management",
+    "aiBottleneck": "Voltage regulation and power management for AI servers and accelerators",
+    "thesis": "MPWR is a higher-quality power-management way to track AI server power density, though valuation often reflects this.",
+    "factors": {
+      "bottleneckFit": 78,
+      "proofPoints": 72,
+      "monetizationPath": 78,
+      "underappreciation": 52,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "valuation",
+      "customer concentration"
+    ],
+    "watchKpis": [
+      "AI server power revenue",
+      "gross margin durability",
+      "large customer mix"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "AI server power-management growth",
+      "customer diversification",
+      "margin durability"
+    ],
+    "rebuttalChecks": [
+      "valuation already discounts growth",
+      "customer concentration increases",
+      "AI server inventory correction"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Monolithic Power Systems is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "AI server power"
+    ]
+  },
+  {
+    "companyId": "schneider",
+    "name": "Schneider Electric",
+    "ticker": "SU.PA",
+    "aliases": [
+      "SBGSY"
+    ],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Electrical automation and energy management",
+    "aiBottleneck": "Power equipment, energy management, racks, and cooling systems for AI data centers",
+    "thesis": "Schneider is a high-quality industrial compounder whose AI angle is grounded in actual power and cooling bottlenecks.",
+    "factors": {
+      "bottleneckFit": 80,
+      "proofPoints": 82,
+      "monetizationPath": 80,
+      "underappreciation": 50,
+      "executionRiskControl": 78
+    },
+    "riskFlags": [
+      "European listing and FX",
+      "valuation"
+    ],
+    "watchKpis": [
+      "data-center revenue growth",
+      "energy-management backlog",
+      "cooling orders"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "data-center revenue growth",
+      "energy-management backlog",
+      "cooling orders"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for SU.PA",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Schneider Electric revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "vertiv",
+    "name": "Vertiv",
+    "ticker": "VRT",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Data-center power and thermal equipment",
+    "aiBottleneck": "Liquid cooling, power management, racks, and thermal infrastructure for high-density AI data centers",
+    "thesis": "AI capex is turning old data-center thermal and power equipment into strategic AI factory infrastructure.",
+    "factors": {
+      "bottleneckFit": 88,
+      "proofPoints": 86,
+      "monetizationPath": 84,
+      "underappreciation": 54,
+      "executionRiskControl": 68
+    },
+    "riskFlags": [
+      "expectations high",
+      "data-center capex cycle"
+    ],
+    "watchKpis": [
+      "liquid-cooling backlog",
+      "order growth",
+      "margin expansion"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T2 quality discovered",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "liquid-cooling backlog",
+      "order growth",
+      "margin expansion"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for VRT",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Vertiv revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "astera_labs",
+    "name": "Astera Labs",
+    "ticker": "ALAB",
+    "aliases": [],
+    "bucket": "AI interconnect / data movement",
+    "oldLabel": "High-speed connectivity startup",
+    "aiBottleneck": "PCIe, CXL, retimers, and rack-level data movement in AI servers",
+    "thesis": "AI clusters waste capital when accelerators wait on data; Astera monetizes the inside-the-rack connectivity layer, with high growth but high valuation risk.",
+    "factors": {
+      "bottleneckFit": 88,
+      "proofPoints": 74,
+      "monetizationPath": 78,
+      "underappreciation": 56,
+      "executionRiskControl": 46
+    },
+    "riskFlags": [
+      "valuation",
+      "post-IPO volatility",
+      "customer concentration"
+    ],
+    "watchKpis": [
+      "PCIe/CXL product adoption",
+      "cloud customer mix",
+      "gross margin durability"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "AI networking / high-speed interconnect",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "major_customer_contract",
+    "conviction": "medium",
+    "catalysts": [
+      "PCIe/CXL product adoption",
+      "cloud customer mix",
+      "gross margin durability"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for ALAB",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Astera Labs revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "Amazon warrant agreement",
+      "rack-scale AI connectivity"
+    ]
+  },
+  {
+    "companyId": "credo",
+    "name": "Credo Technology",
+    "ticker": "CRDO",
+    "aliases": [],
+    "bucket": "AI interconnect / data movement",
+    "oldLabel": "High-speed connectivity and active cable chips",
+    "aiBottleneck": "Active electrical cables, SerDes, and data movement between AI racks and servers",
+    "thesis": "Credo is a high-beta way to express AI cluster connectivity bottlenecks, but customer concentration and cycle timing require tight verification.",
+    "factors": {
+      "bottleneckFit": 86,
+      "proofPoints": 70,
+      "monetizationPath": 74,
+      "underappreciation": 62,
+      "executionRiskControl": 42
+    },
+    "riskFlags": [
+      "customer concentration",
+      "small-cap volatility"
+    ],
+    "watchKpis": [
+      "AEC revenue",
+      "hyperscaler wins",
+      "customer concentration trend"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "AI networking / high-speed interconnect",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "AEC revenue",
+      "hyperscaler wins",
+      "customer concentration trend"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for CRDO",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Credo Technology revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "AEC",
+      "triple-digit revenue growth"
+    ]
+  },
+  {
+    "companyId": "guc",
+    "name": "Global Unichip",
+    "ticker": "3443.TW",
+    "aliases": [],
+    "bucket": "ASIC design services",
+    "oldLabel": "ASIC design service",
+    "aiBottleneck": "Custom ASIC design and TSMC-aligned production handoff",
+    "thesis": "GUC provides another non-US route into the custom AI chip design-service bottleneck, with strong linkage to foundry execution.",
+    "factors": {
+      "bottleneckFit": 84,
+      "proofPoints": 72,
+      "monetizationPath": 72,
+      "underappreciation": 76,
+      "executionRiskControl": 48
+    },
+    "riskFlags": [
+      "Taiwan listing",
+      "customer concentration",
+      "order lumpiness"
+    ],
+    "watchKpis": [
+      "AI ASIC backlog",
+      "NRE revenue",
+      "TSMC-linked project flow"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "ASIC design services",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "AI ASIC backlog",
+      "NRE revenue",
+      "TSMC-linked project flow"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 3443.TW",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Global Unichip revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "alchip",
+    "name": "Alchip Technologies",
+    "ticker": "3661.TW",
+    "aliases": [],
+    "bucket": "ASIC design services",
+    "oldLabel": "ASIC design service",
+    "aiBottleneck": "Turnkey custom AI ASIC design, physical implementation, and TSMC production coordination",
+    "thesis": "Alchip is a pure design-service expression of the MediaTek thesis: customers want custom AI silicon but need engineering delivery.",
+    "factors": {
+      "bottleneckFit": 88,
+      "proofPoints": 76,
+      "monetizationPath": 76,
+      "underappreciation": 78,
+      "executionRiskControl": 46
+    },
+    "riskFlags": [
+      "small-cap volatility",
+      "customer concentration",
+      "Taiwan listing"
+    ],
+    "watchKpis": [
+      "AI ASIC design wins",
+      "NRE and production revenue",
+      "customer concentration"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "ASIC design services",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "AI ASIC design wins",
+      "NRE and production revenue",
+      "customer concentration"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 3661.TW",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Alchip Technologies revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "coherent",
+    "name": "Coherent",
+    "ticker": "COHR",
+    "aliases": [],
+    "bucket": "Optics / photonics",
+    "oldLabel": "Optical materials and components",
+    "aiBottleneck": "Optical transceivers, lasers, and photonics for high-bandwidth AI data centers",
+    "thesis": "AI model scale increases data movement; optics and photonics become a system bottleneck, creating operating leverage for qualified suppliers.",
+    "factors": {
+      "bottleneckFit": 84,
+      "proofPoints": 74,
+      "monetizationPath": 72,
+      "underappreciation": 70,
+      "executionRiskControl": 50
+    },
+    "riskFlags": [
+      "optical cycle",
+      "balance sheet",
+      "customer timing"
+    ],
+    "watchKpis": [
+      "800G/1.6T revenue",
+      "AI photonics orders",
+      "debt reduction"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / photonics / data movement",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "800G/1.6T revenue",
+      "AI photonics orders",
+      "debt reduction"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for COHR",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Coherent revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "fabrinet",
+    "name": "Fabrinet",
+    "ticker": "FN",
+    "aliases": [],
+    "bucket": "Optics / photonics",
+    "oldLabel": "Optical manufacturing services",
+    "aiBottleneck": "Manufacturing and assembly capacity for optical modules used by AI data centers",
+    "thesis": "Fabrinet is a manufacturing-leverage name behind optical module demand, with less IP power but direct volume exposure.",
+    "factors": {
+      "bottleneckFit": 72,
+      "proofPoints": 72,
+      "monetizationPath": 70,
+      "underappreciation": 66,
+      "executionRiskControl": 62
+    },
+    "riskFlags": [
+      "customer concentration",
+      "manufacturing margin ceiling"
+    ],
+    "watchKpis": [
+      "datacom revenue",
+      "AI optical customer demand",
+      "customer concentration"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / photonics / data movement",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "datacom revenue",
+      "AI optical customer demand",
+      "customer concentration"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for FN",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Fabrinet revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "lumentum",
+    "name": "Lumentum",
+    "ticker": "LITE",
+    "aliases": [],
+    "bucket": "Optics / photonics",
+    "oldLabel": "Optical communications and lasers",
+    "aiBottleneck": "Lasers and optical components for AI data-center bandwidth",
+    "thesis": "Lumentum's old optical communications capability maps naturally to AI data movement, with high payoff if customer qualification and volumes scale.",
+    "factors": {
+      "bottleneckFit": 80,
+      "proofPoints": 68,
+      "monetizationPath": 66,
+      "underappreciation": 76,
+      "executionRiskControl": 46
+    },
+    "riskFlags": [
+      "optical cycle",
+      "profit recovery risk"
+    ],
+    "watchKpis": [
+      "cloud optical revenue",
+      "AI customer qualification",
+      "margin recovery"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / photonics / data movement",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "cloud optical revenue",
+      "AI customer qualification",
+      "margin recovery"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for LITE",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Lumentum revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "bloom_energy",
+    "name": "Bloom Energy",
+    "ticker": "BE",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Fuel cells and distributed power",
+    "aiBottleneck": "On-site power and microgrid option for AI data centers",
+    "thesis": "Bloom is a high-risk option on AI data centers needing faster on-site power than grid interconnects can provide.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 52,
+      "monetizationPath": 56,
+      "underappreciation": 76,
+      "executionRiskControl": 26
+    },
+    "riskFlags": [
+      "profitability",
+      "project execution",
+      "policy/subsidy risk"
+    ],
+    "watchKpis": [
+      "AI/data-center fuel-cell deployments",
+      "gross margin and cash flow",
+      "large customer backlog"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "AI data-center fuel-cell deployments",
+      "cash-flow improvement",
+      "large customer backlog"
+    ],
+    "rebuttalChecks": [
+      "unit economics fail to scale",
+      "grid solutions catch up",
+      "financing or policy risk rises"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Bloom Energy is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "on-site data center power"
+    ]
+  },
+  {
+    "companyId": "nvent",
+    "name": "nVent",
+    "ticker": "NVT",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Electrical enclosures and thermal infrastructure",
+    "aiBottleneck": "Enclosures, electrical connection, and cooling-adjacent infrastructure for data centers",
+    "thesis": "nVent is a focused infrastructure parts supplier where AI data-center density may improve mix and growth.",
+    "factors": {
+      "bottleneckFit": 68,
+      "proofPoints": 60,
+      "monetizationPath": 66,
+      "underappreciation": 70,
+      "executionRiskControl": 62
+    },
+    "riskFlags": [
+      "small/mid-cap industrial volatility",
+      "AI purity"
+    ],
+    "watchKpis": [
+      "data center sales growth",
+      "liquid-cooling adjacent products",
+      "margin expansion"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "data center sales growth",
+      "thermal/electrical product mix",
+      "margin expansion"
+    ],
+    "rebuttalChecks": [
+      "AI data-center mix is too small",
+      "industrial orders slow",
+      "competition compresses margins"
+    ],
+    "researchQuestions": [
+      "What reported line item proves nVent is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "data center infrastructure"
+    ]
+  },
+  {
+    "companyId": "vicor",
+    "name": "Vicor",
+    "ticker": "VICR",
+    "aliases": [],
+    "bucket": "Power semiconductors / AI server power",
+    "oldLabel": "High-density power modules",
+    "aiBottleneck": "High-density power modules for processors and AI systems",
+    "thesis": "Vicor has direct high-density power relevance but carries execution, customer, and volatility risk.",
+    "factors": {
+      "bottleneckFit": 74,
+      "proofPoints": 52,
+      "monetizationPath": 56,
+      "underappreciation": 80,
+      "executionRiskControl": 32
+    },
+    "riskFlags": [
+      "customer concentration",
+      "execution volatility"
+    ],
+    "watchKpis": [
+      "AI power module wins",
+      "revenue recovery",
+      "gross margin repair"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "medium-low",
+    "catalysts": [
+      "new AI processor power wins",
+      "revenue reacceleration",
+      "margin repair"
+    ],
+    "rebuttalChecks": [
+      "design wins do not scale",
+      "customer concentration remains high",
+      "losses or margin pressure persist"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Vicor is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "AI power module option"
+    ]
+  },
+  {
+    "companyId": "applovin",
+    "name": "AppLovin",
+    "ticker": "APP",
+    "aliases": [],
+    "bucket": "AI application monetization",
+    "oldLabel": "Mobile ads and game distribution",
+    "aiBottleneck": "AI ad matching, auction optimization, creative testing, and app monetization",
+    "thesis": "Advertising optimization is one of the clearest cash-flow uses of AI; the issue is not relevance but durability, transparency, and valuation.",
+    "factors": {
+      "bottleneckFit": 70,
+      "proofPoints": 78,
+      "monetizationPath": 86,
+      "underappreciation": 50,
+      "executionRiskControl": 36
+    },
+    "riskFlags": [
+      "short-seller controversy",
+      "valuation",
+      "platform policy risk"
+    ],
+    "watchKpis": [
+      "AXON revenue contribution",
+      "software platform margin",
+      "advertiser diversification"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI advertising / application monetization",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "AXON revenue contribution",
+      "software platform margin",
+      "advertiser diversification"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for APP",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of AppLovin revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "AXON",
+      "AI ad monetization"
+    ]
+  },
+  {
+    "companyId": "pinterest",
+    "name": "Pinterest",
+    "ticker": "PINS",
+    "aliases": [],
+    "bucket": "AI application monetization",
+    "oldLabel": "Visual discovery and shopping intent platform",
+    "aiBottleneck": "Visual search, shopping recommendation, and ad conversion optimization",
+    "thesis": "Pinterest has cleaner commercial intent than most social apps, but AI must translate into higher ad load, conversion, and merchant demand.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 54,
+      "monetizationPath": 62,
+      "underappreciation": 68,
+      "executionRiskControl": 52
+    },
+    "riskFlags": [
+      "ad cycle",
+      "platform competition"
+    ],
+    "watchKpis": [
+      "shopping ad conversion",
+      "international ARPU",
+      "AI creative tools"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI advertising / application monetization",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "shopping ad conversion",
+      "international ARPU",
+      "AI creative tools"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for PINS",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Pinterest revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "trade_desk",
+    "name": "The Trade Desk",
+    "ticker": "TTD",
+    "aliases": [],
+    "bucket": "AI application monetization",
+    "oldLabel": "Independent programmatic ad platform",
+    "aiBottleneck": "AI media buying, CTV, retail media, and advertiser optimization",
+    "thesis": "TTD is a higher-quality ad-tech AI monetization watch item if Kokai and CTV improve ROI after a punished execution period.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 58,
+      "monetizationPath": 70,
+      "underappreciation": 62,
+      "executionRiskControl": 54
+    },
+    "riskFlags": [
+      "execution reset",
+      "ad cycle",
+      "valuation sensitivity"
+    ],
+    "watchKpis": [
+      "Kokai adoption",
+      "CTV/retail media growth",
+      "revenue growth recovery"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI advertising / application monetization",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "Kokai adoption",
+      "CTV/retail media growth",
+      "revenue growth recovery"
+    ],
+    "rebuttalChecks": [
+      "execution misses continue",
+      "AI benefits accrue to walled gardens",
+      "valuation multiple compresses"
+    ],
+    "researchQuestions": [
+      "What reported line item proves The Trade Desk is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "AI media buying"
+    ]
+  },
+  {
+    "companyId": "roblox",
+    "name": "Roblox",
+    "ticker": "RBLX",
+    "aliases": [],
+    "bucket": "AI content creation / interactive worlds",
+    "oldLabel": "UGC gaming platform",
+    "aiBottleneck": "Generative 3D content, creator productivity, and virtual-world simulation",
+    "thesis": "AI can lower content creation friction, but the stock needs proof that engagement, bookings, and margin improve enough to offset heavy spending.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 48,
+      "monetizationPath": 50,
+      "underappreciation": 66,
+      "executionRiskControl": 32
+    },
+    "riskFlags": [
+      "profitability",
+      "youth platform risk",
+      "valuation"
+    ],
+    "watchKpis": [
+      "AI creator tool adoption",
+      "bookings growth",
+      "infrastructure cost per hour"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI content creation / interactive worlds",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "medium",
+    "catalysts": [
+      "AI creator tool adoption",
+      "bookings growth",
+      "infrastructure cost per hour"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for RBLX",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Roblox revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "unity",
+    "name": "Unity Software",
+    "ticker": "U",
+    "aliases": [],
+    "bucket": "AI content creation / interactive worlds",
+    "oldLabel": "Game engine and ads platform",
+    "aiBottleneck": "AI-assisted 3D development, simulation, and game/app monetization tools",
+    "thesis": "Unity has logical AI creation tools, but the turnaround burden is high and the business must prove renewed developer trust and profitable growth.",
+    "factors": {
+      "bottleneckFit": 56,
+      "proofPoints": 42,
+      "monetizationPath": 46,
+      "underappreciation": 74,
+      "executionRiskControl": 28
+    },
+    "riskFlags": [
+      "turnaround risk",
+      "developer trust",
+      "profitability"
+    ],
+    "watchKpis": [
+      "Create revenue growth",
+      "AI tool adoption",
+      "free cash flow"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI content creation / interactive worlds",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "medium",
+    "catalysts": [
+      "Create revenue growth",
+      "AI tool adoption",
+      "free cash flow"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for U",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Unity Software revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "lattice",
+    "name": "Lattice Semiconductor",
+    "ticker": "LSCC",
+    "aliases": [],
+    "bucket": "Edge AI / low-power inference",
+    "oldLabel": "Low-power FPGA",
+    "aiBottleneck": "Always-on low-latency FPGA fabric near sensors for edge AI, industrial vision, and robotics",
+    "thesis": "Low-power programmable logic can sit close to sensors where fixed-function AI SoCs are too rigid and GPUs are too power hungry.",
+    "factors": {
+      "bottleneckFit": 74,
+      "proofPoints": 56,
+      "monetizationPath": 58,
+      "underappreciation": 78,
+      "executionRiskControl": 48
+    },
+    "riskFlags": [
+      "cycle recovery risk",
+      "small/mid-cap valuation"
+    ],
+    "watchKpis": [
+      "Avant/Certus/CrossLink edge AI adoption",
+      "industrial vision design wins",
+      "revenue growth recovery"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Edge AI chips / low-power inference",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "edge AI FPGA design wins",
+      "industrial automation recovery",
+      "software ecosystem progress"
+    ],
+    "rebuttalChecks": [
+      "growth remains cyclical FPGA recovery",
+      "edge AI design wins do not scale",
+      "competition from ASIC/MCU vendors"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Lattice Semiconductor is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "Lattice edge AI"
+    ]
+  },
+  {
+    "companyId": "synaptics",
+    "name": "Synaptics",
+    "ticker": "SYNA",
+    "aliases": [],
+    "bucket": "Edge AI / low-power inference",
+    "oldLabel": "Touch, fingerprint, display and human-interface chips",
+    "aiBottleneck": "Low-power multimodal edge AI for IoT, vision, voice, and sound",
+    "thesis": "Human-interface and IoT silicon can migrate toward always-on multimodal AI nodes if customer adoption moves beyond pilots.",
+    "factors": {
+      "bottleneckFit": 74,
+      "proofPoints": 58,
+      "monetizationPath": 56,
+      "underappreciation": 80,
+      "executionRiskControl": 48
+    },
+    "riskFlags": [
+      "turnaround risk",
+      "small-cap volatility"
+    ],
+    "watchKpis": [
+      "Astra edge AI design wins",
+      "Google edge AI collaboration",
+      "IoT revenue growth"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Edge AI chips / low-power inference",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "medium",
+    "catalysts": [
+      "Astra edge AI design wins",
+      "Google edge AI collaboration",
+      "IoT revenue growth"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for SYNA",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Synaptics revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "ambarella",
+    "name": "Ambarella",
+    "ticker": "AMBA",
+    "aliases": [],
+    "bucket": "AI sensing / physical-world data",
+    "oldLabel": "Video compression and camera SoC",
+    "aiBottleneck": "Low-power computer-vision SoCs for cameras, robotics, and ADAS",
+    "thesis": "CVflow and edge vision chips give direct leverage to intelligent cameras and robots, but customer timing and profitability make it high-beta.",
+    "factors": {
+      "bottleneckFit": 78,
+      "proofPoints": 58,
+      "monetizationPath": 58,
+      "underappreciation": 82,
+      "executionRiskControl": 44
+    },
+    "riskFlags": [
+      "small-cap volatility",
+      "customer timing",
+      "loss-making periods"
+    ],
+    "watchKpis": [
+      "CVflow revenue",
+      "ADAS pipeline",
+      "gross margin repair"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Physical AI sensing / machine vision",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "CVflow revenue",
+      "ADAS pipeline",
+      "gross margin repair"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for AMBA",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Ambarella revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": [
+      "edge AI processors",
+      "physical AI SoC"
+    ]
+  },
+  {
+    "companyId": "cognex",
+    "name": "Cognex",
+    "ticker": "CGNX",
+    "aliases": [],
+    "bucket": "AI sensing / physical-world data",
+    "oldLabel": "Machine vision",
+    "aiBottleneck": "Industrial AI inspection and machine vision",
+    "thesis": "Cognex is a purer machine-vision recovery and physical-AI watch candidate, but industrial demand must turn.",
+    "factors": {
+      "bottleneckFit": 70,
+      "proofPoints": 54,
+      "monetizationPath": 58,
+      "underappreciation": 74,
+      "executionRiskControl": 46
+    },
+    "riskFlags": [
+      "industrial cycle",
+      "competition"
+    ],
+    "watchKpis": [
+      "AI vision product adoption",
+      "factory automation orders",
+      "margin recovery"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Physical AI sensing / machine vision",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "early_optional",
+    "conviction": "medium-low",
+    "catalysts": [
+      "AI vision adoption",
+      "industrial order recovery",
+      "margin recovery"
+    ],
+    "rebuttalChecks": [
+      "industrial demand stays weak",
+      "AI vision commoditizes",
+      "growth fails to recover"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Cognex is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "industrial vision AI"
+    ]
+  },
+  {
+    "companyId": "teradyne",
+    "name": "Teradyne",
+    "ticker": "TER",
+    "aliases": [],
+    "bucket": "Physical AI / robotics",
+    "oldLabel": "Semiconductor test and collaborative robots",
+    "aiBottleneck": "AI semiconductor test plus robotics optionality",
+    "thesis": "Teradyne bridges semiconductor test demand and robotics optionality, but the AI story is split across two different businesses.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 58,
+      "monetizationPath": 58,
+      "underappreciation": 62,
+      "executionRiskControl": 54
+    },
+    "riskFlags": [
+      "semicap cycle",
+      "robotics execution"
+    ],
+    "watchKpis": [
+      "AI semiconductor test demand",
+      "robotics growth recovery",
+      "margin trend"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Robotics / industrial automation",
+    "priorityTier": "T3 high-beta option",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "AI semiconductor test demand",
+      "robotics growth recovery",
+      "margin trend"
+    ],
+    "rebuttalChecks": [
+      "robotics remains weak",
+      "semicap test cycle turns down",
+      "AI test content disappoints"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Teradyne is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "semiconductor test robotics"
+    ]
+  },
+  {
+    "companyId": "socionext",
+    "name": "Socionext",
+    "ticker": "6526.T",
+    "aliases": [],
+    "bucket": "ASIC design services",
+    "oldLabel": "Japanese custom SoC design",
+    "aiBottleneck": "Custom SoC engineering for automotive, industrial, and data-center workloads",
+    "thesis": "Socionext has the right custom SoC service DNA, but the AI payoff depends on visible high-value data-center or edge AI wins.",
+    "factors": {
+      "bottleneckFit": 76,
+      "proofPoints": 58,
+      "monetizationPath": 62,
+      "underappreciation": 76,
+      "executionRiskControl": 50
+    },
+    "riskFlags": [
+      "Japan listing and FX",
+      "project visibility"
+    ],
+    "watchKpis": [
+      "custom SoC backlog",
+      "AI/auto design wins",
+      "margin trend"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "ASIC design services",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "customer_design_win",
+    "conviction": "medium",
+    "catalysts": [
+      "custom SoC backlog",
+      "AI/auto design wins",
+      "margin trend"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 6526.T",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Socionext revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "lg_innotek",
+    "name": "LG Innotek",
+    "ticker": "011070.KS",
+    "aliases": [],
+    "bucket": "Advanced packaging / substrates",
+    "oldLabel": "Camera modules and mobile components",
+    "aiBottleneck": "Potential AI/server substrate and optical component migration",
+    "thesis": "LG Innotek is less direct than Samsung Electro-Mechanics but belongs in the mobile-component-to-AI-infrastructure migration screen.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 44,
+      "monetizationPath": 50,
+      "underappreciation": 76,
+      "executionRiskControl": 48
+    },
+    "riskFlags": [
+      "Apple/mobile concentration",
+      "AI exposure unclear"
+    ],
+    "watchKpis": [
+      "server substrate proof",
+      "optical component AI data-center demand",
+      "customer diversification"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Advanced packaging / substrates / materials",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "server substrate/customer evidence",
+      "AI optical component wins",
+      "mobile concentration reduction"
+    ],
+    "rebuttalChecks": [
+      "AI exposure remains too indirect",
+      "mobile camera cycle dominates",
+      "capex fails to convert to margins"
+    ],
+    "researchQuestions": [
+      "What reported line item proves LG Innotek is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "mobile component migration"
+    ]
+  },
+  {
+    "companyId": "ciena",
+    "name": "Ciena",
+    "ticker": "CIEN",
+    "aliases": [],
+    "bucket": "Optics / photonics",
+    "oldLabel": "Optical networking equipment",
+    "aiBottleneck": "Data-center interconnect and optical transport for AI traffic",
+    "thesis": "AI scale increases metro and data-center optical transport demand, giving Ciena a network-layer angle beyond transceivers.",
+    "factors": {
+      "bottleneckFit": 68,
+      "proofPoints": 62,
+      "monetizationPath": 64,
+      "underappreciation": 68,
+      "executionRiskControl": 58
+    },
+    "riskFlags": [
+      "telecom cycle",
+      "AI purity"
+    ],
+    "watchKpis": [
+      "cloud/datacenter orders",
+      "800G/1.6T adoption",
+      "book-to-bill"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Optics / photonics / data movement",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "cloud optical orders",
+      "800G/1.6T product momentum",
+      "telecom cycle stabilization"
+    ],
+    "rebuttalChecks": [
+      "telecom weakness offsets AI demand",
+      "AI traffic goes to captive networks",
+      "margins compress"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Ciena is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "AI optical transport"
+    ]
+  },
+  {
+    "companyId": "abb",
+    "name": "ABB",
+    "ticker": "ABBNY",
+    "aliases": [
+      "ABBN.SW",
+      "ABB.ST"
+    ],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Industrial electrification and automation",
+    "aiBottleneck": "Electrification, automation, and grid infrastructure for AI data centers and physical AI factories",
+    "thesis": "ABB is a broad electrification and automation beneficiary, less pure but relevant to AI power constraints and industrial AI adoption.",
+    "factors": {
+      "bottleneckFit": 66,
+      "proofPoints": 62,
+      "monetizationPath": 68,
+      "underappreciation": 54,
+      "executionRiskControl": 76
+    },
+    "riskFlags": [
+      "low AI purity",
+      "industrial cycle",
+      "ADR liquidity/FX"
+    ],
+    "watchKpis": [
+      "data center electrification orders",
+      "automation backlog",
+      "margin stability"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "data-center electrification orders",
+      "automation demand",
+      "margin resilience"
+    ],
+    "rebuttalChecks": [
+      "AI demand too diluted",
+      "industrial cycle rolls over",
+      "valuation already reflects electrification"
+    ],
+    "researchQuestions": [
+      "What reported line item proves ABB is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "electrification"
+    ]
+  },
+  {
+    "companyId": "caterpillar",
+    "name": "Caterpillar",
+    "ticker": "CAT",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Heavy equipment and engines",
+    "aiBottleneck": "Backup power and generators for data centers",
+    "thesis": "CAT is an indirect data-center backup-power candidate, useful as a power-scarcity monitor rather than a pure AI stock.",
+    "factors": {
+      "bottleneckFit": 50,
+      "proofPoints": 46,
+      "monetizationPath": 58,
+      "underappreciation": 50,
+      "executionRiskControl": 72
+    },
+    "riskFlags": [
+      "very indirect AI exposure",
+      "cyclical machinery"
+    ],
+    "watchKpis": [
+      "data-center generator orders",
+      "power systems growth",
+      "margin resilience"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low",
+    "catalysts": [
+      "data-center generator orders",
+      "power systems backlog",
+      "margin resilience"
+    ],
+    "rebuttalChecks": [
+      "construction/mining cycle dominates",
+      "backup-power AI exposure too small",
+      "engine competition or regulation risk"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Caterpillar is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "backup power"
+    ]
+  },
+  {
+    "companyId": "cummins",
+    "name": "Cummins",
+    "ticker": "CMI",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Engines and power systems",
+    "aiBottleneck": "Backup power, generators, and power systems for data centers",
+    "thesis": "Cummins is another indirect beneficiary of data-center backup and distributed power requirements.",
+    "factors": {
+      "bottleneckFit": 52,
+      "proofPoints": 48,
+      "monetizationPath": 58,
+      "underappreciation": 54,
+      "executionRiskControl": 68
+    },
+    "riskFlags": [
+      "indirect exposure",
+      "engine cycle"
+    ],
+    "watchKpis": [
+      "data-center power systems demand",
+      "generator backlog",
+      "margin trend"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "data-center power systems demand",
+      "generator backlog",
+      "margin trend"
+    ],
+    "rebuttalChecks": [
+      "AI exposure remains too small",
+      "engine/regulatory cycle dominates",
+      "competition pressures pricing"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Cummins is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "backup power"
+    ]
+  },
+  {
+    "companyId": "dover",
+    "name": "Dover",
+    "ticker": "DOV",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Industrial components",
+    "aiBottleneck": "Thermal, pumps, and engineered components for liquid cooling and data-center systems",
+    "thesis": "Dover is an indirect liquid-cooling and engineered-components watch item rather than a pure AI name.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 48,
+      "monetizationPath": 56,
+      "underappreciation": 62,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "indirect exposure",
+      "industrial cycle"
+    ],
+    "watchKpis": [
+      "thermal/cooling component orders",
+      "data center end-market disclosure",
+      "margin trend"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "cooling component orders",
+      "data center disclosure",
+      "margin trend"
+    ],
+    "rebuttalChecks": [
+      "AI exposure remains anecdotal",
+      "industrial cycle dominates",
+      "no direct customer proof"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Dover is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "liquid cooling components"
+    ]
+  },
+  {
+    "companyId": "siemens",
+    "name": "Siemens",
+    "ticker": "SIE.DE",
+    "aliases": [],
+    "bucket": "Power / cooling / AI factories",
+    "oldLabel": "Industrial automation and electrification",
+    "aiBottleneck": "Data-center electrification and AI factory automation",
+    "thesis": "Siemens can benefit from AI-driven data-center electrical buildout and factory automation, though the exposure is broad.",
+    "factors": {
+      "bottleneckFit": 64,
+      "proofPoints": 60,
+      "monetizationPath": 66,
+      "underappreciation": 56,
+      "executionRiskControl": 78
+    },
+    "riskFlags": [
+      "low AI purity",
+      "European cycle"
+    ],
+    "watchKpis": [
+      "data-center electrification orders",
+      "digital industries recovery",
+      "automation backlog"
+    ],
+    "stage": "Stage 2 - AI factory bottlenecks",
+    "direction": "Power / cooling / data-center infrastructure",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "data-center orders",
+      "automation recovery",
+      "software/digital industries growth"
+    ],
+    "rebuttalChecks": [
+      "AI contribution stays hidden",
+      "industrial weakness dominates",
+      "valuation multiple already high"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Siemens is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "industrial automation AI factories"
+    ]
+  },
+  {
+    "companyId": "snap",
+    "name": "Snap",
+    "ticker": "SNAP",
+    "aliases": [],
+    "bucket": "AI application monetization",
+    "oldLabel": "Social camera and messaging app",
+    "aiBottleneck": "AR camera, visual AI, creator tools, and ad targeting",
+    "thesis": "Snap has relevant AI and AR surfaces, but AI has to repair monetization and user engagement before it deserves a high score.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 46,
+      "monetizationPath": 46,
+      "underappreciation": 72,
+      "executionRiskControl": 34
+    },
+    "riskFlags": [
+      "profitability",
+      "ad market competition",
+      "execution risk"
+    ],
+    "watchKpis": [
+      "ad revenue growth",
+      "AR engagement",
+      "free cash flow"
+    ],
+    "stage": "Stage 3 - AI application monetization",
+    "direction": "AI advertising / application monetization",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "revenue_guided",
+    "conviction": "medium",
+    "catalysts": [
+      "ad revenue growth",
+      "AR engagement",
+      "free cash flow"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for SNAP",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Snap revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "texas_instruments",
+    "name": "Texas Instruments",
+    "ticker": "TXN",
+    "aliases": [],
+    "bucket": "Physical AI / analog and power",
+    "oldLabel": "Analog and embedded processors",
+    "aiBottleneck": "Power management, signal chain, and embedded control for AI-enabled devices and factories",
+    "thesis": "TI is a lower-beta, long-duration analog beneficiary if AI spreads into physical devices, but AI purity is low.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 54,
+      "monetizationPath": 64,
+      "underappreciation": 50,
+      "executionRiskControl": 82
+    },
+    "riskFlags": [
+      "low AI purity",
+      "industrial cycle"
+    ],
+    "watchKpis": [
+      "industrial order recovery",
+      "embedded processor growth",
+      "free cash flow"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Analog / power / embedded control",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "industrial order recovery",
+      "embedded processor growth",
+      "free cash flow"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for TXN",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Texas Instruments revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "renesas",
+    "name": "Renesas Electronics",
+    "ticker": "6723.T",
+    "aliases": [
+      "RNECY"
+    ],
+    "bucket": "Physical AI / auto and industrial edge",
+    "oldLabel": "MCU and auto semiconductors",
+    "aiBottleneck": "Automotive and industrial embedded processing for local AI control loops",
+    "thesis": "Renesas offers embedded processing exposure to physical AI, but it is a slow-cycle thesis that needs clear AI attach evidence.",
+    "factors": {
+      "bottleneckFit": 62,
+      "proofPoints": 52,
+      "monetizationPath": 56,
+      "underappreciation": 70,
+      "executionRiskControl": 56
+    },
+    "riskFlags": [
+      "cyclical auto demand",
+      "Japan listing and FX"
+    ],
+    "watchKpis": [
+      "AI MCU/MPU design wins",
+      "auto recovery",
+      "industrial edge demand"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Auto / industrial edge control",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "AI MCU/MPU design wins",
+      "auto recovery",
+      "industrial edge demand"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for 6723.T",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Renesas Electronics revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "apple",
+    "name": "Apple",
+    "ticker": "AAPL",
+    "aliases": [],
+    "bucket": "Closed-loop edge AI device platform",
+    "oldLabel": "Consumer hardware and services",
+    "aiBottleneck": "On-device AI distribution through silicon, OS, app store, and private-cloud integration",
+    "thesis": "Apple is not a picks-and-shovels supplier, but edge AI can improve replacement cycles, device stickiness, and services attachment if product execution improves.",
+    "factors": {
+      "bottleneckFit": 74,
+      "proofPoints": 68,
+      "monetizationPath": 84,
+      "underappreciation": 48,
+      "executionRiskControl": 82
+    },
+    "riskFlags": [
+      "AI product cadence",
+      "already well understood"
+    ],
+    "watchKpis": [
+      "AI-driven upgrade cycle",
+      "Neural Engine utilization",
+      "services attach rate"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Edge AI device platforms",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "AI-driven upgrade cycle",
+      "Neural Engine utilization",
+      "services attach rate"
+    ],
+    "rebuttalChecks": [
+      "AI exposure does not become material in reported revenue for AAPL",
+      "core legacy cycle overwhelms the AI thesis"
+    ],
+    "researchQuestions": [
+      "What percent of Apple revenue can plausibly be AI-related in 2-3 years?",
+      "Which proof point would upgrade this from story to financial evidence?"
+    ],
+    "sourceReportTags": []
+  },
+  {
+    "companyId": "keyence",
+    "name": "Keyence",
+    "ticker": "6861.T",
+    "aliases": [],
+    "bucket": "AI sensing / physical-world data",
+    "oldLabel": "Factory automation sensors and machine vision",
+    "aiBottleneck": "High-end sensors and machine vision for physical AI and automated factories",
+    "thesis": "Keyence is a quality physical-AI sensing watch item, usually expensive but strategically important.",
+    "factors": {
+      "bottleneckFit": 72,
+      "proofPoints": 70,
+      "monetizationPath": 76,
+      "underappreciation": 48,
+      "executionRiskControl": 82
+    },
+    "riskFlags": [
+      "valuation",
+      "Japan listing"
+    ],
+    "watchKpis": [
+      "machine vision growth",
+      "factory automation orders",
+      "AI inspection adoption"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Physical AI sensing / machine vision",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "credible_product",
+    "conviction": "medium",
+    "catalysts": [
+      "machine vision demand recovery",
+      "AI inspection adoption",
+      "factory automation orders"
+    ],
+    "rebuttalChecks": [
+      "valuation already prices quality",
+      "factory automation cycle weakens",
+      "AI does not change growth rate"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Keyence is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "physical AI eyes"
+    ]
+  },
+  {
+    "companyId": "yaskawa",
+    "name": "Yaskawa Electric",
+    "ticker": "6506.T",
+    "aliases": [],
+    "bucket": "Physical AI / robotics",
+    "oldLabel": "Industrial robots and motion control",
+    "aiBottleneck": "Robotics, servos, and motion control for physical AI systems",
+    "thesis": "Yaskawa belongs in the physical-AI body layer, but needs robot-cycle recovery and AI-specific demand proof.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 46,
+      "monetizationPath": 54,
+      "underappreciation": 66,
+      "executionRiskControl": 60
+    },
+    "riskFlags": [
+      "robotics cycle",
+      "Japan listing"
+    ],
+    "watchKpis": [
+      "servo/robot orders",
+      "AI automation demand",
+      "margin recovery"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Robotics / industrial automation",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "servo/robot orders",
+      "AI automation demand",
+      "margin recovery"
+    ],
+    "rebuttalChecks": [
+      "cycle remains weak",
+      "AI value accrues elsewhere",
+      "China competition pressures margins"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Yaskawa Electric is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "physical AI body"
+    ]
+  },
+  {
+    "companyId": "fanuc",
+    "name": "Fanuc",
+    "ticker": "6954.T",
+    "aliases": [],
+    "bucket": "Physical AI / robotics",
+    "oldLabel": "Industrial robots and CNC",
+    "aiBottleneck": "Robotic execution layer for physical AI",
+    "thesis": "Fanuc is a long-cycle robotics execution-layer monitor; the AI link matters when robots become more perception/model driven.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 48,
+      "monetizationPath": 56,
+      "underappreciation": 64,
+      "executionRiskControl": 66
+    },
+    "riskFlags": [
+      "robotics cycle",
+      "Japan listing"
+    ],
+    "watchKpis": [
+      "robot orders",
+      "AI-enabled automation demand",
+      "China/US factory capex"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Robotics / industrial automation",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "robot order recovery",
+      "AI-enabled automation demand",
+      "China/US factory capex"
+    ],
+    "rebuttalChecks": [
+      "robotics cycle remains weak",
+      "AI value accrues to software not robot OEMs",
+      "pricing competition rises"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Fanuc is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "physical AI body"
+    ]
+  },
+  {
+    "companyId": "rockwell",
+    "name": "Rockwell Automation",
+    "ticker": "ROK",
+    "aliases": [],
+    "bucket": "Physical AI / industrial automation",
+    "oldLabel": "Industrial automation and controls",
+    "aiBottleneck": "Industrial control systems for AI-enabled factories",
+    "thesis": "Rockwell is an industrial AI control-layer watch item, with low purity but useful exposure to factory automation.",
+    "factors": {
+      "bottleneckFit": 58,
+      "proofPoints": 50,
+      "monetizationPath": 58,
+      "underappreciation": 58,
+      "executionRiskControl": 68
+    },
+    "riskFlags": [
+      "industrial cycle",
+      "low AI purity"
+    ],
+    "watchKpis": [
+      "factory automation orders",
+      "software/controls growth",
+      "AI-enabled manufacturing projects"
+    ],
+    "stage": "Stage 3 - edge and physical AI",
+    "direction": "Robotics / industrial automation",
+    "priorityTier": "T4 long-cycle watch",
+    "evidenceLevel": "early_optional",
+    "conviction": "low-medium",
+    "catalysts": [
+      "factory automation orders",
+      "software/control growth",
+      "AI-enabled manufacturing projects"
+    ],
+    "rebuttalChecks": [
+      "industrial capex stays weak",
+      "AI contribution immaterial",
+      "competition from Siemens/ABB"
+    ],
+    "researchQuestions": [
+      "What reported line item proves Rockwell Automation is becoming an AI bottleneck supplier?",
+      "What would make the old-cycle explanation more persuasive than the AI migration thesis?"
+    ],
+    "sourceReportTags": [
+      "industrial control AI"
+    ]
+  }
+]

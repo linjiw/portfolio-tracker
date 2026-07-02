@@ -1,0 +1,4 @@
+Account Number,Account Name,Symbol,Description,Quantity,Last Price,Last Price Change,Current Value,Today's Gain/Loss Dollar,Today's Gain/Loss Percent,Total Gain/Loss Dollar,Total Gain/Loss Percent,Percent Of Account,Cost Basis Total,Average Cost Basis,Type
+DEMO01,Demo Taxable,MSFT,MICROSOFT CORP,3,450.00,0.00,1350.00,0.00,0.00,150.00,12.50%,27%,1200.00,400.00,Equity
+DEMO01,Demo Taxable,NVDA,NVIDIA CORP,10,150.00,0.00,1500.00,0.00,0.00,300.00,25.00%,30%,1200.00,120.00,Equity
+DEMO01,Demo Taxable,SPAXX**,FIDELITY GOVERNMENT MONEY MARKET,500,1.00,0.00,500.00,0.00,0.00,--,--,10%,500.00,1.00,Cash

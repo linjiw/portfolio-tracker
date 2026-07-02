@@ -1,0 +1,45 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.env
+.env.*
+
+# raw broker exports and personal account history
+*.csv
+Portfolio_Positions*.csv
+Accounts_History*.csv
+History_for_Account*.csv
+Account_History*.csv
+*Positions*.csv
+*History*.csv
+
+# allow intentionally sanitized example CSVs
+!examples/
+!examples/*.csv
+
+# reference books / PDFs (personal, often copyrighted) — keep them out of the repo
+*.pdf
+
+# local agent/editor state and scratch scripts
+.claude/
+.agents/
+AGENTS.md
+.audit_workflow.js
+scripts/_scratch/
+
+# generated dashboard/runtime artifacts
+output/
+*.log
+*.pid
+*.tmp
+
+# local credentials; scripts read these at runtime, never from repo files
+*.key
+*.pem
+*.p12
+*.pfx
