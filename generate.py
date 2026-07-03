@@ -2870,17 +2870,28 @@ details[open] summary::before{content:"▾ "}
   flex:none; white-space:nowrap;
 }
 .seg-rail button:hover{color:var(--txt)}
+.seg-rail button[hidden]{display:none}   /* segs outside the active workspace are hidden by syncWs() */
 .seg-rail button.on{color:var(--accent)}
 .seg-rail button.on::after{
   content:""; position:absolute; left:12px; right:12px; bottom:-1px; height:2px;
   background:var(--accent); border-radius:1px; box-shadow:0 0 8px var(--accent-line);
 }
-.seg-grp{
-  flex:none; align-self:center; padding:0 8px; display:inline-flex; align-items:center; gap:6px;
-  font-family:var(--f-ui); font-size:var(--t-2xs,10px); font-weight:700;
-  letter-spacing:var(--ls-label); text-transform:uppercase; color:var(--faint);
+/* primary workspace bar (level 1 of the two-level nav) — heavier identity than the sub-rail below it */
+.ws-rail{
+  display:flex; gap:2px; align-items:center;
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:var(--r-card); padding:4px 6px; margin-bottom:8px;
+  overflow-x:auto; overflow-y:hidden; scrollbar-width:none;
 }
-.seg-grp::before{content:""; width:3px; height:10px; border-radius:1px; background:#3A3F47; flex:none}
+.ws-rail::-webkit-scrollbar{display:none}
+.ws-rail button{
+  background:none; border:0; color:var(--mut);
+  font-family:var(--f-disp); font-size:var(--t-base,13px); font-weight:700; letter-spacing:.02em;
+  padding:9px 14px; cursor:pointer; border-radius:var(--r-chip,6px);
+  flex:none; white-space:nowrap; transition:color .16s var(--ease),background .16s var(--ease);
+}
+.ws-rail button:hover{color:var(--txt)}
+.ws-rail button.on{color:var(--accent); background:var(--bg); box-shadow:inset 0 0 0 1px var(--accent-line,var(--line))}
 /* breadcrumb lives IN the rail on overview (one 44px band instead of two) */
 .rail-here{flex:none; align-self:center; font-family:var(--f-disp); font-size:var(--t-sm); font-weight:600; color:var(--txt); padding:0 10px 0 12px; white-space:nowrap}
 .seg[hidden]{display:none}
@@ -3024,6 +3035,9 @@ details[open] summary::before{content:"▾ "}
   }
   .seg-rail::after{content:"›"; position:sticky; right:0; padding:6px 8px; color:var(--mut); background:linear-gradient(90deg,transparent,var(--bg) 40%); pointer-events:none; align-self:center; font-size:18px}
   .seg-rail button{flex:0 0 auto; min-height:44px; padding:13px 14px; font-size:var(--t-base); scroll-snap-align:start}   /* 44pt min-height for one-handed thumb hits */
+  /* workspace bar: same horizontally-scrollable pattern + 44pt targets as the sub-rail */
+  .ws-rail{flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch}
+  .ws-rail button{flex:0 0 auto; min-height:44px; padding:12px 14px; font-size:var(--t-base)}
   /* bigger touch targets */
   .tabs button{padding:14px 6px; min-height:44px}
   .row{padding:14px 14px; min-height:44px}
@@ -3152,6 +3166,27 @@ const DEFAULT_SEG={ov:'score',stk:'price'};
 const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
 const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', risk:'波动贡献', struct:'结构', cmp:'指数对比', pfib:'技术·节奏', sig:'持仓信号', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
 function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
+// Two-level portfolio nav: 5 themed workspaces (level 1) over the seg sub-rail (level 2).
+// Routing is untouched — hash stays #/portfolio/<seg>; the workspace is derived FROM the seg.
+const WS_MAP=[
+ {id:'today', label:'今日决策', segs:['score','decide','qt','mass']},
+ {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch']},
+ {id:'perf',  label:'净值·表现', segs:['nw','cmp','pfib','sig']},
+ {id:'risk',  label:'风险·结构', segs:['risk','struct']},
+ {id:'plan',  label:'行为·计划', segs:['beh','journal','rebal']},
+];
+function wsFor(seg){for(const w of WS_MAP)if(w.segs.indexOf(seg)>=0)return w; return WS_MAP[0];}
+function rememberWsSeg(seg){try{localStorage.setItem('ptrak.wsseg.'+wsFor(seg).id,seg);}catch(e){}}
+function wsLastSeg(w){try{const s=localStorage.getItem('ptrak.wsseg.'+w.id);if(s&&w.segs.indexOf(s)>=0)return s;}catch(e){} return w.segs[0];}
+function wsGo(id){const w=WS_MAP.filter(x=>x.id===id)[0]||WS_MAP[0]; if(sel==='__OV__'&&wsFor(activeSeg()).id===w.id)return; ovGo(wsLastSeg(w),{replace:true});}   // replace: workspace switches are view-state like tab clicks (back walks stock-to-stock, not workspace-to-workspace); same-workspace click short-circuits the full re-render
+// visual sync of the two-level nav: highlight the workspace owning `seg`, show only its sub-rail segs
+function syncWs(seg){
+ const r=document.getElementById('right');if(!r)return;
+ const bar=r.querySelector('.ws-rail');if(!bar)return;
+ const w=wsFor(seg);
+ bar.querySelectorAll('button[data-ws]').forEach(b=>{const on=b.dataset.ws===w.id;b.classList.toggle('on',on);b.setAttribute('aria-selected',on?'true':'false');});
+ r.querySelectorAll('.seg-rail button[data-seg]').forEach(b=>{b.hidden=w.segs.indexOf(b.dataset.seg)<0;});
+}
 let routeApplying=false;
 function findStock(sym){sym=(sym||'').toUpperCase();return stocks.find(x=>x.sym===sym)||null;}
 function normSym(sym){return (sym||'__OV__').toUpperCase();}
@@ -3248,8 +3283,9 @@ function activateSeg(seg,opts){
  // overview panels are lazy-rendered — if the user clicks before idle-prefetch fills this panel, render it now
  if(sel==='__OV__'&&typeof ensureOvPanel==='function')ensureOvPanel(chosen);
  r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+ if(sel==='__OV__'){try{syncWs(chosen);}catch(e){}}   // level-1 workspace bar follows the active seg (deep links auto-activate the owning workspace)
  r.querySelectorAll('.seg').forEach(p=>{const was=p.hidden;p.hidden=p.dataset.seg!==chosen;if(was&&!p.hidden)p.classList.add('segin');});   // .segin arms the panel-entry settle (CSS, motion block); display none→block restarts it per entry
- if(!routeApplying)rememberSeg(sel==='__OV__'?'ov':'stk',chosen);   // don't overwrite user's last-chosen tab during back/forward replay
+ if(!routeApplying){rememberSeg(sel==='__OV__'?'ov':'stk',chosen);if(sel==='__OV__')rememberWsSeg(chosen);}   // don't overwrite user's last-chosen tab during back/forward replay
  updateCtx();
  if(!routeApplying)_updateDocTitleAndSR(sel,chosen);   // tab click should refresh window/tab title + SR-announce — applyRoute already covers route-driven changes
  if(!routeApplying){try{_tmLog({type:'tab',sym:sel,seg:chosen});}catch(e){}}
@@ -4802,16 +4838,18 @@ function renderOverview(){
  const _ob=document.getElementById('onboard-slot');if(_ob)_ob.innerHTML=onboardStrip();   // onboarding lives below the ledger, out of the hero zone
  // Render skeleton: viewbar + seg-rail + empty seg panels. ensureOvPanel() populates each on first activate.
  // activeSeg from URL is rendered eagerly so the initial paint has actual content.
- const initialSeg=lastSeg('ov')||DEFAULT_SEG.ov;
  const segs=['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'];
+ const _ls=lastSeg('ov');const initialSeg=segs.indexOf(_ls)>=0?_ls:DEFAULT_SEG.ov;   // validate stale/invalid localStorage seg so .on/syncWs/panelMarkup all agree
  const _segin=document.body.classList.contains('done')?' segin':'';   // post-load renders settle; initial load keeps the stagger
  const panelMarkup=segs.map(s=>`<div class="seg${s===initialSeg?_segin:''}" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
- <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><span class="rail-here">组合总览</span><span class="seg-grp">决策</span><button class="on" data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><span class="seg-grp">风险</span><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><span class="seg-grp">表现</span><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><span class="seg-grp">记录</span><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
+ <nav aria-label="工作区" class="ws-rail-wrap"><div class="ws-rail"><span class="rail-here">组合总览</span>${WS_MAP.map(w=>`<button data-ws="${w.id}" title="${w.segs.map(s=>segLabel(s,'ov')).join(' · ')}" onclick="wsGo('${w.id}')">${w.label}</button>`).join('')}</div></nav>
+ <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
  ${panelMarkup}`;
  // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
  ensureOvPanel(initialSeg);
- segWire();bindCharts();updateCtx();renderOptSec();
+ {const _b=right.querySelector('.seg-rail [data-seg="'+initialSeg+'"]');if(_b)_b.classList.add('on');}   // .on follows initialSeg (was hardcoded on score — mismatched when lastSeg('ov') differs and its workspace hides score)
+ segWire();syncWs(initialSeg);bindCharts();updateCtx();renderOptSec();
  // Idle-prefetch other panels so subsequent tab clicks are instant. Skipped on browsers without rIC,
  // and rationed on low-end devices (≤4 cores or <4GB) — panels still render on demand at tab click.
  const _lowEnd=(navigator.deviceMemory&&navigator.deviceMemory<4)||(navigator.hardwareConcurrency&&navigator.hardwareConcurrency<=4);
@@ -5348,7 +5386,8 @@ function renderDetail(){
  bindMarkers();segWire();bindCharts();updateCtx();wireJournalEditor(s);renderOptSec();fixThScope(document.getElementById('right'));armDraw(document.getElementById('right'));   // restoreSeg removed — URL is source of truth; renderOptSec replaces the MutationObserver
 }
 function segWire(){const r=document.getElementById('right');
- r.querySelectorAll('.seg-rail').forEach(rail=>rail.setAttribute('role','tablist'));
+ r.querySelectorAll('.seg-rail,.ws-rail').forEach(rail=>rail.setAttribute('role','tablist'));
+ r.querySelectorAll('.ws-rail button[data-ws]').forEach(b=>{b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');});
  r.querySelectorAll('.seg-rail button').forEach(b=>{
   b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');
   {const sg=b.dataset.seg,panel=r.querySelector('.seg[data-seg="'+sg+'"]');if(panel){const tid='segtab-'+sg,pid='segpanel-'+sg;b.id=tid;b.setAttribute('aria-controls',pid);panel.id=pid;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',tid);if(!panel.hasAttribute('tabindex'))panel.setAttribute('tabindex','0');}}
@@ -5570,8 +5609,10 @@ document.addEventListener('keydown',e=>{
    if(sel!=='__OV__')goBack();
    return;
  }
- if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&(a.parentElement.classList.contains('seg-rail')||a.parentElement.classList.contains('tabs'))){
-   const sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;if(sib){sib.click();sib.focus();e.preventDefault();}return;}
+ if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&(a.parentElement.classList.contains('seg-rail')||a.parentElement.classList.contains('ws-rail')||a.parentElement.classList.contains('tabs'))){
+   let sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;
+   while(sib&&(sib.tagName!=='BUTTON'||sib.hidden))sib=e.key==='ArrowRight'?sib.nextElementSibling:sib.previousElementSibling;   // skip .rail-here span + segs hidden by the inactive workspace
+   if(sib){const _ws=sib.dataset&&sib.dataset.ws;sib.click();if(_ws){const _nb=document.querySelector('.ws-rail button[data-ws="'+_ws+'"]');if(_nb)_nb.focus();else sib.focus();}else sib.focus();e.preventDefault();}return;}
  // keyboard listbox on the holdings list: ArrowUp/Down/Home/End cycle row focus; Enter/Space already wired per-row
  if(a&&a.classList&&a.classList.contains('row')){
    if(e.key==='ArrowDown'||e.key==='ArrowUp'){const sib=e.key==='ArrowDown'?a.nextElementSibling:a.previousElementSibling;if(sib&&sib.classList&&sib.classList.contains('row')){sib.focus();e.preventDefault();}return;}
