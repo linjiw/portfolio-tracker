@@ -754,6 +754,12 @@ def compute_fib(items):
         elif e5[i - 1] >= e13[i - 1] and e5[i] < e13[i]:
             sig.append({"date": dates[i], "type": "death", "price": round(px[i], 2)})
     # multi-indicator RESONANCE: trend alignment + recent EMA5x13 cross + RSI not extreme
+    # Weighting: the three conditions are EQUALLY weighted as a hard AND gate — each
+    # is a binary veto, none dominates. Rationale: this is a confirmation filter, not
+    # a score. Trend supplies direction, the recent cross (≤3 bars) supplies timing,
+    # RSI-not-extreme (<70 bull / >30 bear) vetoes chasing exhaustion. Any weaker
+    # (weighted/soft) blend would re-admit exactly the false crosses this exists to
+    # filter. No empirical per-signal weights have been fitted — by design.
     res = []
     lg = ld = -999
     active = None
@@ -868,6 +874,17 @@ def _option_trade_summary(opt_txns, underlyings):
     return out
 
 def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
+    """QQQ/TQQQ decision map from rule-based state heuristics.
+
+    SIGNAL WEIGHTING: all conditions below (EMA stack order, ATR-distance,
+    5-day momentum, EMA proximity/slope) are IMPLICITLY EQUALLY WEIGHTED —
+    they combine via plain boolean and/or, with no confidence scores or
+    fitted per-signal weights. Rationale: transparent, auditable rules for a
+    discretionary daily-review workflow beat an opaque empirically-tuned
+    blend; each heuristic is independently explainable to the trader, and
+    equal weighting means no signal can silently dominate after a data-regime
+    change. If this were ever driven toward automated execution, explicit
+    reliability tiers / confidence scores should be added first."""
     qrows, qsrc = _ohlc_rows(prices, ohlc, "QQQ", dmax)
     trows, tsrc = _ohlc_rows(prices, ohlc, "TQQQ", dmax)
     if len(qrows) < 55:
@@ -1144,6 +1161,16 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
             "tqqqOptions": tqqq_option_plan}
 
 # ---------------------------------------------------------------- behavioral
+# Concentration warning thresholds (weights in % of equity market value), used by
+# the behavioral "concentration" detector below. Named so the review cadence they
+# assume (weekly/monthly portfolio review — see CODE_REVIEW_2026-07-03) is explicit
+# and tunable in ONE place instead of buried in a comparison chain. Same pattern as
+# MOM_SCALE: constant + rationale so docs and code can't silently drift apart.
+CONC_TOP1_ALERT = 25   # single-name weight > 25% → alert (one thesis dominates drawdown risk)
+CONC_TOP1_WATCH = 18   # single-name weight > 18% → watch
+CONC_TOP5_ALERT = 70   # top-5 combined weight > 70% → alert (little diversification left)
+CONC_TOP5_WATCH = 55   # top-5 combined weight > 55% → watch
+
 def analyze_behavior(stocks, summary, prices, dmin, dmax):
     """Behavioral-economics decision support, grounded in Thaler, "Behavioral
     Economics: Past, Present, and Future" (AER 2016). Detects common investing
@@ -1225,7 +1252,8 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
     top = weights[0] if weights else ("—", 0)
     top5 = sum(w for _, w in weights[:5])
     hhi = sum((w / 100) ** 2 for _, w in weights)
-    lvl = "alert" if (top[1] > 25 or top5 > 70) else ("watch" if (top[1] > 18 or top5 > 55) else "good")
+    lvl = ("alert" if (top[1] > CONC_TOP1_ALERT or top5 > CONC_TOP5_ALERT)
+           else ("watch" if (top[1] > CONC_TOP1_WATCH or top5 > CONC_TOP5_WATCH) else "good"))
     add("concentration", lvl, "集中度 · 自控与默认机制",
         f"最大持仓 {top[0]} 占 {top[1]:.0f}% · 前五合计 {top5:.0f}% · HHI {hhi:.2f}",
         f"单一标的 {top[0]} 占净值 {top[1]:.0f}%，前 5 大合计 {top5:.0f}%。集中会同时放大正确判断与单一标的的回撤。",
@@ -2732,6 +2760,8 @@ tbody tr:hover{background:var(--panel2)}
 .tag.s{background:rgba(229,112,122,.12); color:var(--red)}
 .tag.o{background:var(--panel2); color:var(--mut)}
 .note{font-family:var(--f-ui); color:var(--mut); font-size:var(--t-sm); line-height:1.7}
+/* 决策一览 empty cells: demote the '—' placeholder below --mut so missing data reads as quiet, not as content */
+.cell-empty{color:var(--mut); opacity:.5}
 .note b{color:var(--txt); font-weight:600}
 .scroll{max-height:420px; overflow:auto; border-radius:var(--r-card); border:1px solid var(--hair)}
 /* prose measure: explainers cap at a readable column; ragged-right whitespace is composition, not waste */
@@ -3686,14 +3716,16 @@ function scorecardCard(){
    if(d&&Math.abs(d.drift)>dm.band)attn++;
    const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
    const rsiCls=n.rsi>70?'neg':(n.rsi<30?'pos':'');
-   let riskCell='<td>—</td><td>—</td>';
+   let riskCell='<td class="cell-empty">—</td><td class="cell-empty">—</td>';
    if(c){const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-bw;
-     riskCell=`<td>${c.riskPct.toFixed(1)}%</td><td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
-   const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#B89030';return `<span class="chip" style="color:${col};border-color:${chipBd(col)}">${BL[b.id]||b.id}</span>`;}).join(' '):'<span class="note">—</span>';
-   let driftCell='<td>—</td>';
+     // zero-width bar carries no signal: show a muted dash instead of an empty track
+     const bar=bw>0?`<div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div>`:'<span class="cell-empty">—</span>';
+     riskCell=`<td>${c.riskPct.toFixed(1)}%</td><td>${bar}</td>`;}
+   const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#B89030';return `<span class="chip" style="color:${col};border-color:${chipBd(col)}">${BL[b.id]||b.id}</span>`;}).join(' '):'<span class="note cell-empty">—</span>';
+   let driftCell='<td class="cell-empty">—</td>';
    if(d){const g=d.drift,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
-     driftCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`;}
-   const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">${attn}</span>`:'<span class="note">—</span>';
+     driftCell=bw>0?`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`:'<td class="cell-empty">—</td>';}
+   const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">${attn}</span>`:'<span class="note cell-empty">—</span>';
    // Mobile drops 7 columns, leaving 关注度 as the rightmost (often offscreen). Inline a small attention chip next to the ticker so the priority signal travels with the symbol.
    const attnInline=attn>0?` <span class="chip attn-inline" style="color:#E5707A;border-color:var(--chip-bd-red)" aria-label="关注度 ${attn}">${attn}🚩</span>`:'';
    const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
