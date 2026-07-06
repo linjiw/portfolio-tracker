@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Momentum Top-3 sleeve: signals + 8y backtest + dashboard artifact.
+
+Implements the three winning strategies from the July-2026 40-variant sweep
+(see ~/.hermes skill quant-momentum-research / references/findings-2026-07.md):
+
+  1. RET_11M_top3  — 11-month total return, top-3 equal weight (flagship)
+  2. RET_9M_top3   —  9-month total return, top-3 equal weight (balanced)
+  3. RET_5M_top5   —  5-month total return, top-5 equal weight (best Sharpe)
+
+Design rules (no lookahead): signals are computed at month-end close and the
+portfolio is held from the next trading day. Per-side transaction costs are
+charged on turnover. Benchmarks SPY/QQQ ride along.
+
+HONESTY NOTE (survivorship bias): the universe is *today's* index membership,
+so absolute backtest numbers are upper bounds. Cross-strategy ranking is the
+valid signal. This is decision support, not trading advice.
+
+Outputs (under --out-dir, default output/momentum_top3/):
+  momentum_top3.json  — metrics, weekly equity curves, current signals
+  momentum_top3.html  — standalone dark-theme dashboard (no external deps)
+
+Usage:
+  python3 scripts/momentum_top3.py              # fetch prices (cached)
+  python3 scripts/momentum_top3.py --no-fetch   # offline, reuse cache
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import io
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "data" / "momentum_config.json"
+DEFAULT_OUT = ROOT / "output" / "momentum_top3"
+PRICE_CACHE = ROOT / "output" / "momentum_prices.csv.gz"
+
+WIKI = {
+    "SPX": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
+    "NDX": ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
+    "DJIA": ("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", "Symbol"),
+}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) portfolio-tracker/1.0"}
+
+
+# ---------------------------------------------------------------- data layer
+def fetch_universe(indices):
+    import requests
+
+    tickers = set()
+    for idx in indices:
+        url, col = WIKI[idx]
+        r = requests.get(url, headers=UA, timeout=30)
+        r.raise_for_status()
+        for tbl in pd.read_html(io.StringIO(r.text)):
+            cols = [str(c) for c in tbl.columns]
+            if col in cols and len(tbl) > 20:
+                tickers |= {str(t).strip().replace(".", "-") for t in tbl[col]}
+                break
+    return sorted(t for t in tickers if t and t != "nan")
+
+
+def load_prices(cfg, no_fetch=False):
+    if no_fetch:
+        if not PRICE_CACHE.exists():
+            sys.exit(f"--no-fetch but no cache at {PRICE_CACHE}")
+        return pd.read_csv(PRICE_CACHE, index_col=0, parse_dates=True)
+    import yfinance as yf
+
+    tickers = fetch_universe(cfg["universe"]["indices"])
+    tickers = sorted(set(tickers) | set(cfg["backtest"]["benchmarks"]))
+    end = dt.date.today() + dt.timedelta(days=1)
+    start = end - dt.timedelta(days=int(365.25 * (cfg["backtest"]["years"] + 3.2)))
+    px = yf.download(tickers, start=str(start), end=str(end), auto_adjust=True,
+                     threads=True, progress=False)["Close"]
+    if isinstance(px, pd.Series):
+        px = px.to_frame()
+    px = px.dropna(axis=1, how="all").sort_index()
+    PRICE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    px.to_csv(PRICE_CACHE, compression="gzip")
+    return px
+
+
+# ------------------------------------------------------------- signal layer
+def asof_price(hist, months):
+    ts = hist.index[-1] - pd.DateOffset(months=months)
+    idx = hist.index[hist.index >= ts]
+    if not len(idx):
+        return hist.iloc[0] * np.nan
+    return hist.loc[idx[0]]
+
+
+def valid_columns(hist, months=13, coverage=0.95):
+    w = hist.loc[hist.index >= hist.index[-1] - pd.DateOffset(months=months)]
+    return w.columns[w.notna().sum() >= int(len(w) * coverage)]
+
+
+def momentum_scores(hist, lookback_months, coverage=0.95, exclude=()):
+    cols = [c for c in valid_columns(hist, coverage=coverage) if c not in exclude]
+    h = hist[cols]
+    return (h.iloc[-1] / asof_price(h, lookback_months) - 1).dropna()
+
+
+# ----------------------------------------------------------- backtest layer
+def month_end_index(px):
+    return px.groupby(px.index.to_period("M")).tail(1).index
+
+
+def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
+                 coverage=0.95, exclude=()):
+    """Monthly rebalance, equal weight top_n. Returns (equity, avg_turnover)."""
+    me = month_end_index(px)
+    me = me[(me >= start - pd.DateOffset(days=40)) & (me <= end)]
+    daily_ret = px.pct_change()
+    equity, dates = [1.0], []
+    prev_w = pd.Series(dtype=float)
+    turnover_sum, months = 0.0, 0
+    for i in range(len(me) - 1):
+        t0, t1 = me[i], me[i + 1]
+        if t0 < start - pd.DateOffset(days=35):
+            continue
+        scores = momentum_scores(px.loc[:t0], lookback_months,
+                                 coverage=coverage, exclude=exclude)
+        top = scores.sort_values(ascending=False).head(top_n)
+        w = (pd.Series(1 / len(top), index=top.index)
+             if len(top) else pd.Series(dtype=float))
+        both = w.index.union(prev_w.index)
+        turn = (w.reindex(both, fill_value=0)
+                - prev_w.reindex(both, fill_value=0)).abs().sum() / 2
+        turnover_sum += turn
+        months += 1
+        seg = daily_ret.loc[(daily_ret.index > t0) & (daily_ret.index <= t1),
+                            w.index] if len(w) else pd.DataFrame()
+        eq = equity[-1] * (1 - turn * 2 * cost_per_side)
+        if len(w):
+            port = seg.fillna(0) @ w.values
+            for d, r in port.items():
+                eq *= (1 + r)
+                equity.append(eq)
+                dates.append(d)
+            growth = (1 + seg.fillna(0)).prod()
+            drifted = w * growth
+            prev_w = drifted / max(drifted.sum(), 1e-12)
+        else:
+            prev_w = pd.Series(dtype=float)
+    ser = pd.Series(equity[1:], index=pd.DatetimeIndex(dates))
+    return ser[~ser.index.duplicated(keep="last")], turnover_sum / max(months, 1)
+
+
+def perf_metrics(eq):
+    if len(eq) < 2:
+        return {"total_x": None, "cagr_pct": None, "max_dd_pct": None, "sharpe": None}
+    r = eq.pct_change().dropna()
+    yrs = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
+    cagr = float(eq.iloc[-1]) ** (1 / yrs) - 1
+    dd = float((eq / eq.cummax() - 1).min())
+    sharpe = float(r.mean() / r.std() * math.sqrt(252)) if r.std() > 0 else None
+    return {"total_x": round(float(eq.iloc[-1]), 2),
+            "cagr_pct": round(cagr * 100, 1),
+            "max_dd_pct": round(dd * 100, 1),
+            "sharpe": round(sharpe, 2) if sharpe is not None else None}
+
+
+def weekly_points(eq):
+    w = eq.groupby(eq.index.to_period("W")).last()
+    return [[str(p.end_time.date()), round(float(v), 4)] for p, v in w.items()]
+
+
+# ------------------------------------------------------------ artifact layer
+def build_payload(cfg, px):
+    bench = cfg["backtest"]["benchmarks"]
+    end = px.index[-1]
+    start = end - pd.DateOffset(years=cfg["backtest"]["years"])
+    cost = cfg["backtest"]["cost_per_side"]
+    coverage = cfg["universe"].get("min_history_coverage", 0.95)
+
+    payload = {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "window": {"start": str(start.date()), "end": str(end.date()),
+                   "years": cfg["backtest"]["years"]},
+        "universe_size": int(px.shape[1] - len(bench)),
+        "cost_per_side": cost,
+        "disclaimer": ("Survivorship bias: universe is today's index membership; "
+                       "absolute returns are upper bounds. Decision support only."),
+        "strategies": [], "benchmarks": {},
+    }
+    for b in bench:
+        eq = px[b].loc[px.index >= start].dropna()
+        eq = eq / eq.iloc[0]
+        payload["benchmarks"][b] = {"metrics": perf_metrics(eq),
+                                    "equity_weekly": weekly_points(eq)}
+    for s in cfg["strategies"]:
+        eq, turn = run_backtest(px, s["lookback_months"], s["top_n"],
+                                start, end, cost, coverage, exclude=bench)
+        scores = momentum_scores(px, s["lookback_months"],
+                                 coverage=coverage, exclude=bench)
+        top = scores.sort_values(ascending=False).head(s["top_n"])
+        payload["strategies"].append({
+            **{k: s[k] for k in ("id", "label", "lookback_months", "top_n",
+                                 "weighting", "role", "thesis")},
+            "metrics": {**perf_metrics(eq),
+                        "monthly_turnover": round(float(turn), 2)},
+            "equity_weekly": weekly_points(eq),
+            "current_signal": {
+                "as_of": str(end.date()),
+                "holdings": [{"ticker": t, "lookback_return_pct": round(v * 100, 1),
+                              "weight_pct": round(100 / s["top_n"], 1)}
+                             for t, v in top.items()],
+            },
+        })
+    return payload
+
+
+def render_html(payload):
+    data = json.dumps(payload, ensure_ascii=False)
+    return """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>动量 Top-3 策略舱 · Momentum Sleeve</title><style>
+:root{--bg:#0b0f14;--card:#121821;--ink:#e6edf3;--mut:#8b98a5;--line:#1f2937;
+--g:#3fb950;--r:#f85149;--a1:#58a6ff;--a2:#d29922;--a3:#bc8cff;--b1:#484f58;--b2:#6e7681}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:18px}
+h1{font-size:20px;margin:0 0 2px}.sub{color:var(--mut);font-size:12px;margin-bottom:14px}
+.warn{background:#2d1a06;border:1px solid #6a4a12;color:#e3b341;border-radius:8px;
+padding:8px 12px;font-size:12px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{font-size:15px;margin:0 0 2px}.role{font-size:11px;color:var(--mut);margin-bottom:8px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0}
+.kpi{background:#0d1420;border-radius:6px;padding:6px 8px;text-align:center}
+.kpi b{display:block;font-size:16px}.kpi span{font-size:10px;color:var(--mut)}
+.pos b{color:var(--g)}.neg b{color:var(--r)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:4px 6px;text-align:right;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}th{color:var(--mut);font-weight:500}
+.thesis{font-size:11px;color:var(--mut);margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+#chartcard{margin-bottom:16px}#legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;margin-bottom:6px}
+#legend span{display:inline-flex;align-items:center;gap:5px}
+#legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
+.cmp th,.cmp td{font-variant-numeric:tabular-nums}
+</style></head><body>
+<h1>动量 Top-3 策略舱</h1>
+<div class="sub" id="sub"></div>
+<div class="warn">⚠️ 幸存者偏差:宇宙为<b>今日</b>指数成分,绝对收益是上界;策略间相对排名有效。研究用途,非投资建议。</div>
+<div class="card" id="chartcard"><h2>8年净值曲线(对数轴)</h2><div id="legend"></div><div id="chart"></div></div>
+<div class="grid" id="cards"></div>
+<div class="card"><h2>策略对比总表</h2><table class="cmp" id="cmp"></table></div>
+<script>
+const D=__DATA__;
+const C={RET_11M_top3:'var(--a1)',RET_9M_top3:'var(--a2)',RET_5M_top5:'var(--a3)',SPY:'var(--b1)',QQQ:'var(--b2)'};
+document.getElementById('sub').textContent=`窗口 ${D.window.start} → ${D.window.end} · 宇宙 ${D.universe_size} 只 (SPX∪NDX∪DJIA) · 月末信号/次日持有 · 单边成本 ${(D.cost_per_side*1e4).toFixed(0)}bp · 生成于 ${D.generated_at}`;
+function fmt(x){return x==null?'—':x}
+function series(){const out=[];for(const s of D.strategies)out.push({id:s.id,pts:s.equity_weekly});
+for(const[b,v]of Object.entries(D.benchmarks))out.push({id:b,pts:v.equity_weekly});return out}
+(function chart(){const S=series(),W=Math.min(document.body.clientWidth-60,1100),H=340,P={l:46,r:8,t:8,b:22};
+let ymin=1e9,ymax=-1e9,xmin=null,xmax=null;
+for(const s of S)for(const[d,v]of s.pts){ymin=Math.min(ymin,v);ymax=Math.max(ymax,v);
+if(!xmin||d<xmin)xmin=d;if(!xmax||d>xmax)xmax=d}
+const x0=new Date(xmin).getTime(),x1=new Date(xmax).getTime();
+const ly0=Math.log10(ymin),ly1=Math.log10(ymax);
+const X=d=>P.l+(new Date(d).getTime()-x0)/(x1-x0)*(W-P.l-P.r);
+const Y=v=>P.t+(1-(Math.log10(v)-ly0)/(ly1-ly0))*(H-P.t-P.b);
+let g='';const ticks=[0.5,1,2,5,10,20,50,100,200,400];
+for(const t of ticks){if(t<ymin||t>ymax)continue;
+g+=`<line x1="${P.l}" x2="${W-P.r}" y1="${Y(t)}" y2="${Y(t)}" stroke="#1f2937" stroke-width="1"/><text x="4" y="${Y(t)+3}">${t}x</text>`}
+for(let yr=new Date(xmin).getFullYear()+1;yr<=new Date(xmax).getFullYear();yr++){
+const xx=X(yr+'-01-01');g+=`<line x1="${xx}" x2="${xx}" y1="${P.t}" y2="${H-P.b}" stroke="#141c26"/><text x="${xx-12}" y="${H-6}">${yr}</text>`}
+let paths='';for(const s of S){const p=s.pts.map((q,i)=>(i?'L':'M')+X(q[0]).toFixed(1)+','+Y(q[1]).toFixed(1)).join('');
+paths+=`<path d="${p}" fill="none" stroke="${C[s.id]||'#999'}" stroke-width="${s.id in D.benchmarks?1.2:2}" opacity="${s.id in D.benchmarks?0.75:1}"/>`}
+document.getElementById('chart').innerHTML=`<svg width="${W}" height="${H}">${g}${paths}</svg>`;
+document.getElementById('legend').innerHTML=S.map(s=>{const lab=(D.strategies.find(t=>t.id===s.id)||{}).label||s.id+' (基准)';
+return `<span><i style="background:${C[s.id]}"></i>${lab} · ${s.pts[s.pts.length-1][1].toFixed(1)}x</span>`}).join('')})();
+document.getElementById('cards').innerHTML=D.strategies.map(s=>{const m=s.metrics;
+return `<div class="card"><h2 style="color:${C[s.id]}">${s.label}</h2>
+<div class="role">${s.id} · 回看 ${s.lookback_months} 月 · Top${s.top_n} 等权 · 月调仓 · ${s.role}</div>
+<div class="kpis">
+<div class="kpi pos"><b>${fmt(m.total_x)}x</b><span>8年总倍数</span></div>
+<div class="kpi pos"><b>${fmt(m.cagr_pct)}%</b><span>CAGR</span></div>
+<div class="kpi neg"><b>${fmt(m.max_dd_pct)}%</b><span>最大回撤</span></div>
+<div class="kpi"><b>${fmt(m.sharpe)}</b><span>Sharpe</span></div></div>
+<table><tr><th>当前信号 (${s.current_signal.as_of})</th><th>回看收益</th><th>权重</th></tr>
+${s.current_signal.holdings.map(h=>`<tr><td class="hold">${h.ticker}</td><td>+${h.lookback_return_pct}%</td><td>${h.weight_pct}%</td></tr>`).join('')}</table>
+<div class="thesis">${s.thesis}</div></div>`}).join('');
+(function cmp(){const rows=[...D.strategies.map(s=>({n:s.label,m:{...s.metrics}})),
+...Object.entries(D.benchmarks).map(([b,v])=>({n:b+'(基准)',m:{...v.metrics,monthly_turnover:0}}))];
+document.getElementById('cmp').innerHTML='<tr><th>策略</th><th>总倍数</th><th>CAGR</th><th>最大回撤</th><th>Sharpe</th><th>月换手</th></tr>'+
+rows.map(r=>`<tr><td>${r.n}</td><td>${fmt(r.m.total_x)}x</td><td>${fmt(r.m.cagr_pct)}%</td><td>${fmt(r.m.max_dd_pct)}%</td><td>${fmt(r.m.sharpe)}</td><td>${(r.m.monthly_turnover*100).toFixed(0)}%</td></tr>`).join('')})();
+</script></body></html>""".replace("__DATA__", data)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Momentum Top-3 sleeve artifact")
+    ap.add_argument("--config", default=str(DEFAULT_CONFIG))
+    ap.add_argument("--out-dir", default=str(DEFAULT_OUT))
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="reuse cached prices (offline)")
+    args = ap.parse_args()
+
+    cfg = json.loads(Path(args.config).read_text())
+    px = load_prices(cfg, no_fetch=args.no_fetch)
+    payload = build_payload(cfg, px)
+
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "momentum_top3.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1))
+    (out / "momentum_top3.html").write_text(render_html(payload))
+    for s in payload["strategies"]:
+        h = ", ".join(x["ticker"] for x in s["current_signal"]["holdings"])
+        m = s["metrics"]
+        print(f"{s['id']:14s} {m['total_x']:>7}x  CAGR {m['cagr_pct']:>5}%  "
+              f"DD {m['max_dd_pct']:>6}%  Sharpe {m['sharpe']}  -> {h}")
+    print(f"wrote {out/'momentum_top3.json'} and .html")
+
+
+if __name__ == "__main__":
+    main()

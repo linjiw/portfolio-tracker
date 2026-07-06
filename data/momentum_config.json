@@ -1,0 +1,48 @@
+{
+  "$schema_note": "Momentum Top-3 sleeve config. Edited by hand; consumed by scripts/momentum_top3.py. All lookbacks in calendar months; signal computed at month-end close, held from next trading day (no lookahead).",
+  "universe": {
+    "indices": ["SPX", "NDX", "DJIA"],
+    "min_history_coverage": 0.95,
+    "note": "current constituents scraped from Wikipedia -> survivorship bias: absolute backtest numbers are upper bounds; cross-strategy ranking remains valid"
+  },
+  "backtest": {
+    "years": 8,
+    "cost_per_side": 0.0010,
+    "rebalance": "monthly",
+    "benchmarks": ["SPY", "QQQ"]
+  },
+  "strategies": [
+    {
+      "id": "RET_11M_top3",
+      "label": "旗舰 · 11月动量 Top3",
+      "lookback_months": 11,
+      "top_n": 3,
+      "weighting": "equal",
+      "role": "aggressive-core",
+      "thesis": "11m total return, 3-name concentration. Champion of 40-variant sweep: best total return AND best head-4y robustness; Sharpe 1.65."
+    },
+    {
+      "id": "RET_9M_top3",
+      "label": "均衡 · 9月动量 Top3",
+      "lookback_months": 9,
+      "top_n": 3,
+      "weighting": "equal",
+      "role": "balanced",
+      "thesis": "9m lookback sits on the second momentum peak; slightly faster signal than 11m with similar DD profile."
+    },
+    {
+      "id": "RET_5M_top5",
+      "label": "稳健 · 5月动量 Top5",
+      "lookback_months": 5,
+      "top_n": 5,
+      "weighting": "equal",
+      "role": "defensive-diversifier",
+      "thesis": "Short-peak lookback + 5-name breadth: best Sharpe (1.70) and shallowest DD of head group; low overlap with 9-11m signals."
+    }
+  ],
+  "sleeve_caps": {
+    "note": "decision support only, not auto-trading",
+    "suggested_total_sleeve_pct": 10.0,
+    "per_strategy_split": [0.4, 0.3, 0.3]
+  }
+}
