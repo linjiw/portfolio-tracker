@@ -20,12 +20,15 @@ It does three things:
      filter) or a money-market position being miscounted as equity. If the
      numbers disagree the sync FAILS loudly.
 
-  3. **Refresh financial lens** — update the company financial-status artifact
+  3. **Refresh Momentum Top-3** — update the strategy artifact from latest
+     Yahoo index-constituent prices before the dashboard embeds it.
+
+  4. **Refresh financial lens** — update the company financial-status artifact
      using the configured source cascade (default: FMP + Yahoo/yfinance + SEC
      when SEC_USER_AGENT is configured) and re-embed it in the HTML. This step
      is skipped in ``--no-fetch`` mode unless explicitly requested.
 
-  4. **Log** — append a one-line snapshot (value, P&L, return, deposits) to
+  5. **Log** — append a one-line snapshot (value, P&L, return, deposits) to
      ``output/sync_log.json`` and print the delta versus the previous sync, so
      there is a longitudinal record across syncs.
 
@@ -137,6 +140,44 @@ def financial_summary():
         return None
 
 
+def momentum_summary():
+    path = os.path.join(HERE, "output", "momentum_top3", "momentum_top3.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        doc = json.load(open(path))
+        return {
+            "generatedAt": doc.get("generated_at"),
+            "end": (doc.get("window") or {}).get("end"),
+            "signals": [
+                (s.get("id"), [h.get("ticker") for h in ((s.get("current_signal") or {}).get("holdings") or [])])
+                for s in (doc.get("strategies") or [])[:3]
+            ],
+        }
+    except Exception:
+        return None
+
+
+def refresh_momentum_strategy(mode, no_fetch):
+    if mode == "off":
+        return False
+    cmd = [sys.executable, os.path.join(HERE, "scripts", "momentum_top3.py")]
+    if no_fetch:
+        cmd.append("--no-fetch")
+    print("\n▶ refreshing Momentum Top-3 strategy:", " ".join(os.path.basename(c) if c.endswith(".py") else c for c in cmd), flush=True)
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        if mode == "on":
+            sys.exit("!! momentum_top3.py failed — dashboard NOT updated.")
+        print("  (momentum strategy refresh failed; keeping previous artifact)")
+        return False
+    ms = momentum_summary()
+    if ms:
+        flagship = ms["signals"][0][1] if ms["signals"] else []
+        print(f"  momentum strategy: data through {ms['end']} · flagship {', '.join(flagship)}")
+    return True
+
+
 def pct(x):
     return f"{x:+.2f}%" if isinstance(x, (int, float)) else "n/a"
 
@@ -156,12 +197,16 @@ def main():
                     help="comma-separated financial lens sources passed to scripts/financial_status_score.py")
     ap.add_argument("--sec-user-agent", default=None,
                     help="SEC EDGAR User-Agent string passed to the financial lens")
+    ap.add_argument("--momentum-strategy", choices=("auto", "on", "off"), default="auto",
+                    help="refresh/embed the Momentum Top-3 strategy artifact before rendering (default: auto)")
     ap.add_argument("--open", action="store_true", help="open the dashboard in a browser when done")
     args, passthrough = ap.parse_known_args()
 
     portfolio = args.portfolio or newest("Portfolio_Positions*.csv", args.input_dir)
     if not portfolio:
         sys.exit(f"!! No Portfolio_Positions*.csv found in {args.input_dir}. Pass --portfolio.")
+
+    refresh_momentum_strategy(args.momentum_strategy, args.no_fetch)
 
     # 1) regenerate via the single source of truth -----------------------------
     cmd = [sys.executable, os.path.join(HERE, "generate.py"),

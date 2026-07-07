@@ -32,6 +32,7 @@ import io
 import json
 import math
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "data" / "momentum_config.json"
 DEFAULT_OUT = ROOT / "output" / "momentum_top3"
 PRICE_CACHE = ROOT / "output" / "momentum_prices.csv.gz"
+try:
+    pd.tseries.frequencies.to_offset("ME")
+    MONTH_END_FREQ = "ME"
+except ValueError:
+    MONTH_END_FREQ = "M"
 
 WIKI = {
     "SPX": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
@@ -51,6 +57,68 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) portfolio-tracker/1.0"}
 
 
 # ---------------------------------------------------------------- data layer
+class _WikiTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._table = None
+        self._row = None
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table" and self._table is None:
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            if any(self._row):
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+
+def _tickers_from_html_table(html, column):
+    """Small stdlib fallback for Wikipedia constituents when pandas lacks lxml."""
+    parser = _WikiTableParser()
+    parser.feed(html)
+    tickers = set()
+    for table in parser.tables:
+        if len(table) <= 20:
+            continue
+        header_idx = None
+        col_idx = None
+        for i, row in enumerate(table[:5]):
+            normalized = [c.strip() for c in row]
+            if column in normalized:
+                header_idx = i
+                col_idx = normalized.index(column)
+                break
+        if header_idx is None or col_idx is None:
+            continue
+        for row in table[header_idx + 1:]:
+            if col_idx < len(row):
+                ticker = row[col_idx].strip().replace(".", "-")
+                if ticker and ticker.lower() != "nan":
+                    tickers.add(ticker)
+        if tickers:
+            break
+    return tickers
+
+
 def fetch_universe(indices):
     import requests
 
@@ -59,11 +127,20 @@ def fetch_universe(indices):
         url, col = WIKI[idx]
         r = requests.get(url, headers=UA, timeout=30)
         r.raise_for_status()
-        for tbl in pd.read_html(io.StringIO(r.text)):
-            cols = [str(c) for c in tbl.columns]
-            if col in cols and len(tbl) > 20:
-                tickers |= {str(t).strip().replace(".", "-") for t in tbl[col]}
-                break
+        found = set()
+        try:
+            for tbl in pd.read_html(io.StringIO(r.text)):
+                cols = [str(c) for c in tbl.columns]
+                if col in cols and len(tbl) > 20:
+                    found = {str(t).strip().replace(".", "-") for t in tbl[col]}
+                    break
+        except ImportError:
+            found = _tickers_from_html_table(r.text, col)
+        if not found:
+            found = _tickers_from_html_table(r.text, col)
+        if not found:
+            raise RuntimeError(f"Could not parse {idx} constituents from {url}")
+        tickers |= found
     return sorted(t for t in tickers if t and t != "nan")
 
 
@@ -118,7 +195,7 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
     """Monthly rebalance, equal weight top_n. Returns (equity, avg_turnover)."""
     me = month_end_index(px)
     me = me[(me >= start - pd.DateOffset(days=40)) & (me <= end)]
-    daily_ret = px.pct_change()
+    daily_ret = px.pct_change(fill_method=None)
     equity, dates = [1.0], []
     prev_w = pd.Series(dtype=float)
     turnover_sum, months = 0.0, 0
@@ -200,7 +277,7 @@ def cycle_stats(eq, months_back=13):
     elif dd <= -8:  phase = "回吐中"
     elif (r3m or 0) >= 30: phase = "成熟"
     else:           phase = "早期"
-    mr = eq.resample("ME").last().pct_change().dropna().tail(months_back)
+    mr = eq.resample(MONTH_END_FREQ).last().pct_change().dropna().tail(months_back)
     monthly = [[p.strftime("%Y-%m"), round(float(v)*100, 1)] for p, v in mr.items()]
     if monthly and end < mr.index[-1]:      # 数据未到月末 → 末根为进行中的部分月
         monthly[-1][0] += "*"
