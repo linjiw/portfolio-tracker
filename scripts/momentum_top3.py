@@ -41,6 +41,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "data" / "momentum_config.json"
 DEFAULT_OUT = ROOT / "output" / "momentum_top3"
 PRICE_CACHE = ROOT / "output" / "momentum_prices.csv.gz"
+try:
+    pd.tseries.frequencies.to_offset("ME")
+    MONTH_END_FREQ = "ME"
+except ValueError:
+    MONTH_END_FREQ = "M"
 
 WIKI = {
     "SPX": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
@@ -200,7 +205,7 @@ def cycle_stats(eq, months_back=13):
     elif dd <= -8:  phase = "回吐中"
     elif (r3m or 0) >= 30: phase = "成熟"
     else:           phase = "早期"
-    mr = eq.resample("ME").last().pct_change().dropna().tail(months_back)
+    mr = eq.resample(MONTH_END_FREQ).last().pct_change().dropna().tail(months_back)
     monthly = [[p.strftime("%Y-%m"), round(float(v)*100, 1)] for p, v in mr.items()]
     if monthly and end < mr.index[-1]:      # 数据未到月末 → 末根为进行中的部分月
         monthly[-1][0] += "*"
