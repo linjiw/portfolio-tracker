@@ -168,6 +168,66 @@ def perf_metrics(eq):
             "sharpe": round(sharpe, 2) if sharpe is not None else None}
 
 
+def cycle_stats(eq, months_back=13):
+    """周期位置: 基于策略净值的 MTD/1m/3m、距高点回撤、逐月收益、阶段判定."""
+    if len(eq) < 2:
+        return {"mtd_pct": None, "r1m_pct": None, "r3m_pct": None,
+                "dd_from_peak_pct": None, "peak_date": None, "phase": "早期",
+                "monthly_returns": []}
+    end = eq.index[-1]
+
+    def ret_since(t0, include_t0=False):
+        # MTD 口径: 基准=t0(月初)前最后一个收盘, 即上月末; 滚动 1m/3m 口径: 基准=t0 当日或之前最后收盘
+        cutoff = eq.index <= t0 if include_t0 else eq.index < t0
+        prior, sub = eq.loc[cutoff], eq.loc[~cutoff]
+        if len(prior):
+            base = float(prior.iloc[-1])
+        elif len(sub) > 1:
+            base, sub = float(sub.iloc[0]), sub.iloc[1:]
+        else:
+            return None
+        if not len(sub) or base <= 0:
+            return None
+        return round(float(sub.iloc[-1]) / base * 100 - 100, 1)
+
+    mtd = ret_since(end.replace(day=1))
+    r1m = ret_since(end - pd.DateOffset(months=1), include_t0=True)
+    r3m = ret_since(end - pd.DateOffset(months=3), include_t0=True)
+    peak = eq.cummax()
+    dd = round(float(eq.iloc[-1] / peak.iloc[-1] - 1) * 100, 1)
+    peak_date = str(eq.idxmax().date())
+    if dd <= -20:   phase = "深回撤"
+    elif dd <= -8:  phase = "回吐中"
+    elif (r3m or 0) >= 30: phase = "成熟"
+    else:           phase = "早期"
+    mr = eq.resample("ME").last().pct_change().dropna().tail(months_back)
+    monthly = [[p.strftime("%Y-%m"), round(float(v)*100, 1)] for p, v in mr.items()]
+    if monthly and end < mr.index[-1]:      # 数据未到月末 → 末根为进行中的部分月
+        monthly[-1][0] += "*"
+    return {"mtd_pct": mtd, "r1m_pct": r1m, "r3m_pct": r3m,
+            "dd_from_peak_pct": dd, "peak_date": peak_date, "phase": phase,
+            "monthly_returns": monthly}
+
+
+def live_plan_status(plan, strategy_eq):
+    """分批建仓进度: 已部署比例、下一批、入场以来策略表现(镜像参考)."""
+    done = [t for t in plan["tranches"] if t.get("executed")]
+    pending = [t for t in plan["tranches"] if not t.get("executed")]
+    deployed = round(sum(t["fraction"] for t in done) * 100, 1)
+    since = None
+    t0 = pd.Timestamp(plan["started"], tz=strategy_eq.index.tz)  # 兼容 tz-aware 价格索引
+    sub = strategy_eq.loc[strategy_eq.index >= t0]
+    if len(sub) >= 1:
+        since = round(float(sub.iloc[-1] / sub.iloc[0] - 1) * 100, 1)
+    return {"account_label": plan.get("account_label", ""),
+            "strategy_id": plan["strategy_id"], "started": plan["started"],
+            "deployed_pct": deployed,
+            "tranches": plan["tranches"],
+            "next_tranche": min(pending, key=lambda t: t["target_month_end"]) if pending else None,
+            "since_entry_pct": since,
+            "note": plan.get("note", "")}
+
+
 def weekly_points(eq):
     w = eq.groupby(eq.index.to_period("W")).last()
     return [[str(p.end_time.date()), round(float(v), 4)] for p, v in w.items()]
@@ -195,19 +255,23 @@ def build_payload(cfg, px):
         eq = px[b].loc[px.index >= start].dropna()
         eq = eq / eq.iloc[0]
         payload["benchmarks"][b] = {"metrics": perf_metrics(eq),
-                                    "equity_weekly": weekly_points(eq)}
+                                    "equity_weekly": weekly_points(eq),
+                                    "cycle": cycle_stats(eq)}
+    eq_by_id = {}
     for s in cfg["strategies"]:
         eq, turn = run_backtest(px, s["lookback_months"], s["top_n"],
                                 start, end, cost, coverage, exclude=bench)
         scores = momentum_scores(px, s["lookback_months"],
                                  coverage=coverage, exclude=bench)
         top = scores.sort_values(ascending=False).head(s["top_n"])
+        eq_by_id[s["id"]] = eq
         payload["strategies"].append({
             **{k: s[k] for k in ("id", "label", "lookback_months", "top_n",
                                  "weighting", "role", "thesis")},
             "metrics": {**perf_metrics(eq),
                         "monthly_turnover": round(float(turn), 2)},
             "equity_weekly": weekly_points(eq),
+            "cycle": cycle_stats(eq),
             "current_signal": {
                 "as_of": str(end.date()),
                 "holdings": [{"ticker": t, "lookback_return_pct": round(v * 100, 1),
@@ -215,11 +279,15 @@ def build_payload(cfg, px):
                              for t, v in top.items()],
             },
         })
+    lp = cfg.get("live_plan")
+    if lp and lp.get("strategy_id") in eq_by_id:
+        payload["live_plan"] = live_plan_status(lp, eq_by_id[lp["strategy_id"]])
     return payload
 
 
 def render_html(payload):
-    data = json.dumps(payload, ensure_ascii=False)
+    # "</" → "<\/": 防止 config 字符串中的 </script> 提前终结内联脚本
+    data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     return """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>动量 Top-3 策略舱 · Momentum Sleeve</title><style>
@@ -246,11 +314,22 @@ th:first-child,td:first-child{text-align:left}th{color:var(--mut);font-weight:50
 #legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
 svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
 .cmp th,.cmp td{font-variant-numeric:tabular-nums}
+.cycle{font-size:12px;margin:8px 0;color:var(--ink)}
+.phase{border:1px solid;border-radius:10px;padding:1px 8px;font-size:11px;margin-right:6px}
+.bars{display:flex;gap:3px;align-items:flex-start;height:72px;margin:6px 0}
+.bar{flex:1;text-align:center}.bar i{display:block;width:100%;border-radius:2px}
+.bar s{text-decoration:none;font-size:9px;color:var(--mut)}
+#plancard{margin-bottom:16px}
+.progress{height:10px;background:#0d1420;border-radius:5px;overflow:hidden;margin:8px 0}
+.progress i{display:block;height:100%;background:var(--a1);border-radius:5px}
+.next td{background:#0d1f33}
+.mirror{font-size:11px;color:var(--a2);margin-top:6px}
 </style></head><body>
 <h1>动量 Top-3 策略舱</h1>
 <div class="sub" id="sub"></div>
 <div class="warn">⚠️ 幸存者偏差:宇宙为<b>今日</b>指数成分,绝对收益是上界;策略间相对排名有效。研究用途,非投资建议。</div>
 <div class="card" id="chartcard"><h2>8年净值曲线(对数轴)</h2><div id="legend"></div><div id="chart"></div></div>
+<div id="planmount"></div>
 <div class="grid" id="cards"></div>
 <div class="card"><h2>策略对比总表</h2><table class="cmp" id="cmp"></table></div>
 <script>
@@ -279,6 +358,12 @@ document.getElementById('chart').innerHTML=`<svg width="${W}" height="${H}">${g}
 document.getElementById('legend').innerHTML=S.map(s=>{const lab=(D.strategies.find(t=>t.id===s.id)||{}).label||s.id+' (基准)';
 return `<span><i style="background:${C[s.id]}"></i>${lab} · ${s.pts[s.pts.length-1][1].toFixed(1)}x</span>`}).join('')})();
 document.getElementById('cards').innerHTML=D.strategies.map(s=>{const m=s.metrics;
+const cy=s.cycle;let cyc='';
+if(cy){const phC={'早期':'var(--g)','成熟':'var(--a2)','回吐中':'var(--r)','深回撤':'var(--r)'}[cy.phase]||'var(--mut)';
+cyc=`<div class="cycle"><span class="phase" style="border-color:${phC};color:${phC}">${cy.phase}</span>
+ MTD ${fmt(cy.mtd_pct)}% · 1m ${fmt(cy.r1m_pct)}% · 3m ${fmt(cy.r3m_pct)}% · 距高点 <b style="color:var(--r)">${cy.dd_from_peak_pct}%</b> (峰值 ${cy.peak_date})</div>
+<div class="bars">${cy.monthly_returns.map(([mo,v])=>{const h=Math.min(Math.abs(v),60)*0.5;
+return `<div class="bar" title="${mo}: ${v}%"><i style="height:${h}px;background:${v>=0?'var(--g)':'var(--r)'};margin-top:${v>=0?30-h:30}px"></i><s>${mo.slice(5)}</s></div>`}).join('')}</div>`}
 return `<div class="card"><h2 style="color:${C[s.id]}">${s.label}</h2>
 <div class="role">${s.id} · 回看 ${s.lookback_months} 月 · Top${s.top_n} 等权 · 月调仓 · ${s.role}</div>
 <div class="kpis">
@@ -286,9 +371,20 @@ return `<div class="card"><h2 style="color:${C[s.id]}">${s.label}</h2>
 <div class="kpi pos"><b>${fmt(m.cagr_pct)}%</b><span>CAGR</span></div>
 <div class="kpi neg"><b>${fmt(m.max_dd_pct)}%</b><span>最大回撤</span></div>
 <div class="kpi"><b>${fmt(m.sharpe)}</b><span>Sharpe</span></div></div>
+${cyc}
 <table><tr><th>当前信号 (${s.current_signal.as_of})</th><th>回看收益</th><th>权重</th></tr>
 ${s.current_signal.holdings.map(h=>`<tr><td class="hold">${h.ticker}</td><td>+${h.lookback_return_pct}%</td><td>${h.weight_pct}%</td></tr>`).join('')}</table>
 <div class="thesis">${s.thesis}</div></div>`}).join('');
+(function plan(){const p=D.live_plan;if(!p)return;
+const nx=p.next_tranche;
+document.getElementById('planmount').innerHTML=`<div class="card" id="plancard">
+<h2>分批建仓进度 · ${p.account_label} (${p.strategy_id})</h2>
+<div class="role">开始 ${p.started} · ${p.note}</div>
+<div class="progress"><i style="width:${p.deployed_pct}%"></i></div>
+<div style="font-size:12px;margin-bottom:8px">已部署 <b>${p.deployed_pct}%</b>${nx?` · 下一批: 第${nx.seq}批 目标 <b style="color:var(--a1)">${nx.target_month_end}</b> (${(nx.fraction*100).toFixed(1)}%)`:' · 全部完成'}</div>
+<table><tr><th>批次</th><th>目标月末</th><th>份额</th><th>状态</th><th>实际日期</th></tr>
+${p.tranches.map(t=>`<tr class="${nx&&t.seq===nx.seq?'next':''}"><td>第${t.seq}批</td><td>${t.target_month_end}</td><td>${(t.fraction*100).toFixed(1)}%</td><td>${t.executed?'✅ 已执行':'⏳ 待执行'}</td><td>${t.date||'—'}</td></tr>`).join('')}</table>
+<div class="mirror">入场以来策略表现: <b>${fmt(p.since_entry_pct)}%</b>(策略净值镜像,非账户实际;含滑点/时点差)</div></div>`})();
 (function cmp(){const rows=[...D.strategies.map(s=>({n:s.label,m:{...s.metrics}})),
 ...Object.entries(D.benchmarks).map(([b,v])=>({n:b+'(基准)',m:{...v.metrics,monthly_turnover:0}}))];
 document.getElementById('cmp').innerHTML='<tr><th>策略</th><th>总倍数</th><th>CAGR</th><th>最大回撤</th><th>Sharpe</th><th>月换手</th></tr>'+

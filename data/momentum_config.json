@@ -44,5 +44,16 @@
     "note": "decision support only, not auto-trading",
     "suggested_total_sleeve_pct": 10.0,
     "per_strategy_split": [0.4, 0.3, 0.3]
+  },
+  "live_plan": {
+    "strategy_id": "RET_11M_top3",
+    "account_label": "小账户实测",
+    "started": "2026-07-06",
+    "note": "3个月分3批等额建仓, 每批跟随当期月末信号; 手工维护 executed/date",
+    "tranches": [
+      {"seq": 1, "target_month_end": "2026-07-31", "fraction": 0.3334, "executed": false, "date": null},
+      {"seq": 2, "target_month_end": "2026-08-31", "fraction": 0.3333, "executed": false, "date": null},
+      {"seq": 3, "target_month_end": "2026-09-30", "fraction": 0.3333, "executed": false, "date": null}
+    ]
   }
 }
