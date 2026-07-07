@@ -2230,6 +2230,25 @@ def load_market_mass_dashboard(out_dir):
         return None
 
 
+def load_momentum_top3(out_dir):
+    """Optional Momentum Top-3 strategy layer.
+
+    Reads ``output/momentum_top3/momentum_top3.json`` if present. The producer
+    is ``scripts/momentum_top3.py``. The dashboard treats this as a research
+    artifact, so malformed or missing strategy data should never break the
+    core brokerage dashboard.
+    """
+    path = os.path.join(out_dir, "momentum_top3", "momentum_top3.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (ValueError, OSError) as e:
+        print(f"  (skipped momentum_top3.json: {e})")
+        return None
+
+
 def load_financial_status(out_dir):
     """Optional FMP-backed company financial-status lens.
 
@@ -3163,15 +3182,15 @@ document.getElementById('kpis').innerHTML=
 let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
 const DEFAULT_SEG={ov:'score',stk:'price'};
-const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
-const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', risk:'波动贡献', struct:'结构', cmp:'指数对比', pfib:'技术·节奏', sig:'持仓信号', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
+const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
+const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
 function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
 // Two-level portfolio nav: 5 themed workspaces (level 1) over the seg sub-rail (level 2).
 // Routing is untouched — hash stays #/portfolio/<seg>; the workspace is derived FROM the seg.
 const WS_MAP=[
  {id:'today', label:'今日决策', segs:['score','decide','qt','mass']},
  {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch']},
- {id:'perf',  label:'净值·表现', segs:['nw','cmp','pfib','sig']},
+ {id:'perf',  label:'净值·表现', segs:['nw','cmp','mom','pfib','sig']},
  {id:'risk',  label:'风险·结构', segs:['risk','struct']},
  {id:'plan',  label:'行为·计划', segs:['beh','journal','rebal']},
 ];
@@ -4774,6 +4793,67 @@ function marketMassTab(){
  const warn=(M.warnings||[]).map(w=>`<span class="chip" style="color:var(--amber-line);border-color:var(--chip-bd-amber)">${mmEsc(w)}</span>`).join(' ');
  return `<div class="card t1"><div class="dh"><h2 class="t">重心边界<span class="t-en">MASS</span></h2><span class="nm">${mmEsc(M.universeMode||'universe')} · ${mmEsc(p.gravityProfile||'swing')} · lookback ${p.lookback||84} · half-life ${p.halfLife||21} · pyramid ${(p.pyramidProfiles||[]).join('/')||'tactical/swing/structural'} · ${p.defaultHorizonDays||5}d ${((p.defaultConfidence||.8)*100).toFixed(0)}% · generated ${(M.generatedAt||'').slice(0,10)||'—'}</span></div><div class="note" style="line-height:1.7">Use this panel to check whether price is orbiting an accepted participation center or losing its anchor. Mass health now compares tactical, swing, and structural centers; weak agreement or high levitation means price may be moving with less mean-reversion friction. Boundary zones are probabilistic ranges, not guaranteed support/resistance.</div>${anchor?`<div class="mm-lanes">${anchor}</div>`:''}${warn?`<div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${warn}</div>`:''}</div><div class="mm-grid"><div><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px"><span class="cap" style="border-bottom:0;padding-bottom:0">Selected Symbol</span><select id="mm-symbol" class="mm-select" onchange="marketMassRenderSelected()">${opts}</select></div><div id="mm-detail">${marketMassDetail(MMSEL)}</div></div><div>${marketMassComparisonTable()}</div></div>`;
 }
+function mtEsc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function mtNum(x,d=1){if(x==null||!isFinite(Number(x)))return'—';return Number(x).toFixed(d).replace(/\.0$/,'');}
+function mtPct(x,d=1){return x==null||!isFinite(Number(x))?'—':mtNum(x,d)+'%';}
+function mtMult(x){return x==null||!isFinite(Number(x))?'—':mtNum(x,2)+'x';}
+const MT_COL={RET_11M_top3:'#6FA8DC',RET_9M_top3:'#E8B339',RET_5M_top5:'#9A8CF0',SPY:'#6B7079',QQQ:'#B6BAC1'};
+function mtSeries(D){
+ const out=[];
+ (D.strategies||[]).forEach(s=>out.push({id:s.id,label:s.label,pts:s.equity_weekly||[],kind:'strategy'}));
+ Object.entries(D.benchmarks||{}).forEach(([id,v])=>out.push({id,label:id+' benchmark',pts:v.equity_weekly||[],kind:'benchmark'}));
+ return out.filter(s=>s.pts.length>1);
+}
+function mtEquityChart(D){
+ const S=mtSeries(D);
+ if(!S.length)return `<div class="card"><div class="dh"><h2 class="t">8年净值曲线<span class="t-en">MOMENTUM</span></h2></div><div class="note">Momentum strategy artifact has no chart series. Regenerate with <b>python3 scripts/momentum_top3.py</b>.</div></div>`;
+ const W=1120,H=360,P={l:52,r:12,t:12,b:26};
+ let ymin=Infinity,ymax=-Infinity,xmin=Infinity,xmax=-Infinity;
+ S.forEach(s=>(s.pts||[]).forEach(p=>{const x=new Date(p[0]).getTime(),y=Number(p[1]);if(isFinite(x)&&isFinite(y)&&y>0){xmin=Math.min(xmin,x);xmax=Math.max(xmax,x);ymin=Math.min(ymin,y);ymax=Math.max(ymax,y);}}));
+ if(!isFinite(ymin)||!isFinite(ymax)||xmin===xmax)return `<div class="card"><div class="dh"><h2 class="t">8年净值曲线<span class="t-en">MOMENTUM</span></h2></div><div class="note">Momentum chart series is not usable yet.</div></div>`;
+ ymin=Math.max(.2,ymin*.92);ymax*=1.08;
+ const ly0=Math.log10(ymin),ly1=Math.log10(ymax);
+ const X=d=>P.l+(new Date(d).getTime()-xmin)/(xmax-xmin)*(W-P.l-P.r);
+ const Y=v=>P.t+(1-(Math.log10(Math.max(v,.0001))-ly0)/(ly1-ly0))*(H-P.t-P.b);
+ let grid='';
+ [0.25,0.5,1,2,5,10,20,50,100,200,500,1000].forEach(t=>{if(t>=ymin&&t<=ymax){const y=Y(t);grid+=`<line x1="${P.l}" x2="${W-P.r}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/><text x="8" y="${y+3}" fill="var(--mut)">${t}x</text>`;}});
+ for(let y=new Date(xmin).getFullYear()+1;y<=new Date(xmax).getFullYear();y++){const xx=X(y+'-01-01');grid+=`<line x1="${xx}" x2="${xx}" y1="${P.t}" y2="${H-P.b}" stroke="var(--hair)"/><text x="${xx-14}" y="${H-7}" fill="var(--mut)">${y}</text>`;}
+ const paths=S.map(s=>{const d=s.pts.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+','+Y(Number(p[1])).toFixed(1)).join('');return `<path d="${d}" fill="none" stroke="${MT_COL[s.id]||'#8A8F98'}" stroke-width="${s.kind==='benchmark'?1.4:2.4}" stroke-dasharray="${s.kind==='benchmark'?'5 4':''}" opacity="${s.kind==='benchmark'?.8:1}"/>`;}).join('');
+ const legend=S.map(s=>`<span><i class="${s.kind==='benchmark'?'lnd':'ln'}" style="color:${MT_COL[s.id]||'#8A8F98'}"></i>${mtEsc(s.label)} · ${mtMult(s.pts[s.pts.length-1][1])}</span>`).join('');
+ return `<div class="card t1"><div class="dh"><h2 class="t">8年净值曲线<span class="t-en">LOG SCALE</span></h2><span class="nm">monthly signal · next-session hold · transaction-cost adjusted</span></div><div class="legend">${legend}</div><div class="chartbox"><svg role="img" aria-label="Momentum Top-3 log-scale equity curve" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${grid}${paths}</svg></div><div class="note" style="margin-top:8px">Log scale keeps drawdowns and compounding comparable across high-return and benchmark lines. Universe uses current index membership, so absolute backtest returns are upper-bound research numbers.</div></div>`;
+}
+function mtCycleHtml(c){
+ if(!c)return'';
+ const phaseColor={'早期':'#4FB286','成熟':'#E8B339','回吐中':'#E5707A','深回撤':'#E5707A'}[c.phase]||'var(--mut)';
+ const bars=(c.monthly_returns||[]).map(([mo,v])=>{const h=Math.min(Math.abs(Number(v)||0),60)*.52+2,up=Number(v)>=0;return `<div title="${mtEsc(mo)}: ${mtPct(v)}" style="flex:1;text-align:center;min-width:16px"><i style="display:block;height:${h}px;margin-top:${up?32-h:32}px;background:${up?'#4FB286':'#E5707A'};border-radius:2px"></i><s style="text-decoration:none;font:10px/1.4 var(--f-mono);color:var(--mut)">${mtEsc(String(mo).slice(5))}</s></div>`;}).join('');
+ return `<div class="note" style="margin:8px 0;color:var(--txt)"><span class="chip" style="color:${phaseColor};border-color:${chipBd(phaseColor)}">${mtEsc(c.phase||'—')}</span> MTD ${mtPct(c.mtd_pct)} · 1m ${mtPct(c.r1m_pct)} · 3m ${mtPct(c.r3m_pct)} · drawdown <span class="${Number(c.dd_from_peak_pct)<0?'neg':''}">${mtPct(c.dd_from_peak_pct)}</span> from ${mtEsc(c.peak_date||'—')}</div>${bars?`<div style="display:flex;gap:3px;align-items:flex-start;height:66px;margin:4px 0 8px">${bars}</div>`:''}`;
+}
+function mtSignalRows(s){
+ const rows=((s.current_signal||{}).holdings||[]).map(h=>`<tr><td class="l"><b>${mtEsc(h.ticker)}</b></td><td class="${Number(h.lookback_return_pct)>=0?'pos':'neg'}">${mtPct(h.lookback_return_pct)}</td><td>${mtPct(h.weight_pct)}</td></tr>`).join('');
+ return rows||'<tr><td class="l">No current holdings</td><td>—</td><td>—</td></tr>';
+}
+function mtStrategyCard(s){
+ const m=s.metrics||{},col=MT_COL[s.id]||'var(--accent)';
+ const kpis=[['Total',mtMult(m.total_x),'8y compound'],['CAGR',mtPct(m.cagr_pct),'annualized'],['Max DD',mtPct(m.max_dd_pct),'peak-to-trough'],['Sharpe',mtNum(m.sharpe,2),'daily returns'],['Monthly turnover',mtPct((m.monthly_turnover||0)*100,0),'avg rebalance']];
+ return `<div class="card"><div class="dh"><h2 class="t" style="color:${col}">${mtEsc(s.label||s.id)}</h2><span class="nm">${mtEsc(s.id)} · ${s.lookback_months}m lookback · Top ${s.top_n} · ${mtEsc(s.weighting||'equal')}</span></div><div class="badges">${kpis.map(k=>`<div class="badge"><div class="l">${k[0]}</div><div class="v">${k[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${k[2]}</div></div>`).join('')}</div>${mtCycleHtml(s.cycle)}<div class="scroll"><table><thead><tr><th class="l">Current signal ${(s.current_signal||{}).as_of||''}</th><th>Lookback return</th><th>Weight</th></tr></thead><tbody>${mtSignalRows(s)}</tbody></table></div><div class="note" style="margin-top:8px;line-height:1.65">${mtEsc(s.role||'')} ${s.role?'· ':''}${mtEsc(s.thesis||'')}</div></div>`;
+}
+function mtLivePlanCard(D){
+ const p=D.live_plan;if(!p)return'';
+ const rows=(p.tranches||[]).map(t=>{const next=p.next_tranche&&p.next_tranche.seq===t.seq;return `<tr style="${next?'background:rgba(111,168,220,.10)':''}"><td>第${t.seq}批</td><td>${mtEsc(t.target_month_end||'—')}</td><td>${mtPct((Number(t.fraction)||0)*100)}</td><td class="l">${t.executed?'<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">已执行</span>':'<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">待执行</span>'}</td><td>${mtEsc(t.date||'—')}</td></tr>`;}).join('');
+ return `<div class="card"><div class="dh"><h2 class="t">分批建仓进度<span class="t-en">LIVE PLAN</span></h2><span class="nm">${mtEsc(p.account_label||'')} · ${mtEsc(p.strategy_id||'')}</span></div><div style="height:10px;background:var(--grid);border-radius:var(--r-pill);overflow:hidden;margin:8px 0"><i style="display:block;height:100%;width:${Math.max(0,Math.min(100,Number(p.deployed_pct)||0))}%;background:#6FA8DC;border-radius:var(--r-pill)"></i></div><div class="note">已部署 <b>${mtPct(p.deployed_pct)}</b>${p.next_tranche?` · 下一批: 第${p.next_tranche.seq}批 ${mtEsc(p.next_tranche.target_month_end)} (${mtPct((Number(p.next_tranche.fraction)||0)*100)})`: ' · 全部完成'} · 入场以来策略镜像 ${mtPct(p.since_entry_pct)}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th>批次</th><th>目标月末</th><th>份额</th><th class="l">状态</th><th>实际日期</th></tr></thead><tbody>${rows}</tbody></table></div><div class="note" style="margin-top:8px">${mtEsc(p.note||'')}</div></div>`;
+}
+function mtCompareTable(D){
+ const rows=[...(D.strategies||[]).map(s=>({name:s.label,id:s.id,m:s.metrics||{},kind:'strategy'})),...Object.entries(D.benchmarks||{}).map(([id,v])=>({name:id+' benchmark',id,m:v.metrics||{},kind:'benchmark'}))].map(r=>`<tr><td class="l"><b style="color:${MT_COL[r.id]||'var(--txt)'}">${mtEsc(r.name)}</b><br><span class="note">${mtEsc(r.id)}</span></td><td>${mtMult(r.m.total_x)}</td><td>${mtPct(r.m.cagr_pct)}</td><td>${mtPct(r.m.max_dd_pct)}</td><td>${mtNum(r.m.sharpe,2)}</td><td>${r.kind==='benchmark'?'—':mtPct((Number(r.m.monthly_turnover)||0)*100,0)}</td></tr>`).join('');
+ return `<div class="card"><div class="dh"><h2 class="t">策略对比总表<span class="t-en">COMPARE</span></h2><span class="nm">strategy vs SPY / QQQ benchmark</span></div><div class="scroll"><table><thead><tr><th class="l">Strategy</th><th>Total</th><th>CAGR</th><th>Max DD</th><th>Sharpe</th><th>Monthly turnover</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+function momentumTop3Tab(){
+ const D=DATA.momentumTop3;
+ if(!D)return `<div class="card t1"><div class="dh"><h2 class="t">动量策略<span class="t-en">MOMENTUM</span></h2><span class="nm">artifact missing</span></div><div class="note" style="line-height:1.8">暂无 Momentum Top-3 数据。生成方式：运行 <b>python3 scripts/momentum_top3.py</b> 写入 <b>output/momentum_top3/momentum_top3.json</b>，再运行 <b>python3 generate.py --no-fetch</b>。研究框架，非投资建议。</div></div>`;
+ const w=D.window||{},cost=D.cost_per_side==null?'—':(Number(D.cost_per_side)*10000).toFixed(0)+'bp';
+ const cards=(D.strategies||[]).map(mtStrategyCard).join('');
+ const disc=D.disclaimer||"Survivorship bias: universe is today's index membership; decision support only.";
+ return `<div class="card t1"><div class="dh"><h2 class="t">动量 Top-3 策略舱<span class="t-en">MOMENTUM</span></h2><span class="nm">window ${mtEsc(w.start||'—')} → ${mtEsc(w.end||'—')} · universe ${D.universe_size??'—'} · cost ${cost} · generated ${(D.generated_at||'').replace('T',' ')}</span></div><div class="note" style="line-height:1.7">${mtEsc(disc)} This page is embedded from the same artifact as the standalone Momentum Top-3 view and updates when <b>scripts/momentum_top3.py</b> refreshes prices and signals.</div></div>${mtEquityChart(D)}${mtLivePlanCard(D)}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">${cards}</div>${mtCompareTable(D)}`;
+}
 const PANEL_RENDERERS_OV={
  score: ()=>scorecardCard(),
  decide:()=>decisionLabCard(),
@@ -4783,6 +4863,7 @@ const PANEL_RENDERERS_OV={
  aiwatch:()=>aiWatchlistCard(),
  qt:    ()=>qqqTqqqTab(),
  mass:  ()=>marketMassTab(),
+ mom:   ()=>momentumTop3Tab(),
  nw:    ()=>{const e=_ovPanelEnv();
    return wholeAccountCard()+
      `<div class="card"><div class="dh"><h2 class="t">组合总览</h2><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部"全账户"卡片）</span></div>`+
@@ -4838,13 +4919,13 @@ function renderOverview(){
  const _ob=document.getElementById('onboard-slot');if(_ob)_ob.innerHTML=onboardStrip();   // onboarding lives below the ledger, out of the hero zone
  // Render skeleton: viewbar + seg-rail + empty seg panels. ensureOvPanel() populates each on first activate.
  // activeSeg from URL is rendered eagerly so the initial paint has actual content.
- const segs=['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','risk','struct','cmp','pfib','sig','beh','journal','rebal'];
+ const segs=['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
  const _ls=lastSeg('ov');const initialSeg=segs.indexOf(_ls)>=0?_ls:DEFAULT_SEG.ov;   // validate stale/invalid localStorage seg so .on/syncWs/panelMarkup all agree
  const _segin=document.body.classList.contains('done')?' segin':'';   // post-load renders settle; initial load keeps the stagger
  const panelMarkup=segs.map(s=>`<div class="seg${s===initialSeg?_segin:''}" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
  <nav aria-label="工作区" class="ws-rail-wrap"><div class="ws-rail"><span class="rail-here">组合总览</span>${WS_MAP.map(w=>`<button data-ws="${w.id}" title="${w.segs.map(s=>segLabel(s,'ov')).join(' · ')}" onclick="wsGo('${w.id}')">${w.label}</button>`).join('')}</div></nav>
- <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
+ <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
  ${panelMarkup}`;
  // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
  ensureOvPanel(initialSeg);
@@ -5827,6 +5908,7 @@ def main():
     payload["aiWatchlist"] = load_ai_watchlist(os.path.dirname(args.out))
     payload["aics"] = load_aics_payload(os.path.dirname(args.out))
     payload["marketMass"] = load_market_mass_dashboard(os.path.dirname(args.out))
+    payload["momentumTop3"] = load_momentum_top3(os.path.dirname(args.out))
     payload["financialStatus"] = load_financial_status(os.path.dirname(args.out))
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))

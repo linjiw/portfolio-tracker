@@ -3,7 +3,7 @@
 The dashboard's JS template consumes ``DATA.<key>`` for a fixed set of
 top-level keys. ``build_payload`` produces the core keys; the optional
 research layers (decision / aiSemiQuant / aiWatchlist / aics / marketMass /
-financialStatus) are attached in ``main`` via ``load_*`` helpers. These tests
+momentumTop3 / financialStatus) are attached in ``main`` via ``load_*`` helpers. These tests
 build a payload from a small synthetic portfolio and assert:
 
 * every UI-expected top-level key is present (core + optional loaders),
@@ -34,7 +34,7 @@ UI_CORE_KEYS = {
 }
 UI_OPTIONAL_KEYS = {
     "decision", "aiSemiQuant", "aiWatchlist", "aics", "marketMass",
-    "financialStatus",
+    "momentumTop3", "financialStatus",
 }
 
 
@@ -125,6 +125,7 @@ class PayloadSchemaTests(unittest.TestCase):
                 "aiWatchlist": generate.load_ai_watchlist(td),
                 "aics": generate.load_aics_payload(td),
                 "marketMass": generate.load_market_mass_dashboard(td),
+                "momentumTop3": generate.load_momentum_top3(td),
                 "financialStatus": generate.load_financial_status(td),
             }
         self.assertEqual(set(optional.keys()), UI_OPTIONAL_KEYS)
