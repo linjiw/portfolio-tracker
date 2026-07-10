@@ -19,6 +19,12 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+try:
+    from scripts.artifact_io import atomic_write_json
+except ModuleNotFoundError:  # direct ``python scripts/market_mass_dashboard.py``
+    from artifact_io import atomic_write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,14 +56,21 @@ class SymbolConfig:
     warnings: tuple[str, ...] = ()
 
 
-def _fnum(value):
-    text = str(value).strip().replace(",", "").replace("$", "").replace("+", "")
+def _strict_portfolio_number(value, field, row_number):
+    text = str(value or "").strip()
     if text in ("", "--"):
-        return 0.0
+        return None
+    cleaned = text.replace(",", "").replace("$", "").replace("+", "")
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
     try:
-        return float(text)
-    except ValueError:
-        return 0.0
+        parsed = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"portfolio row {row_number}: invalid {field}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"portfolio row {row_number}: non-finite {field}")
+    return -parsed if negative else parsed
 
 
 def newest(pattern, input_dir):
@@ -70,22 +83,47 @@ def parse_portfolio_symbols(path):
     symbols = set()
     if not path or not os.path.exists(path):
         return symbols
-    with open(path, encoding="utf-8-sig") as fh:
-        for row in csv.reader(fh):
-            if len(row) < 14 or not re.match(r"^[A-Z0-9]{5,}$", row[0].strip()):
-                continue
-            symbol = row[2].strip().upper()
-            if (
-                not symbol
-                or symbol.endswith("**")
-                or symbol.startswith("-")
-                or symbol == "PENDING ACTIVITY"
-            ):
-                continue
-            shares = _fnum(row[4])
-            value = _fnum(row[7])
-            if shares > 0 or value > 0:
-                symbols.add(symbol)
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.reader(fh))
+    header_idx = next(
+        (
+            idx for idx, row in enumerate(rows)
+            if {"Account Number", "Symbol", "Quantity", "Current Value"}.issubset(
+                {cell.strip() for cell in row}
+            )
+        ),
+        None,
+    )
+    if header_idx is None:
+        return symbols
+    header = [cell.strip() for cell in rows[header_idx]]
+    index = {name: pos for pos, name in enumerate(header)}
+    for row_number, raw in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
+        if not any(str(cell).strip() for cell in raw):
+            continue
+        cell = lambda name: raw[index[name]].strip() if index[name] < len(raw) else ""
+        if not cell("Account Number"):
+            continue
+        symbol = cell("Symbol").upper()
+        canonical_option = re.fullmatch(
+            r"[A-Z0-9.]{1,10}\d{6}[CP]\d+(?:\.\d+)?",
+            symbol.replace(" ", "").lstrip("-"),
+        )
+        if (
+            not symbol
+            or symbol.endswith("**")
+            or symbol.startswith("-")
+            or symbol == "PENDING ACTIVITY"
+            or canonical_option
+        ):
+            continue
+        shares = _strict_portfolio_number(cell("Quantity"), "Quantity", row_number)
+        value = _strict_portfolio_number(cell("Current Value"), "Current Value", row_number)
+        if (
+            (abs(shares or 0.0) > 0 or abs(value or 0.0) > 0)
+            and re.fullmatch(r"[A-Z][A-Z0-9./^-]*", symbol)
+        ):
+            symbols.add(symbol)
     return symbols
 
 
@@ -235,7 +273,9 @@ def _history_row(state, boundary):
 def freshness_metadata(state, market_rows, generated_at, max_stale_calendar_days=DEFAULT_MAX_STALE_CALENDAR_DAYS):
     price_as_of = mmb.date_key(market_rows[-1]["date"])
     mass_as_of = mmb.date_key(state["as_of"])
-    generated_date = generated_at.date()
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=dt.timezone.utc)
+    generated_date = generated_at.astimezone(ZoneInfo("America/New_York")).date()
     price_date = _date_from_key(price_as_of)
     age_days = (generated_date - price_date).days
     stale = age_days > max_stale_calendar_days
@@ -745,6 +785,19 @@ def build_symbol_payload(
 
     if current["volatility"].get("implied_vol") is None:
         warnings.append("No implied volatility series was available; boundaries rely on realized volatility.")
+    if (current.get("volume_coverage_ratio") or 0.0) < 0.80:
+        warnings.append("Mass-window dollar-volume coverage is below 80%; center quality is penalized.")
+    if current["volatility"].get("primary_vol_stale"):
+        warnings.append("Primary volatility observation was stale and excluded from the boundary blend.")
+    if current["volatility"].get("fallback_vol_stale"):
+        warnings.append("Fallback volatility observation was stale and excluded from the boundary blend.")
+    if (
+        current["volatility"].get("primary_vol_invalid")
+        or current["volatility"].get("fallback_vol_invalid")
+    ):
+        warnings.append("A non-positive volatility observation was excluded from the boundary blend.")
+    if "Stooq daily CSV fallback" in str(price_source):
+        warnings.append("Stooq fallback adjustment policy was not independently verified; long-horizon levels are provisional.")
     warnings = sorted(set(warnings))
     confidence = dashboard_confidence(config, state, freshness, warnings)
 
@@ -760,8 +813,25 @@ def build_symbol_payload(
         "historyEnd": freshness["historyEnd"],
         "stale": freshness["stale"],
         "staleReason": freshness["staleReason"],
+        "dataStatus": "available",
         "freshness": freshness,
         "dashboardConfidence": confidence,
+        "validation": {
+            "decisionGrade": False,
+            "researchOnly": True,
+            "fresh": not freshness["stale"],
+            "impliedVolAvailable": current["volatility"].get("implied_vol") is not None,
+            # volatility_context only exposes a selected implied value after
+            # its freshness/validity gates; excluded primary data may coexist
+            # with a valid fallback.
+            "impliedVolFresh": current["volatility"].get("implied_vol") is not None,
+            "scope": "probabilistic boundary visualization; not an executable options signal",
+            "adjustedPricePolicy": (
+                "yfinance_auto_adjust_true"
+                if "Yahoo Finance" in str(price_source)
+                else "source_adjustment_not_independently_verified"
+            ),
+        },
         "current": current,
         "boundaries": boundaries,
         "history": history[-profile["historyBars"] :],
@@ -835,12 +905,28 @@ def fetch_symbol_payload(
 def build_dashboard_payload(symbol_payloads, profile, warnings=None, generated_at=None, universe_mode=None, portfolio_path=None):
     generated_at = generated_at or dt.datetime.now(dt.timezone.utc)
     return {
+        "schemaVersion": 1,
+        "researchOnly": True,
+        "decisionGrade": False,
         "generatedAt": generated_at.isoformat(),
         "profile": profile,
         "universeMode": universe_mode,
-        "portfolioPath": portfolio_path,
+        "portfolioSourcePresent": bool(portfolio_path),
         "symbols": symbol_payloads,
         "warnings": warnings or [],
+        "validation": {
+            "decisionGrade": False,
+            "researchOnly": True,
+            "failedSymbols": sorted(
+                symbol for symbol, payload in symbol_payloads.items()
+                if not payload.get("current")
+            ),
+            "limitations": [
+                "Broad volatility proxies do not reproduce single-name option surfaces.",
+                "Boundary confidence is a model-health score, not a probability of trade profit.",
+                "Fresh current chains, liquidity, portfolio overlap, and max-risk review are required separately.",
+            ],
+        },
         "disclaimer": "Probabilistic research model only; boundaries are not guaranteed support/resistance and are not financial advice.",
     }
 
@@ -884,7 +970,8 @@ def parse_args(argv=None):
     ap.add_argument("--symbols", help="Comma-separated symbols to cover. Anchors are still included unless --no-force-anchors.")
     ap.add_argument("--anchor-only", action="store_true", help="Generate QQQ/VOO plus reference lanes instead of all holdings.")
     ap.add_argument("--period", default="5y")
-    ap.add_argument("--interval", default="1d")
+    ap.add_argument("--interval", choices=["1d"], default="1d",
+                    help="Daily bars only; model annualization and horizons use trading-day units.")
     ap.add_argument("--gravity-profile", choices=sorted(mmb.GRAVITY_PROFILES), default="swing")
     ap.add_argument("--pyramid-profiles", type=parse_pyramid_profiles, default=list(DEFAULT_PYRAMID_PROFILES), help="Comma-separated multi-timescale profiles for mass-health scoring.")
     ap.add_argument("--lookback", type=int, default=84)
@@ -901,7 +988,23 @@ def parse_args(argv=None):
     ap.add_argument("--max-stale-calendar-days", type=int, default=DEFAULT_MAX_STALE_CALENDAR_DAYS)
     ap.add_argument("--max-symbols", type=int, default=None, help="Optional safety cap for slow first runs.")
     ap.add_argument("--out-json", default=str(DEFAULT_OUT))
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    checks = (
+        (args.lookback >= 30, "--lookback must be at least 30"),
+        (math.isfinite(args.half_life) and args.half_life > 0, "--half-life must be positive and finite"),
+        (args.history_bars > 0, "--history-bars must be positive"),
+        (args.default_horizon > 0, "--default-horizon must be positive"),
+        (0 < args.default_confidence < 1, "--default-confidence must be between 0 and 1"),
+        (args.max_stale_calendar_days >= 0, "--max-stale-calendar-days cannot be negative"),
+    )
+    for valid, message in checks:
+        if not valid:
+            ap.error(message)
+    if any(horizon <= 0 for horizon in args.horizons):
+        ap.error("all --horizons must be positive")
+    if any(not 0 < confidence < 1 for confidence in args.confidences):
+        ap.error("all --confidences must be between 0 and 1")
+    return args
 
 
 def main(argv=None):
@@ -937,27 +1040,31 @@ def main(argv=None):
                 "current": None,
                 "boundaries": [],
                 "history": [],
+                "stale": False,
+                "staleReason": None,
+                "dataStatus": "unavailable",
+                "validation": {
+                    "decisionGrade": False,
+                    "researchOnly": True,
+                    "fresh": False,
+                    "scope": "unavailable",
+                },
                 "warnings": [*config.warnings, f"Market-mass build failed: {type(exc).__name__}: {exc}"],
                 "sources": {},
                 "data": {},
             }
 
     out = Path(args.out_json)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
-        json.dumps(
-            build_dashboard_payload(
-                payloads,
-                profile,
-                warnings,
-                generated_at=generated_at,
-                universe_mode=universe_mode,
-                portfolio_path=portfolio,
-            ),
-            indent=2,
-            ensure_ascii=False,
-        ) + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        out,
+        build_dashboard_payload(
+            payloads,
+            profile,
+            warnings,
+            generated_at=generated_at,
+            universe_mode=universe_mode,
+            portfolio_path=portfolio,
+        ),
     )
     print(f"✓ wrote {out}")
 

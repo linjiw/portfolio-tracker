@@ -1,23 +1,57 @@
 #!/usr/bin/env python3
-"""Close-only YTD backtest for the QQQ weather / TQQQ tactical strategy.
+"""Close-only YTD research backtest for the QQQ weather / TQQQ tactical strategy.
 
 The repository cache stores daily closes. That is enough to test the broad
 EMA8/EMA21 timing idea, but not enough to prove intraday low-touch behavior or
-historical option prices. The report labels those parts as proxies.
+historical option prices. Signals observed at a close are filled at the next
+available close with adverse slippage. The option overlay is a synthetic payoff
+stress test and is deliberately excluded from strategy return claims.
 """
 
 import argparse
-import csv
 import datetime as dt
 import html
 import json
 import math
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import (
+        atomic_write_csv,
+        atomic_write_json,
+        atomic_write_text,
+        ensure_private_directory,
+    )
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_csv, atomic_write_json, atomic_write_text, ensure_private_directory
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE = ROOT / "output" / "prices_cache.json"
 DEFAULT_OUT = ROOT / "output" / "qqq_tqqq_backtest"
+
+METHODOLOGY_VERSION = "2.0"
+MODEL_GRADE = "research_only_not_decision_grade"
+DEFAULT_EQUITY_SLIPPAGE_BPS = 5.0
+DEFAULT_COMMISSION_PER_ORDER = 0.0
+DEFAULT_CCS_EXECUTION_COST_PER_CONTRACT = 4.60
+MIN_INDICATOR_WARMUP_SESSIONS = 34
+
+LIMITATIONS = [
+    "Daily adjusted closes only: signals cannot observe or execute intraday touches, stops, or gaps.",
+    "A signal observed at session close is filled at the next session close, not at the next open.",
+    "Max drawdown is close-to-close and can understate intraday peak-to-trough loss.",
+    "QQQ close-to-close absolute change is an ATR proxy because OHLC true range is unavailable.",
+    "EMA values are seeded from the first cached observation and remain path-dependent during warmup.",
+    "Matching gaps in both symbols cannot be distinguished from exchange holidays without a market calendar.",
+    "TQQQ history reflects the vendor's adjusted series; leverage drag and corporate-action quality depend on that vendor.",
+    "The default 5 bps per-side equity slippage is an explicit scenario assumption, not a quote-calibrated estimate.",
+    "CCS strikes, credits, and expiration payoffs do not use a historical option chain, IV surface, bid/ask, or assignment model.",
+    "The CCS diagnostic is excluded from strategy returns, drawdowns, and parameter ranking.",
+    "The DCA benchmark knows the selected sample horizon and deploys all capital evenly by its final row.",
+    "Parameter sweeps are in-sample and have no walk-forward or out-of-sample validation.",
+    "Taxes, borrow constraints, market impact, and cash yield are not modeled.",
+]
 
 
 DEFAULT_STRATEGY_CONFIG = {
@@ -32,6 +66,9 @@ DEFAULT_STRATEGY_CONFIG = {
     "ccs_hold_days": 10,
     "ccs_multiplier": 4.0,
     "ccs_contracts": 1,
+    "equity_slippage_bps": DEFAULT_EQUITY_SLIPPAGE_BPS,
+    "commission_per_order": DEFAULT_COMMISSION_PER_ORDER,
+    "ccs_execution_cost_per_contract": DEFAULT_CCS_EXECUTION_COST_PER_CONTRACT,
 }
 
 
@@ -45,37 +82,50 @@ def ema(vals, n):
 
 
 def rsi(vals, n=14):
-    out = [50.0] * len(vals)
+    out = [None] * len(vals)
     if len(vals) <= n:
         return out
     deltas = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
     avg_gain = sum(d for d in deltas[:n] if d > 0) / n
     avg_loss = sum(-d for d in deltas[:n] if d < 0) / n
-    out[n] = 100 - 100 / (1 + (avg_gain / avg_loss if avg_loss else 999))
+
+    def value(gain, loss):
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+        if gain == 0:
+            return 0.0
+        return 100 - 100 / (1 + gain / loss)
+
+    out[n] = value(avg_gain, avg_loss)
     for i in range(n + 1, len(vals)):
         d = deltas[i - 1]
         avg_gain = (avg_gain * (n - 1) + max(d, 0)) / n
         avg_loss = (avg_loss * (n - 1) + max(-d, 0)) / n
-        out[i] = 100 - 100 / (1 + (avg_gain / avg_loss if avg_loss else 999))
-    for i in range(n):
-        out[i] = out[n]
+        out[i] = value(avg_gain, avg_loss)
     return out
 
 
 def close_proxy_atr(vals, n=14):
-    out, trs, prev_atr = [], [], None
-    prev = None
-    for v in vals:
-        tr = 0.0 if prev is None else abs(v - prev)
+    """Wilder-smoothed close-change proxy, unavailable until ``n`` ranges exist."""
+    if not isinstance(n, int) or n <= 0:
+        raise ValueError("ATR period must be a positive integer.")
+    if not vals:
+        return []
+    out, trs, prev_atr = [None], [], None
+    prev = vals[0]
+    for v in vals[1:]:
+        tr = abs(v - prev)
         trs.append(tr)
         if len(trs) < n:
-            atr = sum(trs) / len(trs)
+            atr = None
         elif len(trs) == n:
-            atr = sum(trs[-n:]) / n
+            atr = sum(trs) / n
         else:
             atr = (prev_atr * (n - 1) + tr) / n
         out.append(atr)
-        prev_atr, prev = atr, v
+        if atr is not None:
+            prev_atr = atr
+        prev = v
     return out
 
 
@@ -99,11 +149,21 @@ def max_drawdown(values):
     return worst
 
 
+def max_drawdown_from_capital(values, initial_capital):
+    """Peak-to-trough drawdown including the investable capital at inception."""
+    return max_drawdown([initial_capital, *values])
+
+
 def annualized_return(start_value, final_value, start_date, end_date):
     days = max((parse_date(end_date) - parse_date(start_date)).days, 1)
     if start_value <= 0 or final_value <= 0:
         return None
-    return (final_value / start_value) ** (365.0 / days) - 1
+    return (final_value / start_value) ** (365.2425 / days) - 1
+
+
+def annualized_return_pct(start_value, final_value, start_date, end_date):
+    value = annualized_return(start_value, final_value, start_date, end_date)
+    return value * 100 if value is not None else None
 
 
 def parse_date(s):
@@ -124,7 +184,16 @@ def fetch_yfinance_prices(start, end=None):
         import yfinance as yf
     except ImportError as exc:
         raise RuntimeError("yfinance is required for --fetch-yfinance") from exc
-    df = yf.download(["QQQ", "TQQQ"], start=start, end=end, auto_adjust=True, progress=False, threads=False)
+    # yfinance treats end as exclusive; this CLI documents --end as inclusive.
+    fetch_end = (parse_date(end) + dt.timedelta(days=1)).isoformat() if end else None
+    df = yf.download(
+        ["QQQ", "TQQQ"],
+        start=start,
+        end=fetch_end,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
     if df.empty:
         raise RuntimeError("yfinance returned no QQQ/TQQQ rows.")
     prices = {"QQQ": {}, "TQQQ": {}}
@@ -137,19 +206,46 @@ def fetch_yfinance_prices(start, end=None):
 
 
 def build_rows(prices, start="2026-01-01", end=None):
+    start_date = parse_date(start)
+    end_date = parse_date(end) if end else None
+    if end_date and end_date < start_date:
+        raise ValueError("end must be on or after start.")
     qqq = prices.get("QQQ") or {}
     tqqq = prices.get("TQQQ") or {}
-    dates = sorted(set(qqq) & set(tqqq))
+    if not isinstance(qqq, dict) or not isinstance(tqqq, dict):
+        raise ValueError("QQQ and TQQQ price series must be date-to-close mappings.")
+
+    def dates_in_range(series, symbol):
+        selected = set()
+        for date_key in series:
+            try:
+                value = parse_date(date_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid {symbol} price date: {date_key!r}") from exc
+            if value >= start_date and (not end_date or value <= end_date):
+                selected.add(date_key)
+        return selected
+
+    qqq_dates = dates_in_range(qqq, "QQQ")
+    tqqq_dates = dates_in_range(tqqq, "TQQQ")
+    if qqq_dates != tqqq_dates:
+        q_only = sorted(qqq_dates - tqqq_dates)[:3]
+        t_only = sorted(tqqq_dates - qqq_dates)[:3]
+        raise ValueError(
+            "QQQ/TQQQ session coverage mismatch in requested range; "
+            f"QQQ-only examples={q_only}, TQQQ-only examples={t_only}."
+        )
+    dates = sorted(qqq_dates)
     rows = []
     for d in dates:
-        if d < start:
-            continue
-        if end and d > end:
-            continue
         try:
-            rows.append({"date": d, "QQQ": float(qqq[d]), "TQQQ": float(tqqq[d])})
-        except (TypeError, ValueError):
-            pass
+            q_value = float(qqq[d])
+            t_value = float(tqqq[d])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Non-numeric QQQ/TQQQ close on {d}.") from exc
+        if not (math.isfinite(q_value) and math.isfinite(t_value) and q_value > 0 and t_value > 0):
+            raise ValueError(f"QQQ/TQQQ closes must be positive and finite on {d}.")
+        rows.append({"date": d, "QQQ": q_value, "TQQQ": t_value})
     if len(rows) < 40:
         raise ValueError("Need at least 40 overlapping QQQ/TQQQ close rows for this backtest.")
     return rows
@@ -185,9 +281,10 @@ def classify(row, prev_row=None):
         or (row["qqq_5d_pct"] is not None and row["qqq_5d_pct"] > 3.0)
         or (row["tqqq_5d_pct"] is not None and row["tqqq_5d_pct"] > 9.0)
     ))
-    near8 = bool(stacked and atr and close >= e8 and abs(close - e8) <= 0.5 * atr)
+    near8 = bool(stacked and atr and not overheat and close >= e8 and abs(close - e8) <= 0.5 * atr)
     near21 = bool(
         atr
+        and not overheat
         and close >= e21
         and abs(close - e21) <= 0.5 * atr
         and e21_slope > 0
@@ -222,62 +319,206 @@ def strategy_config(**overrides):
     return cfg
 
 
-def open_tactical(row, cash, equity_before, entry_type, alloc):
+def validate_strategy_inputs(rows, capital, warmup, cfg):
+    if not rows:
+        raise ValueError("At least one price row is required.")
+    if not math.isfinite(capital) or capital <= 0:
+        raise ValueError("capital must be a positive finite number.")
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("warmup must be a non-negative integer.")
+    previous_date = None
+    for row in rows:
+        try:
+            row_date = parse_date(row["date"])
+            q_close = float(row["QQQ"])
+            t_close = float(row["TQQQ"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Every row must contain a valid ISO date and numeric QQQ/TQQQ closes.") from exc
+        if previous_date and row_date <= previous_date:
+            raise ValueError("Price rows must be strictly increasing by date.")
+        if not (math.isfinite(q_close) and math.isfinite(t_close) and q_close > 0 and t_close > 0):
+            raise ValueError("QQQ/TQQQ row closes must be positive and finite.")
+        previous_date = row_date
+    for key in ("core_alloc", "ema8_alloc", "ema21_alloc", "overheat_sell_pct"):
+        value = cfg[key]
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{key} must be between 0 and 1.")
+    if not math.isfinite(cfg["trail_pct"]) or not 0 < cfg["trail_pct"] < 1:
+        raise ValueError("trail_pct must be between 0 and 1.")
+    for key in ("equity_slippage_bps", "commission_per_order", "ccs_execution_cost_per_contract"):
+        value = cfg[key]
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{key} must be a non-negative finite number.")
+    if cfg["equity_slippage_bps"] >= 10_000:
+        raise ValueError("equity_slippage_bps must be below 10,000.")
+    if cfg["overheat_exit"] not in ("none", "full", "partial"):
+        raise ValueError("overheat_exit must be none, full, or partial.")
+    if cfg["ccs_mode"] not in ("none", "spot_pct", "ema21_4atr_floor", "ema21_4atr_skip"):
+        raise ValueError("Unsupported ccs_mode.")
+    if not isinstance(cfg["ccs_hold_days"], int) or cfg["ccs_hold_days"] <= 0:
+        raise ValueError("ccs_hold_days must be a positive integer.")
+    if not math.isfinite(cfg["ccs_multiplier"]) or cfg["ccs_multiplier"] <= 0:
+        raise ValueError("ccs_multiplier must be positive and finite.")
+    if not isinstance(cfg["ccs_contracts"], int) or cfg["ccs_contracts"] < 0:
+        raise ValueError("ccs_contracts must be a non-negative integer.")
+
+
+def execution_price(reference_close, side, slippage_bps):
+    """Return an adverse close-proxy fill for a buy or sell."""
+    if reference_close <= 0:
+        raise ValueError("reference_close must be positive.")
+    slip = slippage_bps / 10_000.0
+    if side == "buy":
+        return reference_close * (1 + slip)
+    if side == "sell":
+        return reference_close * (1 - slip)
+    raise ValueError(f"Unknown side: {side}")
+
+
+def buy_with_budget(reference_close, budget, slippage_bps, commission):
+    """Spend at most budget and return shares, effective fill, and explicit cost."""
+    if budget <= commission:
+        return 0.0, None, 0.0
+    fill = execution_price(reference_close, "buy", slippage_bps)
+    shares = (budget - commission) / fill
+    return shares, fill, budget
+
+
+def open_tactical(row, cash, equity_before, entry_type, alloc, signal_date, cfg):
     t_close = row["TQQQ"]
     spend = min(cash, equity_before * alloc)
-    if spend <= 1.0 or t_close <= 0:
+    shares, fill, total_cost = buy_with_budget(
+        t_close,
+        spend,
+        cfg["equity_slippage_bps"],
+        cfg["commission_per_order"],
+    )
+    if shares <= 0 or fill is None:
         return None, cash
     return {
+        "signal_date": signal_date,
         "entry_date": row["date"],
         "type": entry_type,
-        "entry_price": t_close,
-        "shares": spend / t_close,
-        "cost": spend,
+        "entry_price": fill,
+        "entry_reference_close": t_close,
+        "shares": shares,
+        "cost": total_cost,
+        "entry_execution_cost_total": total_cost - shares * t_close,
         "high_close": t_close,
         "partial_taken": False,
-    }, cash - spend
+    }, cash - total_cost
 
 
-def close_tactical_piece(tactical, date, t_close, shares_to_close, status, reason):
+def close_tactical_piece(tactical, date, t_close, shares_to_close, status, reason, signal_date, cfg):
     shares_to_close = min(tactical["shares"], shares_to_close)
-    proceeds = shares_to_close * t_close
-    pnl = shares_to_close * (t_close - tactical["entry_price"])
+    shares_before = tactical["shares"]
+    if shares_to_close <= 0 or shares_before <= 0:
+        raise ValueError("shares_to_close must be positive.")
+    fill = execution_price(t_close, "sell", cfg["equity_slippage_bps"])
+    gross_proceeds = shares_to_close * fill
+    commission = cfg["commission_per_order"]
+    proceeds = gross_proceeds - commission
+    allocated_cost = tactical["cost"] * (shares_to_close / shares_before)
+    allocated_entry_execution_cost = tactical["entry_execution_cost_total"] * (shares_to_close / shares_before)
+    pnl = proceeds - allocated_cost
     tactical["shares"] -= shares_to_close
-    tactical["cost"] = tactical["shares"] * tactical["entry_price"]
+    tactical["cost"] -= allocated_cost
+    tactical["entry_execution_cost_total"] -= allocated_entry_execution_cost
     return proceeds, {
+        "entry_signal_date": tactical["signal_date"],
         "entry_date": tactical["entry_date"],
+        "exit_signal_date": signal_date,
         "exit_date": date,
         "type": tactical["type"],
         "status": status,
         "entry_price": tactical["entry_price"],
-        "exit_price": t_close,
+        "entry_reference_close": tactical["entry_reference_close"],
+        "exit_price": fill,
+        "exit_reference_close": t_close,
         "shares": shares_to_close,
-        "return_pct": (t_close / tactical["entry_price"] - 1) * 100,
+        "return_pct": (proceeds / allocated_cost - 1) * 100 if allocated_cost else None,
         "pnl_dollars": pnl,
         "exit_reason": reason,
+        "entry_execution_cost_dollars": allocated_entry_execution_cost,
+        "exit_execution_cost_dollars": shares_to_close * t_close - proceeds,
+        "fill_timing": "next_trading_close_after_signal",
+        "equity_slippage_bps_per_side": cfg["equity_slippage_bps"],
+        "commission_per_order": commission,
     }
 
 
 def run_strategy_on_rows(rows, capital=100000.0, warmup=34, config=None):
     cfg = strategy_config(**(config or {}))
+    validate_strategy_inputs(rows, capital, warmup, cfg)
     first = rows[0]
     core_alloc = cfg["core_alloc"]
-    cash = capital * (1 - core_alloc)
-    core_shares = capital * core_alloc / first["QQQ"]
+    core_budget = capital * core_alloc
+    core_shares, core_fill, core_cost = buy_with_budget(
+        first["QQQ"], core_budget, cfg["equity_slippage_bps"], cfg["commission_per_order"]
+    )
+    cash = capital - core_cost
+    transaction_costs = core_cost - core_shares * first["QQQ"]
     tactical = None
     trades = []
     curve = []
     states = []
-    qqq_bh_shares = capital / first["QQQ"]
-    tqqq_bh_shares = capital / first["TQQQ"]
+    pending_action = None
+    qqq_bh_shares, _, qqq_bh_cost = buy_with_budget(
+        first["QQQ"], capital, cfg["equity_slippage_bps"], cfg["commission_per_order"]
+    )
+    qqq_bh_cash = capital - qqq_bh_cost
+    tqqq_bh_shares, _, tqqq_bh_cost = buy_with_budget(
+        first["TQQQ"], capital, cfg["equity_slippage_bps"], cfg["commission_per_order"]
+    )
+    tqqq_bh_cash = capital - tqqq_bh_cost
     dca_shares = 0.0
+    dca_cash = capital
     dca_daily = capital / len(rows)
 
     for i, row in enumerate(rows):
         prev = rows[i - 1] if i else None
         sig = classify(row, prev)
-        states.append({**sig, "date": row["date"]})
         q_close, t_close = row["QQQ"], row["TQQQ"]
+
+        # A close-based signal cannot be filled at that same close. Execute only
+        # the action queued by the prior trading session.
+        if pending_action:
+            action = pending_action
+            pending_action = None
+            if action["action"] == "entry" and tactical is None:
+                equity_before = cash + core_shares * q_close
+                tactical, cash = open_tactical(
+                    row,
+                    cash,
+                    equity_before,
+                    action["entry_type"],
+                    action["alloc"],
+                    action["signal_date"],
+                    cfg,
+                )
+                if tactical:
+                    transaction_costs += tactical["entry_execution_cost_total"]
+            elif action["action"] in ("exit_full", "exit_partial") and tactical:
+                fraction = 1.0 if action["action"] == "exit_full" else action["sell_pct"]
+                status = "closed" if fraction >= 1.0 else "partial"
+                proceeds, trade = close_tactical_piece(
+                    tactical,
+                    row["date"],
+                    t_close,
+                    tactical["shares"] * fraction,
+                    status,
+                    action["reason"],
+                    action["signal_date"],
+                    cfg,
+                )
+                cash += proceeds
+                transaction_costs += trade["exit_execution_cost_dollars"]
+                trades.append(trade)
+                if action["action"] == "exit_partial":
+                    tactical["partial_taken"] = True
+                if tactical["shares"] <= 0.000001:
+                    tactical = None
+
         if tactical:
             tactical["high_close"] = max(tactical["high_close"], t_close)
             drawdown = t_close / tactical["high_close"] - 1 if tactical["high_close"] else 0
@@ -289,64 +530,95 @@ def run_strategy_on_rows(rows, capital=100000.0, warmup=34, config=None):
             elif sig["overheat"] and cfg["overheat_exit"] == "full":
                 exit_reason = "overheat_take_profit"
             if exit_reason:
-                proceeds, trade = close_tactical_piece(
-                    tactical, row["date"], t_close, tactical["shares"], "closed", exit_reason
-                )
-                cash += proceeds
-                trades.append(trade)
-                tactical = None
+                pending_action = {
+                    "action": "exit_full",
+                    "signal_date": row["date"],
+                    "reason": exit_reason,
+                }
             elif sig["overheat"] and cfg["overheat_exit"] == "partial" and not tactical["partial_taken"]:
                 sell_pct = max(0.0, min(1.0, cfg["overheat_sell_pct"]))
-                proceeds, trade = close_tactical_piece(
-                    tactical, row["date"], t_close, tactical["shares"] * sell_pct,
-                    "partial", f"overheat_partial_{int(sell_pct * 100)}pct",
-                )
-                cash += proceeds
-                trades.append(trade)
-                tactical["partial_taken"] = True
-                if tactical["shares"] <= 0.000001:
-                    tactical = None
+                if sell_pct > 0:
+                    pending_action = {
+                        "action": "exit_partial" if sell_pct < 1 else "exit_full",
+                        "signal_date": row["date"],
+                        "reason": f"overheat_partial_{int(sell_pct * 100)}pct",
+                        "sell_pct": sell_pct,
+                    }
 
-        if tactical is None and i >= warmup:
+        if tactical is None and pending_action is None and i >= warmup:
             entry_type, alloc = None, 0.0
             if sig["near21"]:
                 entry_type, alloc = "EMA21 tactical TQQQ", cfg["ema21_alloc"]
             elif sig["near8"]:
                 entry_type, alloc = "EMA8 tactical TQQQ", cfg["ema8_alloc"]
             if entry_type:
-                equity_before = cash + core_shares * q_close
-                tactical, cash = open_tactical(row, cash, equity_before, entry_type, alloc)
+                pending_action = {
+                    "action": "entry",
+                    "signal_date": row["date"],
+                    "entry_type": entry_type,
+                    "alloc": alloc,
+                }
+
+        if i == len(rows) - 1:
+            # There is no next observed close at which to fill this signal.
+            pending_at_end = pending_action
+            pending_action = None
+        else:
+            pending_at_end = None
 
         tactical_value = tactical["shares"] * t_close if tactical else 0.0
         strategy_value = cash + core_shares * q_close + tactical_value
-        dca_shares += dca_daily / q_close
-        dca_cash = capital - dca_daily * (i + 1)
+        dca_purchase, _, dca_cost = buy_with_budget(
+            q_close, min(dca_daily, dca_cash), cfg["equity_slippage_bps"], cfg["commission_per_order"]
+        )
+        dca_shares += dca_purchase
+        dca_cash -= dca_cost
+        states.append({
+            **sig,
+            "date": row["date"],
+            "action_for_next_close": pending_action["action"] if pending_action else None,
+        })
         curve.append({
             "date": row["date"],
             "strategy": strategy_value,
             "cash": cash,
             "core_qqq_value": core_shares * q_close,
             "tactical_tqqq_value": tactical_value,
-            "buy_hold_qqq": qqq_bh_shares * q_close,
+            "buy_hold_qqq": qqq_bh_cash + qqq_bh_shares * q_close,
             "daily_dca_qqq": dca_shares * q_close + dca_cash,
-            "buy_hold_tqqq": tqqq_bh_shares * t_close,
+            "buy_hold_tqqq": tqqq_bh_cash + tqqq_bh_shares * t_close,
             "state": sig["state"],
         })
 
     if tactical:
         last = rows[-1]
         shares = tactical["shares"]
+        marked_value = shares * last["TQQQ"]
+        open_reason = "open_at_end"
+        open_exit_signal = None
+        if pending_at_end and pending_at_end["action"].startswith("exit"):
+            open_reason = f"{pending_at_end['reason']}_signal_unfilled_at_end"
+            open_exit_signal = pending_at_end["signal_date"]
         trades.append({
+            "entry_signal_date": tactical["signal_date"],
             "entry_date": tactical["entry_date"],
+            "exit_signal_date": open_exit_signal,
             "exit_date": last["date"],
             "type": tactical["type"],
             "status": "open_mark_to_market",
             "entry_price": tactical["entry_price"],
+            "entry_reference_close": tactical["entry_reference_close"],
             "exit_price": last["TQQQ"],
+            "exit_reference_close": last["TQQQ"],
             "shares": shares,
-            "return_pct": (last["TQQQ"] / tactical["entry_price"] - 1) * 100,
-            "pnl_dollars": shares * (last["TQQQ"] - tactical["entry_price"]),
-            "exit_reason": "open_at_end",
+            "return_pct": (marked_value / tactical["cost"] - 1) * 100 if tactical["cost"] else None,
+            "pnl_dollars": marked_value - tactical["cost"],
+            "exit_reason": open_reason,
+            "entry_execution_cost_dollars": tactical["entry_execution_cost_total"],
+            "exit_execution_cost_dollars": 0.0,
+            "fill_timing": "open_position_marked_at_final_close",
+            "equity_slippage_bps_per_side": cfg["equity_slippage_bps"],
+            "commission_per_order": cfg["commission_per_order"],
         })
     ccs_pnl = 0.0
     ccs_hedges = []
@@ -354,11 +626,15 @@ def run_strategy_on_rows(rows, capital=100000.0, warmup=34, config=None):
         ccs_hedges = simulate_ccs(
             rows, states, hold_days=cfg["ccs_hold_days"], strike_mode=cfg["ccs_mode"],
             multiplier=cfg["ccs_multiplier"],
+            execution_cost_per_contract=cfg["ccs_execution_cost_per_contract"],
+            warmup=warmup,
         )
-        ccs_pnl = sum(h["pnl_per_contract"] for h in ccs_hedges) * cfg["ccs_contracts"]
+        ccs_pnl = sum(h["stylized_net_payoff_per_contract"] for h in ccs_hedges) * cfg["ccs_contracts"]
     final_value = curve[-1]["strategy"] if curve else capital
     values = [r["strategy"] for r in curve]
     start, end = rows[0]["date"], rows[-1]["date"]
+    positions = {(t["entry_date"], t["type"]) for t in trades}
+    total_return_pct = (final_value / capital - 1) * 100
     return {
         "config": cfg,
         "curve": curve,
@@ -366,14 +642,22 @@ def run_strategy_on_rows(rows, capital=100000.0, warmup=34, config=None):
         "states": states,
         "ccs_hedges": ccs_hedges,
         "final_value": final_value,
-        "total_return_pct": (final_value / capital - 1) * 100,
-        "annualized_return_pct": annualized_return(capital, final_value, start, end) * 100,
-        "max_drawdown_pct": max_drawdown(values) * 100,
-        "num_tactical_trades": len(trades),
+        "total_return_pct": total_return_pct,
+        "annualized_return_pct": annualized_return_pct(capital, final_value, start, end),
+        "max_drawdown_pct": max_drawdown_from_capital(values, capital) * 100,
+        "num_tactical_trades": len(positions),
+        "num_tactical_exit_records": len(trades),
         "tactical_pnl_dollars": sum(float(t.get("pnl_dollars") or 0) for t in trades),
-        "ccs_pnl_dollars": ccs_pnl,
-        "combined_final_value": final_value + ccs_pnl,
-        "combined_return_pct": ((final_value + ccs_pnl) / capital - 1) * 100,
+        "transaction_costs_dollars": transaction_costs,
+        "ccs_stylized_payoff_dollars": ccs_pnl,
+        "ccs_pnl_dollars": None,
+        "combined_final_value": final_value,
+        "combined_return_pct": total_return_pct,
+        "return_includes_ccs": False,
+        "decision_grade": False,
+        "model_grade": MODEL_GRADE,
+        "execution_model": "signal_at_close_filled_next_trading_close_with_adverse_slippage",
+        "core_entry_price": core_fill,
     }
 
 
@@ -382,8 +666,8 @@ def run_backtest(prices, start="2026-01-01", end=None, capital=100000.0, warmup=
     baseline = run_strategy_on_rows(rows, capital=capital, warmup=warmup)
     curve, trades, states = baseline["curve"], baseline["trades"], baseline["states"]
 
-    ccs = simulate_ccs(rows, states, hold_days=5, strike_mode="spot_pct")
-    ccs_grid, ccs_detail = run_ccs_grid(rows, states)
+    ccs = simulate_ccs(rows, states, hold_days=5, strike_mode="spot_pct", warmup=warmup)
+    ccs_grid, ccs_detail = run_ccs_grid(rows, states, warmup=warmup)
     summary = build_summary(rows, curve, trades, ccs, capital, warmup)
     sweep = run_strategy_sweep(rows, capital=capital, warmup=warmup)
     presets = preset_comparison(rows, capital=capital, warmup=warmup)
@@ -391,6 +675,24 @@ def run_backtest(prices, start="2026-01-01", end=None, capital=100000.0, warmup=
         "rows": rows, "curve": curve, "trades": trades, "ccs": ccs,
         "ccs_grid": ccs_grid, "ccs_detail": ccs_detail,
         "summary": summary, "states": states, "sweep": sweep, "presets": presets,
+        "methodology": {
+            "version": METHODOLOGY_VERSION,
+            "model_grade": MODEL_GRADE,
+            "decision_grade": False,
+            "decision_grade_reason": (
+                "Close-only proxy with next-close fills and no historical option chain; "
+                "requires OHLC/option-chain data plus walk-forward validation before decision use."
+            ),
+            "signal_timing": "indicators computed at close_t; orders filled at close_t_plus_1",
+            "annualization": "geometric CAGR using ACT/365.2425 calendar-day basis",
+            "equity_slippage_bps_per_side": DEFAULT_EQUITY_SLIPPAGE_BPS,
+            "commission_per_order": DEFAULT_COMMISSION_PER_ORDER,
+            "ccs_execution_cost_per_contract_assumed": DEFAULT_CCS_EXECUTION_COST_PER_CONTRACT,
+            "ccs_min_indicator_warmup_sessions": MIN_INDICATOR_WARMUP_SESSIONS,
+            "ccs_included_in_strategy_returns": False,
+            "parameter_selection": "in_sample_sweep_only",
+            "limitations": LIMITATIONS,
+        },
     }
 
 
@@ -400,7 +702,7 @@ def ccs_payoff_per_contract(expiry_close, short_call, width=1.0, credit=0.25):
 
 
 def ccs_credit_for_hold(hold_days):
-    # Rough time-value proxy, not a historical option-chain model.
+    # Synthetic scenario input only; never treat this as a historical premium.
     return round(min(0.49, 0.25 * math.sqrt(hold_days / 5.0)), 2)
 
 
@@ -435,47 +737,106 @@ def ccs_short_call(row, strike_mode="spot_pct", multiplier=4.0, floor_pct=0.045)
     }
 
 
-def simulate_ccs(rows, states, hold_days=5, credit=None, strike_mode="spot_pct", multiplier=4.0, floor_pct=0.045):
+def simulate_ccs(
+    rows,
+    states,
+    hold_days=5,
+    credit=None,
+    strike_mode="spot_pct",
+    multiplier=4.0,
+    floor_pct=0.045,
+    execution_cost_per_contract=DEFAULT_CCS_EXECUTION_COST_PER_CONTRACT,
+    warmup=MIN_INDICATOR_WARMUP_SESSIONS,
+):
+    if len(states) != len(rows):
+        raise ValueError("states must align one-to-one with rows.")
+    if not isinstance(hold_days, int) or hold_days <= 0:
+        raise ValueError("hold_days must be a positive integer.")
+    if execution_cost_per_contract < 0 or not math.isfinite(execution_cost_per_contract):
+        raise ValueError("execution_cost_per_contract must be non-negative and finite.")
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("warmup must be a non-negative integer.")
     credit = ccs_credit_for_hold(hold_days) if credit is None else credit
+    if not math.isfinite(credit) or not 0 <= credit < 1.0:
+        raise ValueError("credit must be between zero and the $1 spread width.")
     hedges = []
     next_available = 0
-    for i, row in enumerate(rows):
-        if i < next_available:
+    effective_warmup = max(warmup, MIN_INDICATOR_WARMUP_SESSIONS)
+    for signal_i, signal_row in enumerate(rows):
+        entry_i = signal_i + 1
+        expiry_i = entry_i + hold_days
+        if entry_i < next_available:
             continue
-        if not states[i]["overheat"]:
+        if signal_i < effective_warmup:
             continue
-        exp_i = min(i + hold_days, len(rows) - 1)
-        spot = row["TQQQ"]
-        strike = ccs_short_call(row, strike_mode=strike_mode, multiplier=multiplier, floor_pct=floor_pct)
+        indicator_values = [
+            signal_row.get(key)
+            for key in ("ema8", "ema13", "ema21", "ema34", "ema55", "atr14")
+        ]
+        try:
+            indicators_ready = all(
+                value is not None and math.isfinite(float(value))
+                for value in indicator_values
+            )
+        except (TypeError, ValueError):
+            indicators_ready = False
+        if not indicators_ready:
+            continue
+        if not states[signal_i]["overheat"]:
+            continue
+        # Do not shorten an intended holding period at the dataset boundary.
+        if expiry_i >= len(rows):
+            continue
+        entry_row = rows[entry_i]
+        expiry_row = rows[expiry_i]
+        strike = ccs_short_call(
+            signal_row,
+            strike_mode=strike_mode,
+            multiplier=multiplier,
+            floor_pct=floor_pct,
+        )
         if not strike:
             continue
         short_call = strike["short_call"]
         long_call = round(short_call + 1.0, 2)
-        expiry_close = rows[exp_i]["TQQQ"]
-        pnl = ccs_payoff_per_contract(expiry_close, short_call, 1.0, credit)
+        gross_payoff = ccs_payoff_per_contract(expiry_row["TQQQ"], short_call, 1.0, credit)
+        net_payoff = gross_payoff - execution_cost_per_contract
         hedges.append({
-            "entry_date": row["date"],
-            "expiry_date": rows[exp_i]["date"],
-            "tqqq_entry_close": spot,
-            "tqqq_expiry_close": expiry_close,
+            "signal_date": signal_row["date"],
+            "entry_date": entry_row["date"],
+            "expiry_date": expiry_row["date"],
+            "tqqq_signal_close": signal_row["TQQQ"],
+            "tqqq_entry_close": entry_row["TQQQ"],
+            "tqqq_expiry_close": expiry_row["TQQQ"],
             "short_call": short_call,
             "long_call": long_call,
             "credit_per_share_assumed": credit,
+            "premium_source": "synthetic_formula_not_historical_option_chain",
             "hold_days": hold_days,
             "strike_mode": strike_mode,
             "raw_target": strike["raw_target"],
-            "qqq_ema21_plus_4atr": strike["qqq_band"],
+            "qqq_ema21_plus_atr_band": strike["qqq_band"],
+            "atr_multiplier": multiplier,
             "strike_source": strike["source"],
-            "pnl_per_contract": pnl,
-            "win": pnl > 0,
+            "fill_timing": "signal_close_then_next_trading_close_scenario_entry",
+            "signal_warmup_sessions": effective_warmup,
+            "gross_expiration_payoff_per_contract": gross_payoff,
+            "execution_cost_per_contract_assumed": execution_cost_per_contract,
+            "stylized_net_payoff_per_contract": net_payoff,
+            "stylized_max_gain_per_contract": credit * 100 - execution_cost_per_contract,
+            "stylized_max_loss_per_contract": (1.0 - credit) * 100 + execution_cost_per_contract,
+            # Backward-compatible alias. This remains explicitly stylized, not historical P&L.
+            "pnl_per_contract": net_payoff,
+            "decision_grade": False,
+            "win": net_payoff > 0,
         })
-        next_available = exp_i + 1
+        next_available = expiry_i + 1
     return hedges
 
 
 def summarize_ccs(hedges, strike_mode, hold_days, credit, multiplier=None):
     wins = sum(1 for h in hedges if h["win"])
-    pnl = sum(h["pnl_per_contract"] for h in hedges)
+    payoff = sum(h["stylized_net_payoff_per_contract"] for h in hedges)
     trades = len(hedges)
     return {
         "strike_mode": strike_mode,
@@ -486,18 +847,25 @@ def summarize_ccs(hedges, strike_mode, hold_days, credit, multiplier=None):
         "wins": wins,
         "losses": trades - wins,
         "win_rate_pct": (wins / trades * 100) if trades else None,
-        "total_pnl_per_contract": pnl,
-        "avg_pnl_per_contract": (pnl / trades) if trades else None,
+        "total_stylized_payoff_per_contract": payoff,
+        "avg_stylized_payoff_per_contract": (payoff / trades) if trades else None,
+        # Backward-compatible aliases for existing CSV consumers.
+        "total_pnl_per_contract": payoff,
+        "avg_pnl_per_contract": (payoff / trades) if trades else None,
+        "decision_grade": False,
     }
 
 
-def run_ccs_grid(rows, states):
+def run_ccs_grid(rows, states, warmup=MIN_INDICATOR_WARMUP_SESSIONS):
     hold_days_grid = [3, 5, 10, 15, 21]
     ema_multipliers = [3.5, 4.0, 4.5]
     summary, detail = [], {}
     for hold_days in hold_days_grid:
         credit = ccs_credit_for_hold(hold_days)
-        hedges = simulate_ccs(rows, states, hold_days=hold_days, credit=credit, strike_mode="spot_pct")
+        hedges = simulate_ccs(
+            rows, states, hold_days=hold_days, credit=credit,
+            strike_mode="spot_pct", warmup=warmup,
+        )
         summary.append(summarize_ccs(hedges, "spot_pct", hold_days, credit))
         detail[f"spot_pct_{hold_days}d"] = hedges
     for mode in ("ema21_4atr_floor", "ema21_4atr_skip"):
@@ -506,7 +874,7 @@ def run_ccs_grid(rows, states):
                 credit = ccs_credit_for_hold(hold_days)
                 hedges = simulate_ccs(
                     rows, states, hold_days=hold_days, credit=credit,
-                    strike_mode=mode, multiplier=multiplier,
+                    strike_mode=mode, multiplier=multiplier, warmup=warmup,
                 )
                 summary.append(summarize_ccs(hedges, mode, hold_days, credit, multiplier))
                 key = f"{mode}_{str(multiplier).replace('.', 'p')}x_{hold_days}d"
@@ -533,10 +901,14 @@ def strategy_result_row(module, variant, result):
         "max_drawdown_pct": result["max_drawdown_pct"],
         "num_tactical_trades": result["num_tactical_trades"],
         "tactical_pnl_dollars": result["tactical_pnl_dollars"],
+        "transaction_costs_dollars": result["transaction_costs_dollars"],
+        "ccs_stylized_payoff_dollars": result["ccs_stylized_payoff_dollars"],
         "ccs_pnl_dollars": result["ccs_pnl_dollars"],
         "combined_final_value": result["combined_final_value"],
         "combined_return_pct": result["combined_return_pct"],
         "teacher_aligned": cfg["overheat_exit"] in ("full", "partial"),
+        "return_includes_ccs": False,
+        "decision_grade": False,
     }
 
 
@@ -634,17 +1006,28 @@ def run_strategy_sweep(rows, capital=100000.0, warmup=34):
     }
 
 
-def benchmark_curve(rows, capital, mode):
+def benchmark_curve(
+    rows,
+    capital,
+    mode,
+    slippage_bps=DEFAULT_EQUITY_SLIPPAGE_BPS,
+    commission_per_order=DEFAULT_COMMISSION_PER_ORDER,
+):
     if mode == "buy_hold_qqq":
-        shares = capital / rows[0]["QQQ"]
-        return [shares * r["QQQ"] for r in rows]
+        shares, _, cost = buy_with_budget(rows[0]["QQQ"], capital, slippage_bps, commission_per_order)
+        cash = capital - cost
+        return [cash + shares * r["QQQ"] for r in rows]
     if mode == "daily_dca_qqq":
         shares = 0.0
+        cash = capital
         daily = capital / len(rows)
         out = []
-        for i, r in enumerate(rows):
-            shares += daily / r["QQQ"]
-            cash = capital - daily * (i + 1)
+        for r in rows:
+            purchased, _, cost = buy_with_budget(
+                r["QQQ"], min(daily, cash), slippage_bps, commission_per_order
+            )
+            shares += purchased
+            cash -= cost
             out.append(shares * r["QQQ"] + cash)
         return out
     raise ValueError(f"Unknown benchmark mode: {mode}")
@@ -653,7 +1036,7 @@ def benchmark_curve(rows, capital, mode):
 def preset_comparison(rows, capital=100000.0, warmup=34):
     start, end = rows[0]["date"], rows[-1]["date"]
     presets = [
-        ("Strong raw version", strategy_config(
+        ("High-core runner preset", strategy_config(
             name="core90_e810_e2120_runner8_skip10",
             core_alloc=0.90, ema8_alloc=0.10, ema21_alloc=0.20,
             overheat_exit="none", overheat_sell_pct=0.0, trail_pct=0.08,
@@ -675,14 +1058,21 @@ def preset_comparison(rows, capital=100000.0, warmup=34):
             "end_date": end,
             "final_value": res["combined_final_value"],
             "total_return_pct": res["combined_return_pct"],
-            "annualized_return_pct": annualized_return(capital, res["combined_final_value"], start, end) * 100,
+            "annualized_return_pct": annualized_return_pct(capital, res["combined_final_value"], start, end),
             "max_drawdown_pct": res["max_drawdown_pct"],
             "num_tactical_trades": res["num_tactical_trades"],
             "tactical_pnl_dollars": res["tactical_pnl_dollars"],
+            "transaction_costs_dollars": res["transaction_costs_dollars"],
+            "ccs_stylized_payoff_dollars": res["ccs_stylized_payoff_dollars"],
             "ccs_pnl_dollars": res["ccs_pnl_dollars"],
+            "return_includes_ccs": False,
+            "decision_grade": False,
             "config": cfg["name"] if cfg.get("name") else name,
         })
-    for label, mode in (("Buy & hold QQQ", "buy_hold_qqq"), ("Daily DCA QQQ", "daily_dca_qqq")):
+    for label, mode in (
+        ("Buy & hold QQQ", "buy_hold_qqq"),
+        ("Fixed-horizon daily DCA QQQ", "daily_dca_qqq"),
+    ):
         values = benchmark_curve(rows, capital, mode)
         final = values[-1]
         out.append({
@@ -691,11 +1081,15 @@ def preset_comparison(rows, capital=100000.0, warmup=34):
             "end_date": end,
             "final_value": final,
             "total_return_pct": (final / capital - 1) * 100,
-            "annualized_return_pct": annualized_return(capital, final, start, end) * 100,
-            "max_drawdown_pct": max_drawdown(values) * 100,
+            "annualized_return_pct": annualized_return_pct(capital, final, start, end),
+            "max_drawdown_pct": max_drawdown_from_capital(values, capital) * 100,
             "num_tactical_trades": 0,
             "tactical_pnl_dollars": 0.0,
+            "transaction_costs_dollars": None,
+            "ccs_stylized_payoff_dollars": 0.0,
             "ccs_pnl_dollars": 0.0,
+            "return_includes_ccs": False,
+            "decision_grade": False,
             "config": mode,
         })
     return out
@@ -706,7 +1100,7 @@ def build_summary(rows, curve, trades, ccs, capital, warmup):
     fields = [
         ("Teacher-style 70% QQQ core + TQQQ tactical", "strategy"),
         ("Buy & hold QQQ", "buy_hold_qqq"),
-        ("Daily DCA QQQ", "daily_dca_qqq"),
+        ("Fixed-horizon daily DCA QQQ", "daily_dca_qqq"),
         ("Buy & hold TQQQ", "buy_hold_tqqq"),
     ]
     out = []
@@ -719,39 +1113,46 @@ def build_summary(rows, curve, trades, ccs, capital, warmup):
             "end_date": end,
             "final_value": final,
             "total_return_pct": (final / capital - 1) * 100,
-            "annualized_return_pct": annualized_return(capital, final, start, end) * 100,
-            "max_drawdown_pct": max_drawdown(values) * 100,
-            "num_tactical_trades": len(trades) if key == "strategy" else 0,
-            "data_note": f"close-only proxy; first {warmup} trading days used as indicator warmup",
+            "annualized_return_pct": annualized_return_pct(capital, final, start, end),
+            "max_drawdown_pct": max_drawdown_from_capital(values, capital) * 100,
+            "num_tactical_trades": (
+                len({(t["entry_date"], t["type"]) for t in trades}) if key == "strategy" else 0
+            ),
+            "data_note": (
+                f"research-only close proxy; signals fill next close; {DEFAULT_EQUITY_SLIPPAGE_BPS:g} bps "
+                f"adverse slippage per side; first {warmup} sessions block tactical entries"
+            ),
+            "decision_grade": False,
         })
-    ccs_total = sum(h["pnl_per_contract"] for h in ccs)
+    ccs_total = sum(h["stylized_net_payoff_per_contract"] for h in ccs)
     out.append({
-        "scenario": "Stylized TQQQ 1-wide CCS hedges only",
+        "scenario": "Stylized TQQQ 1-wide CCS payoff diagnostic",
         "start_date": start,
         "end_date": end,
-        "final_value": ccs_total,
+        "final_value": None,
         "total_return_pct": None,
         "annualized_return_pct": None,
         "max_drawdown_pct": None,
         "num_tactical_trades": len(ccs),
-        "data_note": "per 1 contract, throttled to one open 5-trading-day hedge at a time; assumed $0.25 credit",
+        "stylized_payoff_dollars": ccs_total,
+        "data_note": (
+            "not historical P&L or a return; synthetic premium, next-close scenario entry, complete 5-session "
+            f"holding periods only, and ${DEFAULT_CCS_EXECUTION_COST_PER_CONTRACT:.2f} assumed execution cost"
+        ),
+        "decision_grade": False,
     })
     return out
 
 
 def write_csv(path, rows, fields=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = fields or (list(rows[0].keys()) if rows else [])
     if not rows:
         if fields:
-            with open(path, "w", newline="") as f:
-                csv.DictWriter(f, fieldnames=fields).writeheader()
+            atomic_write_csv(path, [], fields)
+        else:
+            atomic_write_text(path, "")
         return
-    fields = fields or list(rows[0].keys())
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k) for k in fields})
+    atomic_write_csv(path, ({k: row.get(k) for k in fields} for row in rows), fields)
 
 
 def fmt_money(v):
@@ -852,15 +1253,16 @@ def write_report(result, out_dir, capital):
     equity_svg = line_svg({
         "rows": curve,
         "keys": ["strategy", "buy_hold_qqq", "daily_dca_qqq", "buy_hold_tqqq"],
-        "labels": ["Teacher-style", "QQQ buy/hold", "QQQ daily DCA", "TQQQ buy/hold"],
+        "labels": ["Teacher-style", "QQQ buy/hold", "QQQ fixed-horizon DCA", "TQQQ buy/hold"],
     }, "YTD Equity Curve")
     signal_svg = qqq_signal_svg(rows, trades)
-    (out_dir / "equity_curve.svg").write_text(equity_svg)
-    (out_dir / "qqq_signal_chart.svg").write_text(signal_svg)
+    atomic_write_text(out_dir / "equity_curve.svg", equity_svg)
+    atomic_write_text(out_dir / "qqq_signal_chart.svg", signal_svg)
     summary_rows = "".join(
         f"<tr><td>{html.escape(r['scenario'])}</td><td>{fmt_money(r['final_value'])}</td>"
         f"<td>{fmt_pct(r['total_return_pct'])}</td><td>{fmt_pct(r['annualized_return_pct'])}</td>"
-        f"<td>{fmt_pct(r['max_drawdown_pct'])}</td><td>{r['num_tactical_trades']}</td></tr>"
+        f"<td>{fmt_pct(r['max_drawdown_pct'])}</td><td>{r['num_tactical_trades']}</td>"
+        f"<td>{fmt_money(r.get('stylized_payoff_dollars'))}</td></tr>"
         for r in summary
     )
     preset_rows = "".join(
@@ -868,26 +1270,31 @@ def write_report(result, out_dir, capital):
         f"<td>{fmt_money(r['final_value'])}</td><td>{fmt_pct(r['total_return_pct'])}</td>"
         f"<td>{fmt_pct(r['annualized_return_pct'])}</td><td>{fmt_pct(r['max_drawdown_pct'])}</td>"
         f"<td>{r['num_tactical_trades']}</td><td>{fmt_money(r['tactical_pnl_dollars'])}</td>"
-        f"<td>{fmt_money(r['ccs_pnl_dollars'])}</td></tr>"
+        f"<td>{fmt_money(r['ccs_stylized_payoff_dollars'])}</td></tr>"
         for r in (result.get("presets") or [])
     )
     trade_rows = "".join(
-        f"<tr><td>{t['entry_date']}</td><td>{t['exit_date']}</td><td>{html.escape(t['type'])}</td>"
+        f"<tr><td>{t.get('entry_signal_date') or '-'}</td><td>{t['entry_date']}</td>"
+        f"<td>{t.get('exit_signal_date') or '-'}</td><td>{t['exit_date']}</td><td>{html.escape(t['type'])}</td>"
         f"<td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td><td>{fmt_pct(t['return_pct'])}</td>"
         f"<td>{fmt_money(t['pnl_dollars'])}</td><td>{html.escape(t['exit_reason'])}</td></tr>"
         for t in trades
-    ) or '<tr><td colspan="8">No tactical TQQQ trades fired under the close-only rules.</td></tr>'
+    ) or '<tr><td colspan="10">No tactical TQQQ trades fired under the close-only rules.</td></tr>'
     ccs_rows = "".join(
-        f"<tr><td>{h['entry_date']}</td><td>{h['expiry_date']}</td><td>{h['tqqq_entry_close']:.2f}</td>"
+        f"<tr><td>{h['signal_date']}</td><td>{h['entry_date']}</td><td>{h['expiry_date']}</td><td>{h['tqqq_entry_close']:.2f}</td>"
         f"<td>{h['short_call']:.2f}/{h['long_call']:.2f}</td><td>{h['tqqq_expiry_close']:.2f}</td>"
-        f"<td>{fmt_money(h['pnl_per_contract'])}</td><td>{'Win' if h['win'] else 'Loss'}</td></tr>"
+        f"<td>{fmt_money(h['stylized_net_payoff_per_contract'])}</td>"
+        f"<td>{fmt_money(h['stylized_max_gain_per_contract'])}</td>"
+        f"<td>{fmt_money(-h['stylized_max_loss_per_contract'])}</td>"
+        f"<td>{'Positive' if h['win'] else 'Negative'}</td></tr>"
         for h in ccs
-    ) or '<tr><td colspan="7">No overheat CCS windows fired.</td></tr>'
+    ) or '<tr><td colspan="10">No complete overheat CCS scenario windows fired.</td></tr>'
     grid_rows = "".join(
         f"<tr><td>{html.escape(g['strike_mode'])}</td><td>{g['multiplier'] if g['multiplier'] is not None else '-'}</td><td>{g['hold_days']}</td>"
         f"<td>${g['credit_per_share_assumed']:.2f}</td><td>{g['num_hedges']}</td>"
         f"<td>{g['wins']}/{g['losses']}</td><td>{fmt_pct(g['win_rate_pct'])}</td>"
-        f"<td>{fmt_money(g['total_pnl_per_contract'])}</td><td>{fmt_money(g['avg_pnl_per_contract'])}</td></tr>"
+        f"<td>{fmt_money(g['total_stylized_payoff_per_contract'])}</td>"
+        f"<td>{fmt_money(g['avg_stylized_payoff_per_contract'])}</td></tr>"
         for g in result["ccs_grid"]
     )
     sweep = result.get("sweep") or {}
@@ -900,22 +1307,23 @@ def write_report(result, out_dir, capital):
             f"<td>{html.escape(r['overheat_exit'])} {int(r['overheat_sell_pct'] * 100)}%</td>"
             f"<td>{int(r['trail_pct'] * 100)}%</td><td>{html.escape(r['ccs_mode'])} {r['ccs_hold_days']}d</td>"
             f"<td>{fmt_pct(r['combined_return_pct'])}</td><td>{fmt_pct(r['max_drawdown_pct'])}</td>"
-            f"<td>{fmt_money(r['ccs_pnl_dollars'])}</td></tr>"
+            f"<td>{fmt_money(r['ccs_stylized_payoff_dollars'])}</td></tr>"
         )
     module_rows_html = "".join(sweep_tr(r) for r in (sweep.get("module_rows") or []))
     top_rows_html = "".join(sweep_tr(r) for r in (sweep.get("full_rows") or [])[:12])
     best_teacher_html = ""
     if best_teacher:
         best_teacher_html = (
-            f"<div class=\"note\"><b>Best teacher-aligned:</b> {html.escape(best_teacher['variant'])} · "
+            f"<div class=\"note\"><b>Highest in-sample teacher-aligned row (selection-biased):</b> {html.escape(best_teacher['variant'])} · "
             f"return {fmt_pct(best_teacher['combined_return_pct'])}, max DD {fmt_pct(best_teacher['max_drawdown_pct'])}, "
-            f"CCS {fmt_money(best_teacher['ccs_pnl_dollars'])}. "
-            f"Best raw return: {html.escape(best_overall['variant']) if best_overall else '-'}.</div>"
+            f"synthetic CCS diagnostic {fmt_money(best_teacher['ccs_stylized_payoff_dollars'])}. "
+            f"Highest raw in-sample return: {html.escape(best_overall['variant']) if best_overall else '-'}. "
+            "No row is validated out of sample.</div>"
         )
     playbook_cards = [
-        ("QQQ is weather", "Only QQQ daily trend defines the regime: EMA8/13/21 stack, EMA21 slope, ATR distance, RSI."),
+        ("QQQ is weather", "Only QQQ daily trend defines the regime: EMA8/13/21 stack, EMA21 slope, ATR distance, and 5-day momentum. RSI is reference-only."),
         ("TQQQ is execution", "Use TQQQ only at healthy EMA8/EMA21 pullbacks; do not let TQQQ noise define the market view."),
-        ("CCS is a brake", "Sell small defined-risk TQQQ CCS only when QQQ is extended; skip if the band is already overrun."),
+        ("CCS needs chain data", "A defined-risk overlay still requires live strikes, executable credit, liquidity, max loss, and long-exposure context."),
         ("Profit needs a leash", "At overheat, take partial profits and leave a runner with trailing stop instead of all-or-nothing exits."),
     ]
     playbook_html = "".join(
@@ -926,7 +1334,7 @@ def write_report(result, out_dir, capital):
         ("QQQ above EMA21, EMA8>13>21", "Hold core QQQ; wait for pullbacks before new TQQQ."),
         ("QQQ pulls to EMA8 zone", "Small TQQQ tactical add; avoid chasing options."),
         ("QQQ pulls to EMA21 zone", "If EMA21 still rises, this is the higher-quality TQQQ/call-debit-spread area."),
-        ("QQQ > EMA8 + 1.5 ATR or RSI extended", "Move stops up; sell part of TQQQ; consider small CCS only after confirmation."),
+        ("QQQ > EMA8 + 1.5 ATR or 5-day momentum extended", "Move stops up; sell part of TQQQ; evaluate CCS only with an actual liquid option chain."),
         ("Two closes below EMA21 or EMA8<EMA21", "Stop adding TQQQ/calls; treat it as regime risk, not a normal dip."),
     ]
     decision_html = "".join(
@@ -934,17 +1342,18 @@ def write_report(result, out_dir, capital):
         for a, b in decision_rows
     )
     lessons = [
-        "Core exposure dominates results in strong QQQ trends; too much cash was the main drag in YTD tests.",
-        "The strongest teacher-aligned version used 90% QQQ core, partial TQQQ profit-taking, and a runner.",
-        "Mechanical CCS selling dragged returns; EMA21+4ATR skip rules reduced bad hedges, and multi-year tests favored no constant CCS overlay.",
-        "TQQQ sizing matters only when cash is available; with a 90% QQQ core, tactical buys are naturally capped.",
-        "Close-only tests are useful for regime logic, but real execution needs OHLC and historical option-chain data.",
+        "All tactical signals are observed at one close and executed at the following close with adverse slippage.",
+        "Reported return and drawdown exclude every CCS diagnostic because no historical option-chain premium is available.",
+        "The parameter sweep is in-sample exploration; its top row is not evidence of future superiority.",
+        "Annualized values can magnify short-period results; total return and max drawdown are the primary period metrics.",
+        "Decision-grade testing still requires OHLC, corporate-action-verified prices, historical option quotes, and walk-forward validation.",
     ]
     lessons_html = "".join(f"<li>{html.escape(x)}</li>" for x in lessons)
     strat = summary[0]
     qqq = summary[1]
     diff_return = (strat["total_return_pct"] or 0) - (qqq["total_return_pct"] or 0)
     diff_dd = (strat["max_drawdown_pct"] or 0) - (qqq["max_drawdown_pct"] or 0)
+    limitations_html = "".join(f"<li>{html.escape(x)}</li>" for x in result["methodology"]["limitations"])
     html_doc = f'''<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -975,7 +1384,7 @@ svg{{width:100%;height:auto;display:block}}
 <body><main>
 <h1>QQQ/TQQQ Strategy Backtest</h1>
 <p class="sub">Period: {rows[0]['date']} to {rows[-1]['date']} · Capital: {fmt_money(capital)} · Data: adjusted daily closes / cached closes.</p>
-<div class="note">这个页面验证的是“QQQ 日线 EMA 天气图 + TQQQ 战术仓 + 小仓 CCS 刹车”的节奏，不是完整实盘成交回测。若没有 daily high/low，EMA8/EMA21 回踩用收盘价接近均线近似；CCS 没有历史期权链，只做定义风险结构的压力测试。</div>
+<div class="note"><b>RESEARCH ONLY · NOT DECISION GRADE.</b> Signals at close t fill at close t+1 with {DEFAULT_EQUITY_SLIPPAGE_BPS:g} bps adverse slippage per side. CCS figures use synthetic credits and are excluded from every strategy return, drawdown, and ranking claim.</div>
 <h2>Teacher Strategy Distilled</h2>
 <div class="playbook">{playbook_html}</div>
 <section class="panel"><table><thead><tr><th>Market condition</th><th>Decision rule</th></tr></thead><tbody>{decision_html}</tbody></table></section>
@@ -990,54 +1399,71 @@ svg{{width:100%;height:auto;display:block}}
 <section class="panel">{equity_svg}</section>
 <section class="panel">{signal_svg}</section>
 <h2>Fixed Preset Comparison</h2>
-<section class="panel"><table><thead><tr><th>Scenario</th><th>Config</th><th>Final</th><th>Total return</th><th>Annualized</th><th>Max drawdown</th><th>Tactical trades</th><th>TQQQ P&L</th><th>CCS P&L</th></tr></thead><tbody>{preset_rows}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Scenario</th><th>Config</th><th>Final</th><th>Total return</th><th>Annualized</th><th>Max drawdown</th><th>Tactical positions</th><th>TQQQ P&L</th><th>CCS synthetic diagnostic</th></tr></thead><tbody>{preset_rows}</tbody></table></section>
 <h2>Summary</h2>
-<section class="panel"><table><thead><tr><th>Scenario</th><th>Final</th><th>Total return</th><th>Annualized</th><th>Max drawdown</th><th>Trades</th></tr></thead><tbody>{summary_rows}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Scenario</th><th>Final</th><th>Total return</th><th>Annualized</th><th>Max drawdown</th><th>Positions/windows</th><th>Synthetic diagnostic</th></tr></thead><tbody>{summary_rows}</tbody></table></section>
 <h2>Tactical TQQQ Trades</h2>
-<section class="panel"><table><thead><tr><th>Entry</th><th>Exit</th><th>Type</th><th>Entry px</th><th>Exit px</th><th>Return</th><th>P&L</th><th>Exit reason</th></tr></thead><tbody>{trade_rows}</tbody></table></section>
-<h2>Stylized CCS Hedges</h2>
-<section class="panel"><table><thead><tr><th>Entry</th><th>Expiry</th><th>TQQQ entry</th><th>Spread</th><th>TQQQ expiry</th><th>P&L / contract</th><th>Result</th></tr></thead><tbody>{ccs_rows}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Entry signal</th><th>Entry fill</th><th>Exit signal</th><th>Exit fill/mark</th><th>Type</th><th>Entry px</th><th>Exit px</th><th>Return</th><th>P&L</th><th>Exit reason</th></tr></thead><tbody>{trade_rows}</tbody></table></section>
+<h2>Stylized CCS Diagnostics (not historical P&amp;L)</h2>
+<section class="panel"><table><thead><tr><th>Signal</th><th>Scenario entry</th><th>Expiry</th><th>TQQQ entry</th><th>Spread</th><th>TQQQ expiry</th><th>Net synthetic payoff / contract</th><th>Conditional max gain</th><th>Conditional max loss</th><th>Sign</th></tr></thead><tbody>{ccs_rows}</tbody></table></section>
 <h2>CCS Strike / Time Grid</h2>
-<section class="panel"><table><thead><tr><th>Strike mode</th><th>Multiplier</th><th>Hold days</th><th>Credit</th><th>Hedges</th><th>Win/Loss</th><th>Win rate</th><th>Total P&L / contract</th><th>Avg P&L</th></tr></thead><tbody>{grid_rows}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Strike mode</th><th>Multiplier</th><th>Hold days</th><th>Synthetic credit</th><th>Windows</th><th>Positive/negative</th><th>Positive rate</th><th>Total synthetic payoff</th><th>Avg synthetic payoff</th></tr></thead><tbody>{grid_rows}</tbody></table></section>
 <h2>Teacher-Style Sweep</h2>
 {best_teacher_html}
-<section class="panel"><table><thead><tr><th>Module</th><th>Variant</th><th>Core</th><th>EMA8/21 TQQQ</th><th>Overheat</th><th>Trail</th><th>CCS</th><th>Combined return</th><th>Max DD</th><th>CCS P&L</th></tr></thead><tbody>{module_rows_html}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Module</th><th>Variant</th><th>Core</th><th>EMA8/21 TQQQ</th><th>Overheat</th><th>Trail</th><th>CCS diagnostic</th><th>Equity return (CCS excluded)</th><th>Max DD</th><th>CCS synthetic payoff</th></tr></thead><tbody>{module_rows_html}</tbody></table></section>
 <h2>Top Full-Grid Versions</h2>
-<section class="panel"><table><thead><tr><th>Module</th><th>Variant</th><th>Core</th><th>EMA8/21 TQQQ</th><th>Overheat</th><th>Trail</th><th>CCS</th><th>Combined return</th><th>Max DD</th><th>CCS P&L</th></tr></thead><tbody>{top_rows_html}</tbody></table></section>
+<section class="panel"><table><thead><tr><th>Module</th><th>Variant</th><th>Core</th><th>EMA8/21 TQQQ</th><th>Overheat</th><th>Trail</th><th>CCS diagnostic</th><th>Equity return (CCS excluded)</th><th>Max DD</th><th>CCS synthetic payoff</th></tr></thead><tbody>{top_rows_html}</tbody></table></section>
+<h2>Methodology Limits</h2>
+<section class="panel"><ul class="lessons">{limitations_html}</ul></section>
 </main></body></html>'''
     report = out_dir / "qqq_tqqq_ytd_backtest_report.html"
-    report.write_text(html_doc)
+    atomic_write_text(report, html_doc)
     return report
 
 
 def save_outputs(result, out_dir, capital):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(out_dir / "ytd_summary.csv", result["summary"])
+    ensure_private_directory(out_dir)
+    write_csv(out_dir / "ytd_summary.csv", result["summary"], [
+        "scenario", "start_date", "end_date", "final_value", "total_return_pct",
+        "annualized_return_pct", "max_drawdown_pct", "num_tactical_trades",
+        "stylized_payoff_dollars", "data_note", "decision_grade",
+    ])
     write_csv(out_dir / "preset_comparison.csv", result["presets"], [
         "scenario", "config", "start_date", "end_date", "final_value", "total_return_pct",
         "annualized_return_pct", "max_drawdown_pct", "num_tactical_trades",
-        "tactical_pnl_dollars", "ccs_pnl_dollars",
+        "tactical_pnl_dollars", "transaction_costs_dollars", "ccs_stylized_payoff_dollars",
+        "return_includes_ccs", "decision_grade",
     ])
     write_csv(out_dir / "trades.csv", result["trades"], [
-        "entry_date", "exit_date", "type", "status", "entry_price", "exit_price",
-        "shares", "return_pct", "pnl_dollars", "exit_reason",
+        "entry_signal_date", "entry_date", "exit_signal_date", "exit_date", "type", "status",
+        "entry_reference_close", "entry_price", "exit_reference_close", "exit_price",
+        "shares", "return_pct", "pnl_dollars", "entry_execution_cost_dollars",
+        "exit_execution_cost_dollars", "exit_reason", "fill_timing",
+        "equity_slippage_bps_per_side", "commission_per_order",
     ])
     write_csv(out_dir / "ccs_hedges.csv", result["ccs"], [
-        "entry_date", "expiry_date", "tqqq_entry_close", "tqqq_expiry_close",
+        "signal_date", "entry_date", "expiry_date", "tqqq_signal_close", "tqqq_entry_close",
+        "tqqq_expiry_close",
         "short_call", "long_call", "credit_per_share_assumed", "hold_days", "strike_mode",
-        "raw_target", "qqq_ema21_plus_4atr", "strike_source", "pnl_per_contract", "win",
+        "raw_target", "qqq_ema21_plus_atr_band", "atr_multiplier", "strike_source",
+        "premium_source", "fill_timing", "signal_warmup_sessions",
+        "gross_expiration_payoff_per_contract", "execution_cost_per_contract_assumed",
+        "stylized_net_payoff_per_contract", "stylized_max_gain_per_contract",
+        "stylized_max_loss_per_contract", "decision_grade", "win",
     ])
     write_csv(out_dir / "ccs_grid.csv", result["ccs_grid"], [
         "strike_mode", "multiplier", "hold_days", "credit_per_share_assumed", "num_hedges",
-        "wins", "losses", "win_rate_pct", "total_pnl_per_contract", "avg_pnl_per_contract",
+        "wins", "losses", "win_rate_pct", "total_stylized_payoff_per_contract",
+        "avg_stylized_payoff_per_contract", "decision_grade",
     ])
     sweep_fields = [
         "module", "variant", "core_alloc", "ema8_alloc", "ema21_alloc",
         "overheat_exit", "overheat_sell_pct", "trail_pct",
         "ccs_mode", "ccs_hold_days", "ccs_multiplier",
         "final_value", "total_return_pct", "max_drawdown_pct", "num_tactical_trades",
-        "tactical_pnl_dollars", "ccs_pnl_dollars", "combined_final_value",
-        "combined_return_pct", "teacher_aligned",
+        "tactical_pnl_dollars", "transaction_costs_dollars", "ccs_stylized_payoff_dollars",
+        "combined_final_value", "combined_return_pct", "teacher_aligned",
+        "return_includes_ccs", "decision_grade",
     ]
     write_csv(out_dir / "strategy_module_comparison.csv", result["sweep"]["module_rows"], sweep_fields)
     write_csv(out_dir / "strategy_full_grid.csv", result["sweep"]["full_rows"], sweep_fields)
@@ -1049,9 +1475,14 @@ def save_outputs(result, out_dir, capital):
     write_csv(out_dir / "strategy_best_versions.csv", best_rows, sweep_fields)
     for key, hedges in result["ccs_detail"].items():
         write_csv(out_dir / f"ccs_{key}.csv", hedges, [
-            "entry_date", "expiry_date", "tqqq_entry_close", "tqqq_expiry_close",
+            "signal_date", "entry_date", "expiry_date", "tqqq_signal_close", "tqqq_entry_close",
+            "tqqq_expiry_close",
             "short_call", "long_call", "credit_per_share_assumed", "hold_days", "strike_mode",
-            "raw_target", "qqq_ema21_plus_4atr", "strike_source", "pnl_per_contract", "win",
+            "raw_target", "qqq_ema21_plus_atr_band", "atr_multiplier", "strike_source",
+            "premium_source", "fill_timing", "signal_warmup_sessions",
+            "gross_expiration_payoff_per_contract", "execution_cost_per_contract_assumed",
+            "stylized_net_payoff_per_contract", "stylized_max_gain_per_contract",
+            "stylized_max_loss_per_contract", "decision_grade", "win",
         ])
     write_csv(out_dir / "equity_curve.csv", result["curve"])
     indicator_rows = []
@@ -1065,12 +1496,15 @@ def save_outputs(result, out_dir, capital):
         })
     write_csv(out_dir / "indicator_series.csv", indicator_rows)
     report = write_report(result, out_dir, capital)
-    (out_dir / "summary.json").write_text(json.dumps(result["summary"], indent=2))
+    atomic_write_json(out_dir / "summary.json", result["summary"])
+    atomic_write_json(out_dir / "methodology.json", result["methodology"])
     return report
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Backtest QQQ EMA weather / TQQQ tactical strategy using cached closes.")
+    ap = argparse.ArgumentParser(
+        description="Research-only close proxy for QQQ EMA weather / TQQQ tactical rules."
+    )
     ap.add_argument("--prices-cache", default=str(DEFAULT_CACHE))
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT))
     ap.add_argument("--start", default="2026-01-01")
@@ -1088,9 +1522,16 @@ def main():
     print(f"Backtest period: {strat['start_date']} to {strat['end_date']}")
     print(f"Strategy final: {fmt_money(strat['final_value'])} ({fmt_pct(strat['total_return_pct'])}), max DD {fmt_pct(strat['max_drawdown_pct'])}")
     print(f"QQQ buy/hold:   {fmt_money(qqq['final_value'])} ({fmt_pct(qqq['total_return_pct'])}), max DD {fmt_pct(qqq['max_drawdown_pct'])}")
-    print(f"QQQ daily DCA:  {fmt_money(dca['final_value'])} ({fmt_pct(dca['total_return_pct'])}), max DD {fmt_pct(dca['max_drawdown_pct'])}")
+    print(
+        f"QQQ fixed-horizon DCA: {fmt_money(dca['final_value'])} "
+        f"({fmt_pct(dca['total_return_pct'])}), max DD {fmt_pct(dca['max_drawdown_pct'])}"
+    )
     print(f"TQQQ buy/hold:  {fmt_money(tqqq['final_value'])} ({fmt_pct(tqqq['total_return_pct'])}), max DD {fmt_pct(tqqq['max_drawdown_pct'])}")
-    print(f"Tactical trades: {len(result['trades'])}; CCS windows: {len(result['ccs'])}; CCS P&L/contract total: {fmt_money(ccs['final_value'])}")
+    print(
+        f"Tactical execution records: {len(result['trades'])}; CCS diagnostic windows: {len(result['ccs'])}; "
+        f"synthetic CCS payoff total (excluded from returns): {fmt_money(ccs.get('stylized_payoff_dollars'))}"
+    )
+    print("Model grade: RESEARCH ONLY / NOT DECISION GRADE")
     print(f"Report: {report}")
 
 

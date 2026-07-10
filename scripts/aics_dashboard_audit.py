@@ -17,6 +17,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text, ensure_private_directory
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_json, atomic_write_text, ensure_private_directory
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = ROOT / "output" / "portfolio_dashboard.html"
@@ -137,6 +142,10 @@ def run_screenshot(chrome: str, url: str, width: int, height: int, out: Path) ->
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90, check=True)
 
 
+def file_url(path: Path, fragment: str = "") -> str:
+    return path.resolve().as_uri() + fragment
+
+
 def extract_audit_json(dom: str) -> dict:
     match = re.search(r'<pre id="aics-audit-json">([\s\S]*?)</pre>', dom)
     if not match:
@@ -146,7 +155,7 @@ def extract_audit_json(dom: str) -> dict:
 
 def write_temp_target(source_html: str, name: str, replace_body: bool) -> Path:
     path = OUT_DIR / f"_tmp_{name}.html"
-    path.write_text(inject(source_html, audit_script(replace_body)), encoding="utf-8")
+    atomic_write_text(path, inject(source_html, audit_script(replace_body)))
     return path
 
 
@@ -168,11 +177,10 @@ setTimeout(pullAudit,500);
 """
     else:
         script = ""
-    path.write_text(
+    atomic_write_text(path,
         "<!doctype html><html><body style='margin:0;background:#000'>"
-        f"<iframe id='frame' src='file://{target}' style='width:390px;height:844px;border:0;display:block'></iframe>"
+        f"<iframe id='frame' src='{html.escape(target.resolve().as_uri(), quote=True)}' style='width:390px;height:844px;border:0;display:block'></iframe>"
         f"<script>{script}</script></body></html>",
-        encoding="utf-8",
     )
     return path
 
@@ -225,8 +233,9 @@ def assert_metrics(label: str, metrics: dict) -> List[str]:
 
 
 def run_audit(args) -> int:
+    os.umask(0o077)
     chrome = args.chrome or find_chrome()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(OUT_DIR)
     dashboard_html = read_text(Path(args.dashboard))
     aics = json.loads(read_text(Path(args.aics_json)))
     failures = []
@@ -236,11 +245,11 @@ def run_audit(args) -> int:
             failures.append(f"static check failed: {name}")
 
     desktop_target = write_temp_target(dashboard_html, "desktop_metrics", True)
-    desktop_dom = run_dump(chrome, f"file://{desktop_target}#/portfolio/aics", 1440, 900)
+    desktop_dom = run_dump(chrome, file_url(desktop_target, "#/portfolio/aics"), 1440, 900)
     desktop_metrics = extract_audit_json(desktop_dom)
 
     mobile_target = write_temp_target(dashboard_html, "mobile_metrics", True)
-    mobile_dom = run_dump(chrome, f"file://{mobile_host(mobile_target, 'mobile_metrics', True)}", 520, 900)
+    mobile_dom = run_dump(chrome, file_url(mobile_host(mobile_target, "mobile_metrics", True)), 520, 900)
     mobile_metrics = extract_audit_json(mobile_dom)
 
     failures.extend(assert_metrics("desktop", desktop_metrics))
@@ -250,16 +259,17 @@ def run_audit(args) -> int:
 
     desktop_shot_target = write_temp_target(dashboard_html, "desktop_shot", False)
     desktop_png = OUT_DIR / "aics_desktop.png"
-    run_screenshot(chrome, f"file://{desktop_shot_target}#/portfolio/aics", 1440, 900, desktop_png)
+    run_screenshot(chrome, file_url(desktop_shot_target, "#/portfolio/aics"), 1440, 900, desktop_png)
 
     mobile_shot_target = write_temp_target(dashboard_html, "mobile_shot", False)
     mobile_png = OUT_DIR / "aics_mobile.png"
-    run_screenshot(chrome, f"file://{mobile_host(mobile_shot_target, 'mobile_shot', False)}", 520, 900, mobile_png)
+    run_screenshot(chrome, file_url(mobile_host(mobile_shot_target, "mobile_shot", False)), 520, 900, mobile_png)
 
     for label, png, min_width, min_bytes in (
         ("desktop", desktop_png, 1200, 30000),
         ("mobile", mobile_png, 500, 20000),
     ):
+        png.chmod(0o600)
         width, height = png_dimensions(png)
         if width < min_width or height < 800 or png.stat().st_size < min_bytes:
             failures.append(f"{label}: screenshot weak ({png}, {width}x{height}, {png.stat().st_size} bytes)")
@@ -273,7 +283,7 @@ def run_audit(args) -> int:
         "failures": failures,
     }
     result_path = OUT_DIR / "aics_dashboard_audit.json"
-    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(result_path, result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if failures else 0
 

@@ -1,5 +1,8 @@
 import importlib.util
+import json
+import math
 import pathlib
+import tempfile
 import unittest
 
 
@@ -39,6 +42,22 @@ class ArchiveOptionChainSnapshotsTests(unittest.TestCase):
         self.assertEqual("2026-06-26_153000_ET_QQQ_2026-07-03_raw.json", raw.name)
         self.assertEqual(pathlib.Path("/tmp/snapshots/QQQ/metadata/2026-06-26"), metadata.parent)
         self.assertEqual("2026-06-26_153000_ET_QQQ_2026-07-03_metadata.json", metadata.name)
+
+    def test_snapshot_paths_reject_traversal_tickers(self):
+        for ticker in ("../private", "QQQ/../../private", "", "."):
+            with self.subTest(ticker=ticker), self.assertRaises(ValueError):
+                archive.output_path(
+                    "/tmp/snapshots", ticker,
+                    "2026-06-26T15:30:00-04:00", "2026-07-03",
+                )
+
+    def test_snapshot_paths_reject_non_iso_or_traversal_expiries(self):
+        for expiry in ("../private", "2026-07-03/../../x", "2026-02-30", ""):
+            with self.subTest(expiry=expiry), self.assertRaises(ValueError):
+                archive.output_path(
+                    "/tmp/snapshots", "QQQ",
+                    "2026-06-26T15:30:00-04:00", expiry,
+                )
 
     def test_bs_greeks_return_option_type_specific_delta(self):
         call = archive.bs_greeks(100, 105, 7, 0.30, "call")
@@ -80,6 +99,34 @@ class ArchiveOptionChainSnapshotsTests(unittest.TestCase):
         self.assertIn("model_delta", row)
         self.assertEqual(row["source"], "yfinance")
 
+    def test_normalized_chain_rejects_missing_negative_or_crossed_quotes(self):
+        args = archive.parse_args(["--skip-gravity-state"])
+        base = {"strike": 720, "impliedVolatility": 0.25}
+        for quote in (
+            {"bid": None, "ask": 1.4},
+            {"bid": -0.1, "ask": 1.4},
+            {"bid": 1.5, "ask": 1.4},
+        ):
+            with self.subTest(quote=quote):
+                row = archive.normalize_option_row(
+                    {**base, **quote}, "call", args,
+                    "2026-06-26T15:30:00-04:00", "QQQ", 706.52,
+                    "2026-07-03", None, None,
+                )
+                self.assertIsNone(row)
+
+    def test_cli_rejects_unsafe_ticker_expiry_and_invalid_bounds(self):
+        bad_args = (
+            ["--ticker", "../QQQ"],
+            ["--expiry", "2026-02-30"],
+            ["--max-expiries", "-1"],
+            ["--boundary-confidence", "1"],
+            ["--horizon-days", "0"],
+        )
+        for argv in bad_args:
+            with self.subTest(argv=argv), self.assertRaises((ValueError, SystemExit)):
+                archive.parse_args(argv)
+
     def test_snapshot_metadata_records_rebuild_inputs(self):
         args = archive.parse_args(["--ticker", "QQQ"])
         metadata = archive.snapshot_metadata(
@@ -96,6 +143,22 @@ class ArchiveOptionChainSnapshotsTests(unittest.TestCase):
         self.assertEqual(metadata["normalized_rows"], 1)
         self.assertEqual(metadata["raw_rows"], 2)
         self.assertEqual(metadata["timezone"], "America/New_York")
+
+    def test_snapshot_writers_emit_private_strict_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td) / "snapshots" / "QQQ"
+            json_path = root / "raw.json"
+            csv_path = root / "chain.csv"
+
+            archive.write_json(json_path, {"valid": 1.0, "missing": math.nan})
+            archive.write_csv(csv_path, [{"snapshot_ts": "2026-07-09T15:30:00-04:00"}])
+
+            raw = json_path.read_text(encoding="utf-8")
+            self.assertNotIn("NaN", raw)
+            self.assertIsNone(json.loads(raw)["missing"])
+            self.assertEqual(json_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(csv_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
 
 
 if __name__ == "__main__":

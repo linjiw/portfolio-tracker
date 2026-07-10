@@ -17,13 +17,22 @@ Designed to be re-run whenever you export fresh CSVs:
 Nothing is hard-coded: ticker list, date range, holdings and costs are all
 derived from the two CSV files at run time. See docs/METHODOLOGY.md for methodology.
 """
-import csv, re, json, glob, os, sys, argparse, datetime, math
+import csv, re, json, glob, os, sys, argparse, datetime, math, hashlib
+
+try:
+    from scripts.artifact_validation import load_artifact, compact_counterfactual
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+except ModuleNotFoundError:  # defensive for direct execution from unusual cwd
+    from artifact_validation import load_artifact, compact_counterfactual
+    from artifact_io import atomic_write_json, atomic_write_text
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, "output", "prices_cache.json")
 SECTORS_CACHE = os.path.join(HERE, "output", "sectors_cache.json")
 OHLC_CACHE = os.path.join(HERE, "output", "ohlc_cache.json")
+MONEY_MARKET_SYMBOLS = {"SPAXX", "FDRXX", "FCASH", "SPRXX", "FZFXX"}
+BROKER_EQUITY_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.^/=_-]{0,31}", re.I)
 
 # ---------------------------------------------------------------- helpers
 def fnum(s):
@@ -35,31 +44,125 @@ def fnum(s):
     except ValueError:
         return 0.0
 
+
+def strict_fnum(value, field, source="history export", row_number=None):
+    """Parse a required broker numeric field without coercing corruption to 0.
+
+    ``fnum`` remains appropriate for optional display cells where Fidelity uses
+    blanks/``--``.  Recognized trades and cash events, however, feed P&L and
+    return calculations, so a malformed required value must block the run.
+    """
+    raw = str(value or "").strip()
+    negative_parentheses = raw.startswith("(") and raw.endswith(")")
+    if negative_parentheses:
+        raw = raw[1:-1]
+    text = raw.replace(",", "").replace("$", "").replace("+", "").strip()
+    if text in ("", "--"):
+        location = f" row {row_number}" if row_number is not None else ""
+        raise ValueError(f"{source}{location}: required {field} is blank")
+    try:
+        number = float(text)
+    except ValueError as exc:
+        location = f" row {row_number}" if row_number is not None else ""
+        raise ValueError(f"{source}{location}: invalid {field} {value!r}") from exc
+    if not math.isfinite(number):
+        location = f" row {row_number}" if row_number is not None else ""
+        raise ValueError(f"{source}{location}: non-finite {field} {value!r}")
+    return -number if negative_parentheses else number
+
+def parse_broker_date(value):
+    """Normalize the date formats emitted by Fidelity/Schwab CSV exports.
+
+    Account-history downloads have used both ``MM/DD/YYYY`` and
+    ``MM-DD-YYYY``.  Returning ``None`` for non-data/footer rows keeps the
+    parser strict without silently dropping a whole valid export variant.
+    """
+    text = str(value or "").strip()
+    for fmt in ("%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def iso(d):
-    m, dd, y = d.split("/")
-    return f"{y}-{int(m):02d}-{int(dd):02d}"
+    parsed = parse_broker_date(d)
+    if parsed is None:
+        raise ValueError(f"unsupported broker date: {d!r}")
+    return parsed
 
 def newest(pattern, where):
     hits = sorted(glob.glob(os.path.join(where, pattern)), key=os.path.getmtime, reverse=True)
     return hits[0] if hits else None
 
-def collect_history_files(input_dir, explicit=None):
+def collect_history_files(input_dir, explicit=None, exact=False, include_archive=True):
     """Return every known history export, plus an optional newly supplied file.
 
     Sync semantics are cumulative: a fresh Fidelity export is an increment or
     fuller snapshot of activity, not a replacement for older local history.
+    ``exact=True`` is an explicit audit mode that uses only ``explicit``.
     """
+    if exact:
+        return [os.path.realpath(explicit)] if explicit else []
     seen, out = set(), []
     for pat in ("History_for_Account*.csv", "Accounts_History*.csv"):
         for p in sorted(glob.glob(os.path.join(input_dir, pat)), key=os.path.getmtime):
-            ap = os.path.abspath(p)
+            ap = os.path.realpath(p)
             if ap not in seen:
                 seen.add(ap); out.append(ap)
     if explicit:
-        ap = os.path.abspath(explicit)
+        ap = os.path.realpath(explicit)
         if ap not in seen:
             out.append(ap)
-    return out
+    archive_root = os.path.join(HERE, "output", "imports", "raw")
+    if include_archive and os.path.isdir(archive_root):
+        for pat in ("**/History_for_Account*.csv", "**/Accounts_History*.csv"):
+            for p in glob.glob(os.path.join(archive_root, pat), recursive=True):
+                ap = os.path.realpath(p)
+                if ap not in seen:
+                    seen.add(ap); out.append(ap)
+    # Original and archived copies are byte-identical; merge each content hash
+    # once so durable storage cannot duplicate activity.
+    by_hash = {}
+    for path in sorted(out, key=os.path.getmtime):
+        try:
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            continue
+        by_hash[digest] = path
+    return sorted(by_hash.values(), key=os.path.getmtime)
+
+
+def canonical_option_symbol(symbol):
+    """Return a stable dash-prefixed OCC-like option symbol, else ``None``.
+
+    Some exports omit Fidelity's cosmetic leading dash.  Action text is not a
+    safe classifier because equity settlement rows say "EXERCISED CALLS" while
+    their symbol is the plain underlying ticker.
+    """
+    raw = str(symbol or "").strip().replace(" ", "")
+    core = raw.lstrip("-")
+    if re.fullmatch(r"[A-Z0-9.]{1,10}\d{6}[CP]\d+(?:\.\d+)?", core, re.I):
+        return "-" + core.upper()
+    return None
+
+
+def canonical_equity_symbol(symbol, source="broker export", row_number=None):
+    """Validate and normalize a non-option broker symbol.
+
+    Symbols become dictionary keys, Yahoo query inputs, DOM data attributes,
+    and route components.  Failing closed here prevents malformed exports from
+    silently splitting one holding and keeps broker-controlled text out of
+    executable HTML contexts.  Dots, slashes, carets, dashes and equals signs
+    cover common share classes and index/futures-style Yahoo symbols.
+    """
+    raw = str(symbol or "").strip()
+    if not BROKER_EQUITY_SYMBOL.fullmatch(raw):
+        location = f" row {row_number}" if row_number is not None else ""
+        raise ValueError(f"{source}{location}: invalid equity symbol {symbol!r}")
+    return raw.upper()
 
 # ---------------------------------------------------------------- parsing
 def _colmap(header):
@@ -78,6 +181,34 @@ def _colmap(header):
         elif h.startswith("amount"): idx["amount"] = i
     return idx
 
+
+def _history_action_metadata(action, is_option, side):
+    """Return stable provenance for a broker activity row.
+
+    Fidelity represents option exercise/assignment twice: once on the option
+    contract and once as plain-ticker stock delivery.  The latter must remain
+    identifiable after overlapping exports are merged; otherwise it looks like
+    a discretionary stock trade and can corrupt realized P&L and behavior
+    metrics.  ``settlementType`` retains the useful subtype while the common
+    ``OPTION_SETTLEMENT`` actionType makes the accounting rule explicit.
+    """
+    upper = str(action or "").upper()
+    if is_option:
+        if "EXPIRED" in upper:
+            return {"actionType": "EXPIRED"}
+        if "ASSIGNED" in upper:
+            return {"actionType": "ASSIGNED"}
+        if "EXERCISED" in upper:
+            return {"actionType": "EXERCISED"}
+    else:
+        if "ASSIGNED" in upper:
+            return {"actionType": "OPTION_SETTLEMENT", "settlementType": "ASSIGNED"}
+        if "EXERCISED" in upper:
+            return {"actionType": "OPTION_SETTLEMENT", "settlementType": "EXERCISED"}
+        if "REINVESTMENT" in upper:
+            return {"actionType": "REINVESTMENT"}
+    return {"actionType": "TRADE" if side in ("BUY", "SELL") else "OTHER"}
+
 def parse_history(path):
     """Header-aware parser. Returns a dict with txns/opt_txns/names, cash flows
     (deposits, dividends), trade totals, date range, and counts used to pick the
@@ -86,128 +217,269 @@ def parse_history(path):
     txns, opt_txns, names = defaultdict(list), defaultdict(list), {}
     m_acct = re.search(r"History_for_Account_([A-Z0-9]+)", os.path.basename(path))
     default_account = m_acct.group(1) if m_acct else ""
-    deposits = dividends = tot_buy = tot_sell = 0.0
+    deposits = dividends = corporate_actions = tot_buy = tot_sell = 0.0
+    accounts_seen = set()
     n_buys = n_eft = n_div = 0
     dmin = dmax = None
     cmap = None
-    cash_rows = []   # (date, kind, amount) for cross-file union
+    cash_rows = []   # (date, kind, amount, account) for cross-file union
+    source_name = os.path.basename(path)
     with open(path, encoding="utf-8-sig") as f:
-        for r in csv.reader(f):
+        for row_number, r in enumerate(csv.reader(f), start=1):
             if cmap is None:
                 if r and r[0].strip() == "Run Date":
                     cmap = _colmap(r)
+                    required = {"date", "action", "symbol", "amount"}
+                    missing = sorted(required - set(cmap))
+                    if missing:
+                        raise ValueError(
+                            f"{source_name} row {row_number}: missing required columns "
+                            + ", ".join(missing))
                 continue
-            if len(r) <= cmap.get("amount", 99) or not re.match(r"\d{2}/\d{2}/\d{4}", r[0]):
+            if len(r) <= cmap.get("amount", 99):
+                continue
+            d = parse_broker_date(r[cmap["date"]])
+            if d is None:
                 continue
             action = r[cmap["action"]]
-            amt = fnum(r[cmap["amount"]])
+            action_upper = action.upper()
+            amount_raw = r[cmap["amount"]]
             sym = r[cmap["symbol"]].strip()
-            d = iso(r[cmap["date"]])
+            account = (r[cmap["account"]].strip()
+                       if "account" in cmap and len(r) > cmap["account"] else default_account)
+            if account:
+                accounts_seen.add(account)
             dmin = d if dmin is None or d < dmin else dmin
             dmax = d if dmax is None or d > dmax else dmax
-            if "Electronic Funds Transfer Received" in action or "TRANSFERRED" in action:
+            is_cash_transfer = ("ELECTRONIC FUNDS TRANSFER RECEIVED" in action_upper
+                                or ("TRANSFERRED" in action_upper and not sym))
+            if is_cash_transfer:
+                amt = strict_fnum(amount_raw, "cash amount", source_name, row_number)
                 deposits += amt
-                if "Electronic" in action:
-                    n_eft += 1; cash_rows.append((d, "EFT", round(amt, 2)))
+                if "ELECTRONIC" in action_upper:
+                    n_eft += 1; cash_rows.append((d, "EFT", round(amt, 2), account))
                 else:
-                    cash_rows.append((d, "TRANSFER", round(amt, 2)))
+                    cash_rows.append((d, "TRANSFER", round(amt, 2), account))
                 continue
-            if "DIVIDEND RECEIVED" in action or "INTEREST" in action:
-                dividends += amt; n_div += 1; cash_rows.append((d, "DIV", round(amt, 2)))
+            if ("DIVIDEND RECEIVED" in action_upper or "INTEREST" in action_upper
+                    or "FOREIGN TAX PAID" in action_upper
+                    or ("ADJUSTMENT" in action_upper and " DIV " in (" " + action_upper + " "))):
+                amt = strict_fnum(amount_raw, "dividend/interest amount", source_name, row_number)
+                dividends += amt; n_div += 1; cash_rows.append((d, "DIV", round(amt, 2), account))
                 continue
-            if "JOURNALED" in action or sym == "":
+            if "IN LIEU OF" in action_upper or "CASH IN LIEU" in action_upper:
+                amt = strict_fnum(amount_raw, "corporate-action amount", source_name, row_number)
+                corporate_actions += amt
+                cash_rows.append((d, "CORPORATE_ACTION", round(amt, 2), account))
                 continue
-            is_opt = sym.startswith("-") or "CALL" in action or "PUT" in action
-            side = "BUY" if "BOUGHT" in action else ("SELL" if "SOLD" in action else "?")
-            rec = {"date": d, "side": side, "qty": abs(fnum(r[cmap["qty"]])),
-                   "price": fnum(r[cmap["price"]]), "amount": amt,
-                   "account": r[cmap["account"]].strip() if "account" in cmap and len(r) > cmap["account"] else default_account}
+            if "JOURNALED" in action_upper or sym == "":
+                continue
+            option_symbol = canonical_option_symbol(sym)
+            is_opt = option_symbol is not None
+            if is_opt:
+                sym = option_symbol
+            elif sym.upper().rstrip("*") in MONEY_MARKET_SYMBOLS:
+                continue
+            side = ("BUY" if ("BOUGHT" in action_upper or "REINVESTMENT" in action_upper)
+                    else ("SELL" if "SOLD" in action_upper else "OTHER"))
+            if side in ("BUY", "SELL"):
+                if not is_opt:
+                    sym = canonical_equity_symbol(sym, source_name, row_number)
+                missing_trade_cols = [key for key in ("qty", "price")
+                                      if key not in cmap or cmap[key] >= len(r)]
+                if missing_trade_cols:
+                    raise ValueError(
+                        f"{source_name} row {row_number}: recognized trade missing columns "
+                        + ", ".join(missing_trade_cols))
+                qty = abs(strict_fnum(r[cmap["qty"]], "trade quantity", source_name, row_number))
+                price = strict_fnum(r[cmap["price"]], "trade price", source_name, row_number)
+                amt = strict_fnum(amount_raw, "trade amount", source_name, row_number)
+            else:
+                qty = abs(fnum(r[cmap["qty"]])) if "qty" in cmap else 0.0
+                price = fnum(r[cmap["price"]]) if "price" in cmap else 0.0
+                amt = fnum(amount_raw)
+            rec = {"date": d, "side": side, "qty": qty,
+                   "price": price, "amount": amt,
+                   "account": account}
+            rec.update(_history_action_metadata(action, is_opt, side))
             if is_opt:
                 opt_txns[sym].append(rec)
             else:
+                if side not in ("BUY", "SELL"):
+                    continue
                 txns[sym].append(rec)
-                names.setdefault(sym, r[cmap["desc"]].strip())
+                desc = (r[cmap["desc"]].strip()
+                        if "desc" in cmap and cmap["desc"] < len(r) else sym)
+                names.setdefault(sym, desc)
                 if side == "BUY":
                     tot_buy += -rec["amount"]; n_buys += 1
                 elif side == "SELL":
                     tot_sell += rec["amount"]
+    if cmap is None:
+        raise ValueError(f"{source_name}: could not find a Run Date header")
     return {"txns": txns, "opt_txns": opt_txns, "names": names,
             "deposits": round(deposits, 2), "dividends": round(dividends, 2),
+            "corporateActions": round(corporate_actions, 2),
             "totals": (tot_buy, tot_sell), "dmin": dmin, "dmax": dmax,
             "n_buys": n_buys, "n_eft": n_eft, "n_div": n_div,
-            "cash_rows": cash_rows, "path": path}
+            "cash_rows": cash_rows, "path": path,
+            "accounts": sorted(accounts_seen),
+            "sourceFamily": ("account" if os.path.basename(path).startswith("Accounts_History")
+                             else "single_account")}
+
+POSITION_REQUIRED_COLUMNS = {
+    "account number", "symbol", "quantity", "current value",
+    "total gain/loss dollar", "cost basis total",
+}
+
+
+def _portfolio_snapshot_rows(path):
+    """Return header-mapped broker rows plus the embedded download timestamp."""
+    source = os.path.basename(path)
+    with open(path, encoding="utf-8-sig", newline="") as handle:
+        raw_rows = list(csv.reader(handle))
+    header_index = None
+    header = None
+    as_of = ""
+    for i, raw in enumerate(raw_rows):
+        first = raw[0].strip() if raw else ""
+        if first.startswith("Date downloaded"):
+            as_of = first[len("Date downloaded"):].strip()
+        normalized = [str(cell).strip().lower() for cell in raw]
+        if "account number" in normalized and "symbol" in normalized and "current value" in normalized:
+            header_index, header = i, normalized
+            break
+    if header is None:
+        raise ValueError(f"{source}: portfolio header not found")
+    missing = sorted(POSITION_REQUIRED_COLUMNS - set(header))
+    if missing:
+        raise ValueError(f"{source}: missing portfolio columns: {', '.join(missing)}")
+    nonempty = [name for name in header if name]
+    if len(nonempty) != len(set(nonempty)):
+        raise ValueError(f"{source}: duplicate portfolio column names")
+    indexes = {name: i for i, name in enumerate(header) if name}
+    rows = []
+    for row_number, raw in enumerate(raw_rows[header_index + 1:], header_index + 2):
+        def cell(name):
+            idx = indexes[name]
+            return raw[idx].strip() if idx < len(raw) else ""
+        account, symbol = cell("account number"), cell("symbol")
+        if not account or not symbol:
+            continue
+        rows.append((row_number, {name: cell(name) for name in indexes}))
+    if not rows:
+        raise ValueError(f"{source}: no recognized portfolio rows")
+    # The footer normally follows the table, so capture an as-of line that may
+    # appear after the header as well.
+    if not as_of:
+        for raw in raw_rows[header_index + 1:]:
+            first = raw[0].strip() if raw else ""
+            if first.startswith("Date downloaded"):
+                as_of = first[len("Date downloaded"):].strip()
+                break
+    return rows, as_of
+
+
+def _optional_position_number(value, field, source, row_number):
+    return (0.0 if str(value or "").strip() in ("", "--")
+            else strict_fnum(value, field, source, row_number))
+
 
 def parse_portfolio(path):
-    """Return dict: sym -> {shares, price, value, gain, cost, avg, gainpct}.
-
-    Sums every lot of a symbol across ALL accounts in the export — brokerage,
-    retirement, and other account ids. Match
-    account rows by an alphanumeric account id in col 0 (the header "Account
-    Number" and the trailing disclaimer paragraphs both contain spaces, so they
-    fail the regex). Skip money-market core positions (Fidelity flags these with
-    a "**" suffix: SPAXX**, FDRXX** — they're cash, counted separately), the
-    "Pending activity" line, blank symbols, and option rows (symbol starts "-").
-    """
+    """Return aggregated equities using a strict, header-driven broker schema."""
     cur = {}
-    with open(path) as f:
-        for r in csv.reader(f):
-            if len(r) < 14 or not re.match(r"^[A-Z0-9]{5,}$", r[0].strip()):
-                continue
-            sym = r[2].strip()
-            if sym.endswith("**") or sym in ("Pending activity", "") or sym.startswith("-"):
-                continue
-            shares, price, val = fnum(r[4]), fnum(r[5]), fnum(r[7])
-            cost = fnum(r[13])
-            # Total Gain/Loss ($) is col 10, but Fidelity sometimes prints "--"
-            # (e.g. after a same-day fill). For a long equity gain == value − cost
-            # exactly (verified against reported rows), so fall back to that rather
-            # than letting fnum("--")→0 zero out a real gain on a big holding.
-            g_raw = r[10].strip()
-            gain = fnum(g_raw) if g_raw not in ("", "--") else round(val - cost, 2)
-            d = cur.setdefault(sym, {"shares": 0.0, "price": price, "value": 0.0, "gain": 0.0, "cost": 0.0})
-            d["shares"] += shares; d["value"] += val; d["gain"] += gain; d["cost"] += cost; d["price"] = price
-    for d in cur.values():
-        d["avg"] = d["cost"] / d["shares"] if d["shares"] else 0
-        d["gainpct"] = d["gain"] / d["cost"] * 100 if d["cost"] else 0
+    source = os.path.basename(path)
+    rows, _ = _portfolio_snapshot_rows(path)
+    for row_number, row in rows:
+        sym = row["symbol"].strip()
+        cash_core = sym.endswith("**") or sym.upper().rstrip("*") in MONEY_MARKET_SYMBOLS
+        if cash_core or sym.lower() == "pending activity" or canonical_option_symbol(sym):
+            continue
+        sym = canonical_equity_symbol(sym, source, row_number)
+        shares = strict_fnum(row["quantity"], "position quantity", source, row_number)
+        val = strict_fnum(row["current value"], "position current value", source, row_number)
+        cost = strict_fnum(row["cost basis total"], "position cost basis", source, row_number)
+        price = _optional_position_number(row.get("last price"), "position last price", source, row_number)
+        if not price and shares:
+            price = val / shares
+        gain_raw = row["total gain/loss dollar"]
+        gain = (_optional_position_number(gain_raw, "position total gain", source, row_number)
+                if gain_raw not in ("", "--") else round(val - cost, 2))
+        data = cur.setdefault(sym, {"shares": 0.0, "price": price, "value": 0.0,
+                                    "gain": 0.0, "cost": 0.0})
+        data["shares"] += shares
+        data["value"] += val
+        data["gain"] += gain
+        data["cost"] += cost
+        data["price"] = price
+    for data in cur.values():
+        # A symbol can appear in several accounts.  Re-derive the aggregate
+        # mark from aggregate broker value/shares instead of trusting whichever
+        # account row happened to appear last in the export.
+        if data["shares"]:
+            data["price"] = data["value"] / data["shares"]
+        data["avg"] = data["cost"] / data["shares"] if data["shares"] else 0
+        data["gainpct"] = data["gain"] / data["cost"] * 100 if data["cost"] else 0
     return cur
 
+
 def parse_account_extras(path):
-    """Additive companion to parse_portfolio: returns exactly the rows the equity
-    parser SKIPS — cash core ('**'), option legs ('-'), and 'Pending activity' —
-    so whole-account net worth can be summed WITHOUT touching the broker-verified
-    equity path that sync.py asserts to the cent. Every value is broker Current
-    Value (col 7): a MARK, not delta/notional/Greeks. The margin DEBIT balance is
-    NOT in this export (only positive money-market cash appears)."""
+    """Return cash, pending, options, and account-level equity coverage."""
     cash, opt_legs = [], []
-    cash_total = pending = opt_net = opt_gross = 0.0
-    as_of = ""
-    with open(path) as f:
-        for r in csv.reader(f):
-            if r and r[0].strip().startswith("Date downloaded"):
-                as_of = r[0].strip()[len("Date downloaded"):].strip()
-            # len<8 (NOT <14): the 'Pending activity' row is 14 cols; data rows 17.
-            # Current Value is col 7, so 8 cols is the true minimum. Header,
-            # disclaimer paragraphs and blank lines contain spaces -> fail regex.
-            if len(r) < 8 or not re.match(r"^[A-Z0-9]{5,}$", r[0].strip()):
-                continue
-            acct, sym, val = r[0].strip(), r[2].strip(), fnum(r[7])
-            if sym.endswith("**"):
-                cash_total += val
-                cash.append({"acct": acct, "sym": sym, "value": round(val, 2)})
-            elif sym.startswith("-"):
-                # side = sign of the MARK (col 7), NOT the '-' symbol prefix (which
-                # is on ALL option rows). A long call also starts with '-'.
-                opt_net += val; opt_gross += abs(val)
-                opt_legs.append({"acct": acct, "sym": sym, "name": r[3].strip(),
-                                 "qty": fnum(r[4]), "mark": round(val, 2),
-                                 "side": "short" if val < 0 else "long",
-                                 "type": (r[15].strip() if len(r) > 15 else "")})
-            elif sym == "Pending activity":
-                pending += val
+    cash_by_account, equity_shares_by_account = {}, {}
+    cash_total = pending = opt_net = opt_gross = opt_pnl = opt_entry_cash = 0.0
+    source = os.path.basename(path)
+    rows, as_of = _portfolio_snapshot_rows(path)
+    for row_number, row in rows:
+        acct, raw_sym = row["account number"], row["symbol"]
+        sym = canonical_option_symbol(raw_sym) or raw_sym
+        pending_row = raw_sym.lower() == "pending activity"
+        val = (_optional_position_number(row["current value"], "pending current value", source, row_number)
+               if pending_row else strict_fnum(row["current value"], "position current value", source, row_number))
+        cash_core = raw_sym.endswith("**") or raw_sym.upper().rstrip("*") in MONEY_MARKET_SYMBOLS
+        if cash_core:
+            cash_total += val
+            cash_by_account[acct] = cash_by_account.get(acct, 0.0) + val
+            cash.append({"acct": acct, "sym": raw_sym, "value": round(val, 2)})
+        elif canonical_option_symbol(raw_sym):
+            qty = strict_fnum(row["quantity"], "option quantity", source, row_number)
+            cost_basis = _optional_position_number(
+                row["cost basis total"], "option cost basis", source, row_number)
+            broker_pnl = _optional_position_number(
+                row["total gain/loss dollar"], "option total gain", source, row_number)
+            opt_net += val
+            opt_gross += abs(val)
+            opt_pnl += broker_pnl
+            opt_entry_cash += cost_basis if qty < 0 else -cost_basis
+            opt_legs.append({"acct": acct, "sym": sym, "name": row.get("description", ""),
+                             "qty": qty, "mark": round(val, 2),
+                             "costBasis": round(cost_basis, 2),
+                             "brokerPnl": round(broker_pnl, 2),
+                             "side": "short" if qty < 0 else "long", "type": row.get("type", "")})
+        elif pending_row:
+            pending += val
+        else:
+            raw_sym = canonical_equity_symbol(raw_sym, source, row_number)
+            shares = strict_fnum(row["quantity"], "position quantity", source, row_number)
+            if shares:
+                by_sym = equity_shares_by_account.setdefault(acct, {})
+                by_sym[raw_sym] = by_sym.get(raw_sym, 0.0) + shares
     return {"cash": cash, "cashTotal": round(cash_total, 2),
             "pending": round(pending, 2), "optLegs": opt_legs,
             "optMarkNet": round(opt_net, 2), "optMarkGross": round(opt_gross, 2),
-            "asOf": as_of}
+            "optBrokerPnl": round(opt_pnl, 2), "optEntryCashNet": round(opt_entry_cash, 2),
+            "cashByAccount": {acct: round(value, 2) for acct, value in cash_by_account.items()},
+            "equitySharesByAccount": equity_shares_by_account, "asOf": as_of}
+
+
+def broker_snapshot_date(as_of):
+    match = re.search(r"\b([A-Z][a-z]{2}-\d{2}-\d{4})\b", str(as_of or ""))
+    if not match:
+        return None
+    try:
+        return datetime.datetime.strptime(match.group(1), "%b-%d-%Y").date().isoformat()
+    except ValueError:
+        return None
 
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
           "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
@@ -219,7 +491,7 @@ def parse_option_contract(leg):
     look like "QQQ JUN 18 2026 $711 CALL".
     """
     name = (leg.get("name") or "").upper()
-    m = re.search(r"\b([A-Z][A-Z0-9.]*)\s+([A-Z]{3})\s+(\d{1,2})\s+(\d{4})\s+\$([0-9.]+)\s+(CALL|PUT)\b", name)
+    m = re.search(r"\b([A-Z][A-Z0-9.]*)\s+([A-Z]{3})\s+(\d{1,2})\s+(\d{4})\s+\$([0-9,.]+)\s+(CALL|PUT)\b", name)
     if not m:
         return None
     mon = MONTHS.get(m.group(2))
@@ -228,7 +500,7 @@ def parse_option_contract(leg):
     expiry = datetime.date(int(m.group(4)), mon, int(m.group(3))).isoformat()
     return {"underlying": m.group(1), "expiry": expiry,
             "right": "C" if m.group(6) == "CALL" else "P",
-            "strike": float(m.group(5))}
+            "strike": float(m.group(5).replace(",", ""))}
 
 def build_option_spreads(opt_legs, asof):
     enriched = []
@@ -238,10 +510,13 @@ def build_option_spreads(opt_legs, asof):
             continue
         qty = fnum(leg.get("qty", 0))
         mark = fnum(leg.get("mark", 0))
+        cost_basis = fnum(leg.get("costBasis", 0))
+        broker_pnl = fnum(leg.get("brokerPnl", 0))
         contracts = abs(qty)
         mark_per_share = abs(mark) / (contracts * 100) if contracts else None
         enriched.append({**leg, **meta, "idx": idx, "qty": qty, "contracts": contracts,
-                         "mark": mark, "markPerShare": _rn(mark_per_share, 2)})
+                         "mark": mark, "costBasis": cost_basis, "brokerPnl": broker_pnl,
+                         "markPerShare": _rn(mark_per_share, 2)})
 
     groups = {}
     for leg in enriched:
@@ -252,45 +527,145 @@ def build_option_spreads(opt_legs, asof):
     for (acct, und, expiry, right), legs in groups.items():
         longs = sorted([x for x in legs if x["qty"] > 0], key=lambda x: x["strike"])
         shorts = sorted([x for x in legs if x["qty"] < 0], key=lambda x: x["strike"])
-        used_l = set(); used_s = set()
-        for li, lg in enumerate(longs):
-            for si, sh in enumerate(shorts):
-                if li in used_l or si in used_s:
-                    continue
-                contracts = min(lg["contracts"], sh["contracts"])
+        # Pair quantities, not merely leg rows. One three-contract long can
+        # define risk against several short rows (and vice versa); marking a
+        # whole row "used" after the first match incorrectly left valid hedges
+        # classified as naked. Nearest-strike allocation is deterministic, and
+        # complex groups remain explicitly flagged for payoff-level review.
+        remaining = {leg["idx"]: leg["contracts"] for leg in legs}
+        complex_group = len(longs) + len(shorts) > 2
+        for lg in longs:
+            candidates = sorted(shorts, key=lambda sh: (abs(sh["strike"] - lg["strike"]), sh["strike"]))
+            for sh in candidates:
+                contracts = min(remaining[lg["idx"]], remaining[sh["idx"]])
                 if contracts <= 0:
                     continue
                 width = abs(sh["strike"] - lg["strike"])
                 width_value = width * contracts * 100
-                net_mark = lg["mark"] + sh["mark"]
+                long_fraction = contracts / lg["contracts"] if lg["contracts"] else 0
+                short_fraction = contracts / sh["contracts"] if sh["contracts"] else 0
+                long_mark = lg["mark"] * long_fraction
+                short_mark = sh["mark"] * short_fraction
+                net_mark = long_mark + short_mark
+                long_cost = lg["costBasis"] * long_fraction
+                short_credit = sh["costBasis"] * short_fraction
+                current_pnl = lg["brokerPnl"] * long_fraction + sh["brokerPnl"] * short_fraction
                 if right == "C" and lg["strike"] < sh["strike"]:
-                    kind = "bull call debit spread"; expected = [0, width_value]
+                    kind = "bull call debit spread"; expected = [0, width_value]; entry_kind = "debit"
                 elif right == "C":
-                    kind = "bear call credit spread"; expected = [-width_value, 0]
+                    kind = "bear call credit spread"; expected = [-width_value, 0]; entry_kind = "credit"
                 elif right == "P" and lg["strike"] > sh["strike"]:
-                    kind = "bear put debit spread"; expected = [0, width_value]
+                    kind = "bear put debit spread"; expected = [0, width_value]; entry_kind = "debit"
                 else:
-                    kind = "bull put credit spread"; expected = [-width_value, 0]
+                    kind = "bull put credit spread"; expected = [-width_value, 0]; entry_kind = "credit"
+                entry_debit = max(0.0, long_cost - short_credit) if entry_kind == "debit" else None
+                entry_credit = max(0.0, short_credit - long_cost) if entry_kind == "credit" else None
+                max_loss = (entry_debit if entry_kind == "debit"
+                            else (width_value - entry_credit if entry_credit is not None else None))
+                max_profit = ((width_value - entry_debit) if entry_kind == "debit" and entry_debit is not None
+                              else entry_credit)
                 dte = None
                 try:
                     dte = (datetime.date.fromisoformat(expiry) - datetime.date.fromisoformat(asof)).days
                 except Exception:
                     pass
                 warn = []
+                if complex_group:
+                    warn.append("多腿/比例仓位按最邻近执行价分解；请核对组合级到期收益")
                 if net_mark < expected[0] - 1 or net_mark > expected[1] + 1:
                     warn.append("当前净 mark 超出垂直价差理论范围，请核对券商报价/腿配对")
                 out.append({
                     "underlying": und, "acct": acct, "expiry": expiry, "right": right,
+                    "longSym": lg.get("sym"), "shortSym": sh.get("sym"),
                     "longStrike": _rn(lg["strike"]), "shortStrike": _rn(sh["strike"]),
                     "contracts": _rn(contracts, 3), "kind": kind, "width": _rn(width),
                     "widthValue": _rn(width_value), "netMark": _rn(net_mark),
+                    "entryType": entry_kind, "entryDebit": _rn(entry_debit),
+                    "entryCredit": _rn(entry_credit), "maxLoss": _rn(max_loss),
+                    "maxProfit": _rn(max_profit), "currentPnl": _rn(current_pnl),
                     "expectedRange": [_rn(expected[0]), _rn(expected[1])], "dte": dte,
-                    "longMark": _rn(lg["mark"]), "shortMark": _rn(sh["mark"]),
+                    "longMark": _rn(long_mark), "shortMark": _rn(short_mark),
                     "warnings": warn,
                 })
-                used_l.add(li); used_s.add(si)
-                break
+                remaining[lg["idx"]] -= contracts
+                remaining[sh["idx"]] -= contracts
+                if remaining[lg["idx"]] <= 1e-9:
+                    break
     return out
+
+
+def build_unpaired_option_risk(account, spreads):
+    """Classify residual option legs after vertical pairing.
+
+    Coverage uses same-account shares/cash from the broker snapshot.  Known
+    cash is deliberately conservative because margin buying power is absent.
+    """
+    from collections import Counter
+    paired = Counter()
+    for spread in spreads or []:
+        contracts = fnum(spread.get("contracts"))
+        paired[(spread.get("acct"), spread.get("longSym"))] += contracts
+        paired[(spread.get("acct"), spread.get("shortSym"))] += contracts
+    shares = {acct: dict(rows) for acct, rows in (account.get("equitySharesByAccount") or {}).items()}
+    cash = dict(account.get("cashByAccount") or {})
+    rows = []
+    summary = {"unpairedLegs": 0, "marginShortPutContracts": 0.0,
+               "cashSecuredPutContracts": 0.0, "shortPutAssignmentValue": 0.0,
+               "coveredCallContracts": 0.0, "uncoveredCallContracts": 0.0,
+               "longPremiumAtRisk": 0.0}
+    for leg in account.get("optLegs") or []:
+        total = abs(fnum(leg.get("qty")))
+        residual = max(0.0, total - paired[(leg.get("acct"), leg.get("sym"))])
+        if residual <= 1e-9:
+            continue
+        fraction = residual / total if total else 0.0
+        meta = parse_option_contract(leg)
+        base = {"acct": leg.get("acct"), "sym": leg.get("sym"), "name": leg.get("name"),
+                "contracts": _rn(residual, 3), "currentPnl": _rn(fnum(leg.get("brokerPnl")) * fraction),
+                "costBasis": _rn(fnum(leg.get("costBasis")) * fraction)}
+        summary["unpairedLegs"] += 1
+        if not meta:
+            rows.append({**base, "riskClass": "DATA_REVIEW", "riskNote": "contract metadata could not be parsed"})
+            continue
+        und, strike, right = meta["underlying"], meta["strike"], meta["right"]
+        acct = leg.get("acct")
+        if fnum(leg.get("qty")) > 0:
+            premium = fnum(leg.get("costBasis")) * fraction
+            summary["longPremiumAtRisk"] += premium
+            rows.append({**base, **meta, "riskClass": "LONG_PREMIUM",
+                         "maxLoss": _rn(premium), "riskNote": "maximum loss is entry debit"})
+        elif right == "P":
+            obligation = strike * 100 * residual
+            credit = fnum(leg.get("costBasis")) * fraction
+            available = max(0.0, fnum(cash.get(acct)))
+            secured = min(residual, math.floor(available / (strike * 100))) if strike else 0.0
+            margin = residual - secured
+            cash[acct] = max(0.0, available - secured * strike * 100)
+            summary["cashSecuredPutContracts"] += secured
+            summary["marginShortPutContracts"] += margin
+            summary["shortPutAssignmentValue"] += obligation
+            rows.append({**base, **meta,
+                         "riskClass": "CASH_SECURED_PUT" if margin <= 0 else "MARGIN_SHORT_PUT",
+                         "assignmentValue": _rn(obligation), "maxLoss": _rn(obligation - credit),
+                         "knownCash": _rn(available),
+                         "riskNote": ("covered by known same-account cash" if margin <= 0
+                                      else "not cash-secured by known same-account cash; margin/buying power unavailable")})
+        else:
+            available = max(0.0, fnum((shares.get(acct) or {}).get(und)))
+            covered = min(residual, math.floor(available / 100))
+            uncovered = residual - covered
+            shares.setdefault(acct, {})[und] = max(0.0, available - covered * 100)
+            summary["coveredCallContracts"] += covered
+            summary["uncoveredCallContracts"] += uncovered
+            rows.append({**base, **meta,
+                         "riskClass": "COVERED_CALL" if uncovered <= 0 else "UNCOVERED_CALL",
+                         "coveredContracts": _rn(covered, 3), "uncoveredContracts": _rn(uncovered, 3),
+                         "riskNote": ("covered by same-account shares; assignment caps upside" if uncovered <= 0
+                                      else "uncovered call contracts have unbounded upside risk")})
+    for key in summary:
+        if key != "unpairedLegs":
+            summary[key] = _rn(summary[key])
+    return {"summary": summary, "rows": rows}
 
 # ---------------------------------------------------------------- classification
 # fact-checked vs LIVE yfinance .info on 2026-06-02; this map's ONLY job is the
@@ -358,9 +733,10 @@ def sector_to_theme(rec):
 # ---------------------------------------------------------------- merge
 def merge_histories(parsed):
     """Merge trades across overlapping exports. Each real transaction appears
-    once per export that covers its date; overlapping exports repeat it. So we
-    take, per identical-transaction key, the MAX count seen in any single file
-    (not the sum) — robust dedup that preserves genuine same-day duplicates.
+    once per export that covers its date; overlapping exports repeat it.  For a
+    key present in multiple files, the newest parsed export's multiplicity wins.
+    This preserves genuine same-day duplicate fills while allowing a later
+    broker export to correct a transient duplicate in an older file.
 
     Amount is intentionally not part of the identity key: Fidelity sometimes
     changes commission/fee rounding by a cent between overlapping exports. In
@@ -376,70 +752,218 @@ def merge_histories(parsed):
         for sym, L in h["txns"].items():
             names.setdefault(sym, h["names"].get(sym, sym))
             for t in L:
+                action_type = t.get("actionType") or ("TRADE" if t["side"] in ("BUY", "SELL") else "OTHER")
                 k = (t.get("account", ""), t["date"], t["side"], sym,
-                     round(t["qty"], 3), round(t["price"], 2))
+                     round(t["qty"], 3), round(t["price"], 2), action_type,
+                     t.get("settlementType"))
                 fsc[k] += 1
                 fsa[k].append(round(t["amount"], 2))
         for sym, L in h["opt_txns"].items():
             for t in L:
+                action_type = t.get("actionType") or ("TRADE" if t["side"] in ("BUY", "SELL") else "OTHER")
                 k = (t.get("account", ""), t["date"], t["side"], sym,
-                     round(t["qty"], 3), round(t["price"], 2))
+                     round(t["qty"], 3), round(t["price"], 2), action_type,
+                     t.get("settlementType"))
                 foc[k] += 1
                 foa[k].append(round(t["amount"], 2))
         for k, n in fsc.items():
-            if n >= sc[k]:
-                sc[k] = n
-                sa[k] = fsa[k]
+            sc[k] = n
+            sa[k] = fsa[k]
         for k, n in foc.items():
-            if n >= oc[k]:
-                oc[k] = n
-                oa[k] = foa[k]
+            oc[k] = n
+            oa[k] = foa[k]
     txns, opt = defaultdict(list), defaultdict(list)
     for store, src, amts in ((txns, sc, sa), (opt, oc, oa)):
-        for (acct, d, side, sym, qty, price), n in src.items():
-            vals = amts.get((acct, d, side, sym, qty, price), [0.0])
+        for (acct, d, side, sym, qty, price, action_type, settlement_type), n in src.items():
+            vals = amts.get((acct, d, side, sym, qty, price, action_type, settlement_type), [0.0])
             for i in range(n):
                 amt = vals[i] if i < len(vals) else vals[-1]
-                store[sym].append({"date": d, "side": side, "qty": qty,
-                                   "price": price, "amount": amt, "account": acct})
+                row = {"date": d, "side": side, "qty": qty,
+                       "price": price, "amount": amt, "account": acct,
+                       "actionType": action_type}
+                if settlement_type:
+                    row["settlementType"] = settlement_type
+                store[sym].append(row)
     for L in txns.values():
+        L.sort(key=lambda t: t["date"])
+    for L in opt.values():
         L.sort(key=lambda t: t["date"])
     return txns, opt, names
 
+
+def partition_equity_option_settlements(txns):
+    """Separate paired stock-delivery settlements from the equity cost ledger.
+
+    A same-account/day/symbol exercise + assignment with equal bought and sold
+    shares has zero net equity exposure.  Walking both legs through an average-
+    cost stock ledger manufactures equity realized P&L from what is actually an
+    option lifecycle cash settlement.  Such groups are reported separately and
+    omitted from the stock ledger.  Unpaired delivery remains in the ledger so
+    the resulting share change is preserved, with action provenance intact.
+    """
+    groups = {}
+    for sym, rows in (txns or {}).items():
+        for row in rows:
+            if row.get("actionType") != "OPTION_SETTLEMENT":
+                continue
+            key = (row.get("account", ""), row["date"], sym)
+            groups.setdefault(key, []).append(row)
+
+    paired_keys = set()
+    settlements = []
+    for (account, date_text, sym), rows in groups.items():
+        bought = sum(fnum(t.get("qty")) for t in rows if t.get("side") == "BUY")
+        sold = sum(fnum(t.get("qty")) for t in rows if t.get("side") == "SELL")
+        net_shares = bought - sold
+        paired = bought > 0 and sold > 0 and abs(net_shares) <= 1e-6
+        if paired:
+            paired_keys.add((account, date_text, sym))
+        settlements.append({
+            "account": account, "date": date_text, "sym": sym,
+            "boughtShares": _rn(bought, 3), "soldShares": _rn(sold, 3),
+            "netShares": _rn(net_shares, 3),
+            "netCash": _rn(sum(fnum(t.get("amount")) for t in rows)),
+            "pairedNetZero": paired,
+            "accountingTreatment": ("excluded_from_equity_realized" if paired
+                                    else "included_in_share_accounting"),
+            "txns": [{
+                "date": t["date"], "side": t.get("side"),
+                "qty": _rn(fnum(t.get("qty")), 3), "price": _rn(fnum(t.get("price"))),
+                "amount": _rn(fnum(t.get("amount"))),
+                "actionType": t.get("actionType"),
+                "settlementType": t.get("settlementType"),
+            } for t in rows],
+        })
+
+    accounting = {}
+    for sym, rows in (txns or {}).items():
+        kept = []
+        for row in rows:
+            key = (row.get("account", ""), row["date"], sym)
+            if row.get("actionType") == "OPTION_SETTLEMENT" and key in paired_keys:
+                continue
+            kept.append(row)
+        if kept:
+            accounting[sym] = kept
+    settlements.sort(key=lambda x: (x["date"], x["account"], x["sym"]))
+    return accounting, settlements
+
+def resolve_history_start(txns, explicit_start=None):
+    """Return the requested analysis start, defaulting to the earliest trade.
+
+    A gap between trades is not evidence of a missing broker export: a portfolio
+    can legitimately remain untouched for weeks or months.  Windowing is
+    therefore explicit.  ``explicit_start`` may pre-date the first trade (the
+    opening position is then inferred from the current snapshot and all known
+    transactions), but it may not be later than the latest known trade.
+    """
+    dates = sorted({t["date"] for L in txns.values() for t in L})
+    if not dates:
+        return None
+    if explicit_start is None:
+        return dates[0]
+    try:
+        datetime.date.fromisoformat(explicit_start)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("history start must be YYYY-MM-DD") from exc
+    if explicit_start > dates[-1]:
+        raise ValueError("history start is later than the latest known trade")
+    return explicit_start
+
+
 def continuous_start(txns, gap_days=20):
-    """Largest gap-free span ending at the latest trade: returns the first date
-    after the last coverage gap >= gap_days (missing-data hole, not a quiet week)."""
+    """Backward-compatible history diagnostic; never truncates on trade gaps.
+
+    The returned gaps are informational only.  Callers must use the first return
+    value (the earliest known trade), not treat inactivity as missing history.
+    """
     dates = sorted({t["date"] for L in txns.values() for t in L})
     if not dates:
         return None, []
-    start = dates[0]
     gaps = []
     for a, b in zip(dates, dates[1:]):
         if (datetime.date.fromisoformat(b) - datetime.date.fromisoformat(a)).days >= gap_days:
-            gaps.append((a, b)); start = b
-    return start, gaps
+            gaps.append((a, b))
+    return dates[0], gaps
 
-def union_cash(parsed, lo, hi):
-    """Deduped union of cash rows across all exports, within [lo, hi]."""
-    seen = set()
-    dep = div = 0.0
+
+def union_cash_events(parsed, lo, hi):
+    """Return deduplicated, dated cash events across overlapping exports."""
+    events = {}
     for h in parsed:
-        for d, kind, amt in h["cash_rows"]:
-            if not (lo <= d <= hi):
-                continue
-            key = (d, kind, amt)
-            if key in seen:
-                continue
-            seen.add(key)
-            if kind in ("EFT", "TRANSFER"):
-                dep += amt
-            elif kind == "DIV":
-                div += amt
-    return round(dep, 2), round(div, 2)
+        file_rows = {}
+        for row in h["cash_rows"]:
+            d, kind, amt = row[:3]
+            account = row[3] if len(row) > 3 else ""
+            file_rows.setdefault((account, kind, amt), []).append(d)
+        for base, dates in file_rows.items():
+            account, kind, amt = base
+            tolerance = 3 if kind in ("EFT", "TRANSFER") else 0
+            bucket = events.setdefault(base, [])
+            preexisting = len(bucket)
+            used = set()
+            for date_text in sorted(dates):
+                date_obj = datetime.date.fromisoformat(date_text)
+                candidates = []
+                for idx, event in enumerate(bucket):
+                    if idx in used:
+                        continue
+                    gap = abs((date_obj - datetime.date.fromisoformat(event["date"])).days)
+                    if gap <= tolerance:
+                        candidates.append((gap, idx))
+                if candidates:
+                    _, idx = min(candidates)
+                    bucket[idx]["date"] = date_text
+                    used.add(idx)
+                else:
+                    bucket.append({"date": date_text})
+                    used.add(len(bucket) - 1)
+            current_dates = [datetime.date.fromisoformat(d) for d in dates]
+            remove = []
+            for idx in range(preexisting):
+                if idx in used:
+                    continue
+                event_date = datetime.date.fromisoformat(bucket[idx]["date"])
+                if any(abs((event_date - current).days) <= tolerance for current in current_dates):
+                    remove.append(idx)
+            for idx in reversed(remove):
+                del bucket[idx]
+
+    out = []
+    for (account, kind, amt), bucket in events.items():
+        for event in bucket:
+            if lo <= event["date"] <= hi:
+                out.append({"date": event["date"], "kind": kind,
+                            "amount": round(amt, 2), "account": account})
+    return sorted(out, key=lambda x: (x["date"], x["account"], x["kind"], x["amount"]))
+
+def union_cash(parsed, lo, hi, include_corporate_actions=False):
+    """Stitch cash events across mutable overlapping broker snapshots.
+
+    EFT run dates can migrate by a few days while pending.  Event instances are
+    therefore matched by account/kind/amount across consecutive exports with a
+    three-day tolerance.  Each existing event may match only once per file, so
+    two identical transfers present together remain two real events.  Dividend
+    dates use zero tolerance to avoid collapsing recurring distributions.
+    """
+    dep = div = corporate = 0.0
+    for event in union_cash_events(parsed, lo, hi):
+        kind, amt = event["kind"], event["amount"]
+        if kind in ("EFT", "TRANSFER"):
+            dep += amt
+        elif kind == "DIV":
+            div += amt
+        elif kind == "CORPORATE_ACTION":
+            corporate += amt
+    totals = (round(dep, 2), round(div, 2))
+    if include_corporate_actions:
+        return totals + (round(corporate, 2),)
+    return totals
 
 # ---------------------------------------------------------------- prices
 # Module-level fetch status so the dashboard can warn the trader when prices are stale (correctness > silence)
 FETCH_STATUS = {"ok": True, "stale": False, "reason": None, "cacheAgeDays": 0}
+MARK_STATUS = {"freshSymbols": [], "staleSymbols": {}, "missingSymbols": [], "oldestAsOf": None}
 
 
 def _cache_age_days():
@@ -447,19 +971,38 @@ def _cache_age_days():
         return 0
     return max(0, int((datetime.datetime.now().timestamp() - os.path.getmtime(CACHE)) / 86400))
 
-def _ensure_parent(path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _write_json_atomic(path, payload):
+    atomic_write_json(path, payload)
+
+
+def _write_text_atomic_private(path, text):
+    """Atomically replace a private artifact, preserving last-known-good output."""
+    atomic_write_text(path, text)
+
+
+def _configure_yfinance(yf):
+    """Keep yfinance's SQLite timezone cache in a known writable directory."""
+    cache_dir = os.path.join(HERE, "output", "yfinance_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    setter = getattr(yf, "set_tz_cache_location", None)
+    if setter:
+        setter(cache_dir)
 
 
 def fetch_prices(tickers, start, end, no_fetch=False):
     global FETCH_STATUS
-    if no_fetch and os.path.exists(CACHE):
-        print("· using cached prices (--no-fetch)")
-        FETCH_STATUS = {"ok": True, "stale": True, "reason": "--no-fetch", "cacheAgeDays": _cache_age_days()}
-        return json.load(open(CACHE))
+    if no_fetch:
+        if os.path.exists(CACHE):
+            print("· using cached prices (--no-fetch)")
+            FETCH_STATUS = {"ok": True, "stale": True, "reason": "--no-fetch", "cacheAgeDays": _cache_age_days()}
+            return json.load(open(CACHE))
+        print("!! --no-fetch requested but no price cache exists")
+        FETCH_STATUS = {"ok": False, "stale": True, "reason": "--no-fetch; cache missing", "cacheAgeDays": 0}
+        return {}
     try:
         import warnings; warnings.filterwarnings("ignore")
         import yfinance as yf
+        _configure_yfinance(yf)
     except ImportError:
         print("!! yfinance not installed (pip install yfinance). Falling back to cache.")
         FETCH_STATUS = {"ok": False, "stale": True, "reason": "yfinance 未安装", "cacheAgeDays": _cache_age_days()}
@@ -481,8 +1024,11 @@ def fetch_prices(tickers, start, end, no_fetch=False):
         print(f"!! fetch failed ({e}); using cache if available")
         FETCH_STATUS = {"ok": False, "stale": True, "reason": f"Yahoo 拉取失败：{type(e).__name__}", "cacheAgeDays": _cache_age_days()}
         return json.load(open(CACHE)) if os.path.exists(CACHE) else {}
-    FETCH_STATUS = {"ok": True, "stale": False, "reason": None, "cacheAgeDays": 0}
+    downloaded = sorted(out)
     missing = [t for t in tickers if t not in out]
+    FETCH_STATUS = {"ok": True, "stale": False, "reason": None, "cacheAgeDays": 0,
+                    "downloadedCount": len(downloaded), "requestedCount": len(tickers),
+                    "downloadPartial": bool(missing), "downloadMissingSymbols": missing}
     print(f"· got {len(out)}/{len(tickers)} tickers" + (f"  missing: {missing}" if missing else ""))
     if os.path.exists(CACHE):
         try:
@@ -494,8 +1040,7 @@ def fetch_prices(tickers, start, end, no_fetch=False):
             out = old
         except Exception:
             pass
-    _ensure_parent(CACHE)
-    json.dump(out, open(CACHE, "w"))
+    _write_json_atomic(CACHE, out)
     return out
 
 def fetch_ohlc(tickers, start, end, no_fetch=False):
@@ -511,6 +1056,7 @@ def fetch_ohlc(tickers, start, end, no_fetch=False):
     try:
         import warnings; warnings.filterwarnings("ignore")
         import yfinance as yf
+        _configure_yfinance(yf)
     except ImportError:
         print("!! yfinance not installed. OHLC strategy data from cache only.")
         return json.load(open(OHLC_CACHE)) if os.path.exists(OHLC_CACHE) else {}
@@ -549,8 +1095,7 @@ def fetch_ohlc(tickers, start, end, no_fetch=False):
         except Exception:
             pass
     try:
-        _ensure_parent(OHLC_CACHE)
-        json.dump(out, open(OHLC_CACHE, "w"))
+        _write_json_atomic(OHLC_CACHE, out)
     except Exception:
         pass
     return out
@@ -572,6 +1117,7 @@ def fetch_sectors(tickers, no_fetch=False, per_ticker_timeout=4.0, total_budget=
         return cache
     try:
         import warnings; warnings.filterwarnings("ignore"); import yfinance as yf
+        _configure_yfinance(yf)
     except ImportError:
         print("· yfinance missing; sectors from cache only")
         return cache
@@ -585,7 +1131,7 @@ def fetch_sectors(tickers, no_fetch=False, per_ticker_timeout=4.0, total_budget=
     if not todo:
         return cache
     print(f"· fetching sectors for {len(todo)} names ...")
-    now = datetime.datetime.now().isoformat(timespec="seconds")
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     deadline = time.time() + total_budget
     def one(t):
         i = yf.Ticker(t).get_info() or {}
@@ -611,25 +1157,43 @@ def fetch_sectors(tickers, no_fetch=False, per_ticker_timeout=4.0, total_budget=
     got = sum(1 for t in tickers if t in cache)
     print(f"· sectors: {got}/{len(tickers)} cached")
     try:
-        _ensure_parent(SECTORS_CACHE)
-        json.dump(cache, open(SECTORS_CACHE, "w"))
+        _write_json_atomic(SECTORS_CACHE, cache)
     except Exception:
         pass
     return cache
 
-def price_on(prices, sym, isodate):
+def price_on(prices, sym, isodate, *, max_age_calendar_days=7):
+    """Return an as-of close without future fill or indefinite stale carry.
+
+    The short backward allowance supports weekends/holidays for behavioral and
+    opening-inventory estimates. Calculation paths that require an exact market
+    close pass ``max_age_calendar_days=0`` and therefore break on a data hole.
+    """
     ps = prices.get(sym, {})
     if not ps:
         return None
     if isodate in ps:
         return ps[isodate]
     prev = None
+    prev_date = None
     for k in sorted(ps):
         if k <= isodate:
             prev = ps[k]
+            prev_date = k
         else:
             break
-    return prev if prev is not None else ps[min(ps)]
+    # Never borrow a future close for an earlier valuation date. Before the
+    # first observed price the position is unpriceable. Equally, never carry a
+    # delisted/halted/missing quote indefinitely and flatten the portfolio path.
+    if prev is None:
+        return None
+    try:
+        age = (datetime.date.fromisoformat(isodate) - datetime.date.fromisoformat(prev_date)).days
+    except (TypeError, ValueError):
+        return None
+    if max_age_calendar_days is not None and age > max_age_calendar_days:
+        return None
+    return prev
 
 def market_axis(prices, dmin, dmax):
     """Market-day axis shared by the real and counterfactual portfolio paths."""
@@ -661,10 +1225,16 @@ def mark_to_market(cur, prices, asof):
     and option marks as the broker snapshot because Yahoo close data is not a
     reliable option-chain valuation source.
     """
+    global MARK_STATUS
     refreshed = {}
+    fresh, stale, missing = [], {}, []
     for sym, d in cur.items():
-        px = price_on(prices, sym, asof)
+        series = prices.get(sym) or {}
+        dates = sorted(day for day in series if day <= asof)
+        used_date = dates[-1] if dates else None
+        px = series.get(used_date) if used_date else None
         if not px or not d.get("shares"):
+            missing.append(sym)
             continue
         shares = d["shares"]
         cost = d.get("cost", 0.0)
@@ -676,7 +1246,33 @@ def mark_to_market(cur, prices, asof):
         d["gainpct"] = gain / cost * 100 if cost else 0.0
         d["avg"] = cost / shares if shares else 0.0
         refreshed[sym] = round(px, 4)
+        if used_date == asof:
+            fresh.append(sym)
+        else:
+            stale[sym] = used_date
+    used_dates = [asof] * len(fresh) + [d for d in stale.values() if d]
+    MARK_STATUS = {"freshSymbols": sorted(fresh), "staleSymbols": stale,
+                   "missingSymbols": sorted(missing),
+                   "oldestAsOf": min(used_dates) if used_dates else None}
     return refreshed
+
+
+def reconcile_fetch_freshness(target_asof, price_asof):
+    """Align network/cache status with per-held-symbol as-of evidence."""
+    stale_n = len(MARK_STATUS.get("staleSymbols") or {})
+    missing_n = len(MARK_STATUS.get("missingSymbols") or [])
+    if stale_n or missing_n:
+        FETCH_STATUS["stale"] = True
+        detail = []
+        if stale_n:
+            detail.append(f"{stale_n} held symbols stale")
+        if missing_n:
+            detail.append(f"{missing_n} held symbols missing")
+        FETCH_STATUS["reason"] = "; ".join(detail)
+    elif price_asof == target_asof:
+        FETCH_STATUS["stale"] = False
+        if FETCH_STATUS.get("reason") == "--no-fetch":
+            FETCH_STATUS["reason"] = "exact-date cache verified"
 
 # ---------------------------------------------------------------- Fibonacci indicators
 def _ema(vals, n):
@@ -688,22 +1284,31 @@ def _ema(vals, n):
     return out
 
 def _rsi(vals, n=14):
+    """Wilder RSI with an explicit, non-predictive warm-up.
+
+    Before ``n`` returns exist, RSI is neutral (50) rather than backfilled from
+    the first future-computable value.  A completely flat window is also 50;
+    gains with no losses are 100 and losses with no gains are 0.
+    """
     out = [50.0] * len(vals)
     if len(vals) <= n:
         return out
+    def value(avg_gain, avg_loss):
+        if avg_loss == 0:
+            return 50.0 if avg_gain == 0 else 100.0
+        if avg_gain == 0:
+            return 0.0
+        rs = avg_gain / avg_loss
+        return 100 - 100 / (1 + rs)
     deltas = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
     ag = sum(d for d in deltas[:n] if d > 0) / n
     al = sum(-d for d in deltas[:n] if d < 0) / n
-    rs = ag / al if al > 0 else 999
-    out[n] = 100 - 100 / (1 + rs)
+    out[n] = value(ag, al)
     for i in range(n + 1, len(vals)):
         d = deltas[i - 1]
         ag = (ag * (n - 1) + max(d, 0)) / n
         al = (al * (n - 1) + max(-d, 0)) / n
-        rs = ag / al if al > 0 else 999
-        out[i] = 100 - 100 / (1 + rs)
-    for i in range(n):
-        out[i] = out[n]
+        out[i] = value(ag, al)
     return out
 
 # Momentum oscillator scale: the divisor on the EMA5-vs-EMA21 separation inside
@@ -768,8 +1373,10 @@ def compute_fib(items):
             lg = i
         if i >= 1 and e5[i - 1] >= e13[i - 1] and e5[i] < e13[i]:
             ld = i
-        bull = state[i] == "up" and (i - lg) <= 3 and rsi[i] < 70
-        bear = state[i] == "down" and (i - ld) <= 3 and rsi[i] > 30
+        # RSI requires 14 completed returns.  Neutral warm-up values are for
+        # display continuity only and must not authorize a resonance signal.
+        bull = i >= 14 and state[i] == "up" and (i - lg) <= 3 and rsi[i] < 70
+        bear = i >= 14 and state[i] == "down" and (i - ld) <= 3 and rsi[i] > 30
         cur = "bull" if bull else ("bear" if bear else None)
         if cur and cur != active:
             res.append({"date": dates[i], "price": round(px[i], 2), "rsi": round(rsi[i], 1), "type": cur})
@@ -808,18 +1415,21 @@ def _ohlc_rows(prices, ohlc, sym, dmax):
     return rows, "close-proxy"
 
 def _atr14(rows):
+    """Wilder ATR14; values before the first complete window are unavailable."""
     out, trs, prev_close, prev_atr = [], [], None, None
     for r in rows:
         h, l, c = r["high"], r["low"], r["close"]
         tr = (h - l) if prev_close is None else max(h - l, abs(h - prev_close), abs(l - prev_close))
         trs.append(tr)
         if len(trs) < 14:
-            atr = sum(trs) / len(trs)
+            atr = None
         elif len(trs) == 14:
             atr = sum(trs[-14:]) / 14.0
         else:
             atr = (prev_atr * 13 + tr) / 14.0
-        prev_atr, prev_close = atr, c
+        if atr is not None:
+            prev_atr = atr
+        prev_close = c
         out.append(atr)
     return out
 
@@ -856,6 +1466,34 @@ def _option_underlying(sym="", name=""):
     meta = parse_option_contract({"name": name or ""})
     return meta.get("underlying") if meta else None
 
+
+OPTION_TERMINAL_ACTION_TYPES = {"EXPIRED", "ASSIGNED", "EXERCISED"}
+
+
+def _option_lifecycle_net_qty(rows):
+    """Open contracts after applying expiry/exercise/assignment events."""
+    net_qty = 0.0
+    ordered = sorted(rows or [], key=lambda t: (
+        t.get("date", ""), t.get("actionType") in OPTION_TERMINAL_ACTION_TYPES))
+    for row in ordered:
+        action_type = row.get("actionType") or (
+            "TRADE" if row.get("side") in ("BUY", "SELL") else "OTHER")
+        qty = abs(fnum(row.get("qty")))
+        if action_type in OPTION_TERMINAL_ACTION_TYPES:
+            if qty <= 1e-9:
+                net_qty = 0.0
+            elif net_qty > 0:
+                net_qty = max(0.0, net_qty - qty)
+            elif net_qty < 0:
+                net_qty = min(0.0, net_qty + qty)
+            continue
+        if row.get("side") == "BUY":
+            net_qty += qty
+        elif row.get("side") == "SELL":
+            net_qty -= qty
+    return net_qty
+
+
 def _option_trade_summary(opt_txns, underlyings):
     out = []
     wanted = set(underlyings)
@@ -863,14 +1501,18 @@ def _option_trade_summary(opt_txns, underlyings):
         und = _option_underlying(sym=sym)
         if und not in wanted:
             continue
-        tl = sorted(L, key=lambda x: x["date"])
+        tl = sorted(L, key=lambda x: (
+            x["date"], x.get("actionType") in OPTION_TERMINAL_ACTION_TYPES))
         net_cash = sum(t["amount"] for t in tl)
-        net_qty = sum((t["qty"] if t["side"] == "BUY" else -t["qty"]) for t in tl)
+        net_qty = _option_lifecycle_net_qty(tl)
         out.append({"underlying": und, "sym": sym, "lastDate": tl[-1]["date"] if tl else None,
                     "netCash": _rn(net_cash), "netQty": _rn(net_qty, 3),
                     "trades": len(tl),
                     "txns": [{"date": t["date"], "side": t["side"], "qty": t["qty"],
-                              "price": t["price"], "amount": _rn(t["amount"])} for t in tl]})
+                              "price": t["price"], "amount": _rn(t["amount"]),
+                              "actionType": t.get("actionType") or (
+                                  "TRADE" if t.get("side") in ("BUY", "SELL") else "OTHER")}
+                             for t in tl]})
     return out
 
 def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
@@ -889,6 +1531,18 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     trows, tsrc = _ohlc_rows(prices, ohlc, "TQQQ", dmax)
     if len(qrows) < 55:
         return {"available": False, "reason": "QQQ price history is shorter than 55 trading days."}
+    if qrows[-1]["date"] != dmax:
+        return {
+            "available": False,
+            "reason": (f"QQQ latest close {qrows[-1]['date']} does not match the "
+                       f"requested market date {dmax}; strategy output is blocked."),
+            "asOf": dmax,
+            "sourceAsOf": {
+                "qqq": qrows[-1]["date"],
+                "tqqq": trows[-1]["date"] if trows else None,
+            },
+            "dataStatus": "BLOCK_DATA",
+        }
 
     dates = [r["date"] for r in qrows]
     closes = [r["close"] for r in qrows]
@@ -899,9 +1553,12 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     c, a = closes[i], atr[i] or 0.0
     e8, e13, e21, e34, e55, e89 = (ema[n][i] for n in (8, 13, 21, 34, 55, 89))
     q5 = _pct_chg(closes, 5)
+    q_as_of = dates[-1]
+    t_as_of = trows[-1]["date"] if trows else None
+    tqqq_aligned = bool(t_as_of and t_as_of == q_as_of == dmax)
     tcloses = [r["close"] for r in trows]
-    t_close = tcloses[-1] if tcloses else None
-    t5 = _pct_chg(tcloses, 5) if tcloses else None
+    t_close = tcloses[-1] if tcloses and tqqq_aligned else None
+    t5 = _pct_chg(tcloses, 5) if tcloses and tqqq_aligned else None
     e21s, e34s = _slope_pct(ema[21], 5), _slope_pct(ema[34], 5)
     dist8, dist21 = c - e8, c - e21
     dist8_atr = dist8 / a if a else None
@@ -914,12 +1571,17 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     near8 = bool(stacked and a and abs(c - e8) <= 0.5 * a)
     near21 = bool(a and abs(c - e21) <= 0.5 * a and (e21s or 0) > 0)
     two_below_21 = len(closes) >= 2 and closes[-1] < ema[21][-1] and closes[-2] < ema[21][-2]
-    broken = two_below_21 or e8 < e21 or (c < e21 and (e21s or 0) <= 0)
+    ribbon_broken = e8 < e21
+    broken = two_below_21 or ribbon_broken or (c < e21 and (e21s or 0) <= 0)
     chop = (not stacked and not broken and band < 1.2)
 
     if broken:
-        state = {"code": "break", "label": "趋势破坏/防守", "tone": "neg",
-                 "action": "停止加 TQQQ / Call；等待重新站回 EMA21 或重新评估 regime。"}
+        if c >= e21 and ribbon_broken and not two_below_21:
+            state = {"code": "repair", "label": "价格已修复·均线未修复", "tone": "watch",
+                     "action": "价格已站回 EMA21，但 EMA8 仍在 EMA21 下方；停止加杠杆，等待 EMA8 重新上穿并确认。"}
+        else:
+            state = {"code": "break", "label": "趋势破坏/防守", "tone": "neg",
+                     "action": "停止加 TQQQ / Call；等待价格与 EMA8/EMA21 结构共同修复。"}
     elif near21:
         state = {"code": "ema21", "label": "EMA21 期权观察区", "tone": "watch",
                  "action": "趋势未坏时，才评估 14-30DTE call debit spread 或小仓 TQQQ 弹性仓。"}
@@ -982,6 +1644,8 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
 
     def day_state(j):
         cj, aj = closes[j], atr[j] or 0.0
+        if cj >= ema[21][j] and ema[8][j] < ema[21][j]:
+            return "repair"
         if ema[8][j] < ema[21][j] or cj < ema[21][j]:
             return "below21"
         if aj and cj - ema[8][j] > 1.5 * aj:
@@ -1014,7 +1678,7 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
         {"key": "ema21", "title": "QQQ 回踩 EMA21", "active": near21,
          "trigger": "Close 在 EMA21 上下 0.5 x ATR14 内，EMA21 仍向上，未连续两日收破",
          "decision": "才评估期权多头，优先 call debit spread 而非高位裸追"},
-        {"key": "break", "title": "跌破 EMA21 并反抽失败", "active": broken,
+        {"key": "break", "title": "趋势破坏 / 均线带未修复", "active": broken,
          "trigger": "连续两日收在 EMA21 下方，或 EMA8 下穿 EMA21",
          "decision": "不加 TQQQ，不买 call；先保护本金"},
         {"key": "chop", "title": "EMA8/13/21/34 缠绕", "active": chop,
@@ -1026,16 +1690,16 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     long_value = (hqqq.get("value") or 0.0) + (htqqq.get("value") or 0.0)
     has_long = bool(hqqq.get("held") or htqqq.get("held"))
     known_cash = (account or {}).get("cashTotal", 0.0) or 0.0
-    tqqq_cash_contracts = math.floor(known_cash / (t_close * 100)) if t_close else 0
+    tqqq_cash_contracts = math.floor(known_cash / (t_close * 100)) if t_close else None
     tqqq_covered_contracts = math.floor((htqqq.get("shares") or 0.0) / 100)
     opt_hist_focus = _option_trade_summary(opt_txns or {}, ("QQQ", "TQQQ"))
     tqqq_hist_focus = [x for x in opt_hist_focus if x["underlying"] == "TQQQ"]
     qqq_hist_focus = [x for x in opt_hist_focus if x["underlying"] == "QQQ"]
     q_high20 = max(closes[-20:]) if len(closes) >= 20 else max(closes)
     q_trail_3atr = q_high20 - 3 * a if a else None
-    t_atr = _atr14(trows) if len(trows) >= 2 else []
+    t_atr = _atr14(trows) if len(trows) >= 2 and tqqq_aligned else []
     t_atr_last = t_atr[-1] if t_atr else None
-    t_high20 = max(tcloses[-20:]) if tcloses else None
+    t_high20 = max(tcloses[-20:]) if tcloses and tqqq_aligned else None
     trailing = {
         "qqqHigh20": _rn(q_high20), "qqqTrail3Atr": _rn(q_trail_3atr),
         "qqqTrailGapPct": _rn((q_trail_3atr / c - 1) * 100, 2) if q_trail_3atr and c else None,
@@ -1046,16 +1710,20 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     next_triggers = [
         {"name": "EMA8 拿回", "level": _rn(e8), "zone": zone(e8, 0.5 * a),
          "distancePct": _rn((e8 / c - 1) * 100, 2),
-         "action": "浅回踩才考虑拿回小仓 QQQ/TQQQ"},
+         "action": ("价格已在 EMA8 上方；仍等 EMA8 重新上穿 EMA21"
+                    if ribbon_broken and c >= e8 else "浅回踩才考虑拿回小仓 QQQ/TQQQ")},
         {"name": "EMA21 期权", "level": _rn(e21), "zone": zone(e21, 0.5 * a),
          "distancePct": _rn((e21 / c - 1) * 100, 2),
-         "action": "趋势未坏时才评估 14-30DTE call debit spread"},
+         "action": ("价格已收复 EMA21；均线带未修复前不新增方向性期权"
+                    if ribbon_broken and c >= e21 else "趋势未坏时才评估 14-30DTE call debit spread")},
         {"name": "过热阈值", "level": _rn(e8 + 1.5 * a), "zone": None,
          "distancePct": _rn(((e8 + 1.5 * a) / c - 1) * 100, 2),
          "action": "触发后上移移动止盈；只用小仓 CCS 刹车"},
-        {"name": "趋势破坏", "level": _rn(e21), "zone": None,
+        {"name": ("重新失守 EMA21" if state["code"] == "repair" else "趋势破坏"),
+         "level": _rn(e21), "zone": None,
          "distancePct": _rn((e21 / c - 1) * 100, 2),
-         "action": "连续收破 EMA21 或 EMA8<EMA21 时停止进攻"},
+         "action": ("价格虽已收复 EMA21，若再次收破则维持防守；EMA8 上穿前不新增杠杆"
+                    if state["code"] == "repair" else "连续收破 EMA21 或 EMA8<EMA21 时停止进攻")},
     ]
     panel_map = {
         "bull": ("等待，不追", "核心多头继续趋势管理；新 TQQQ/期权等 EMA8/EMA21。",
@@ -1068,6 +1736,8 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
                   "不要用 0DTE/远 OTM 裸 call 代替有风险定义的结构。"),
         "break": ("停止进攻", "退出/降低战术仓，保护本金，等重新站回 EMA21。",
                   "不要无脑抄底 TQQQ；不要把趋势破坏当普通回调。"),
+        "repair": ("等待均线确认", "价格已收复 EMA21；核心仓按既定风控管理，但不新增 TQQQ/call，等待 EMA8 重新上穿 EMA21。",
+                   "不要把一次价格收复当成均线结构已经修复；也不要把核心仓与战术杠杆混为一谈。"),
         "chop": ("降频小仓", "均线纠缠时减少交易频率，等方向重新排队。",
                  "不要用 EMA8/21 反复加减仓被 whipsaw。"),
         "mixed": ("等确认", "仓位按风险管理，等趋势重排或破位确认。",
@@ -1080,8 +1750,16 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
                     + f"${long_value:,.0f}") if has_long else "没有 QQQ/TQQQ 多头；上方 CCS 是偏空交易，不是 hedge。",
         "movingStop": "QQQ 用 3xATR 保护天气图；TQQQ 战术仓用 8%-12% trailing stop。",
     }
+    if not tqqq_aligned:
+        decision_panel.update({
+            "doNow": f"仅使用 QQQ {q_as_of} 管理天气与核心仓；TQQQ 截至 {t_as_of or '缺失'}，所有新增 TQQQ/期权动作 BLOCK_DATA。",
+            "avoid": "不要用旧 TQQQ spot、收益、ATR、现金担保张数或 CCS 区间执行交易。",
+            "ccsRole": "TQQQ 行情未与 QQQ 同日；CCS 结构与容量全部停用，先刷新数据。",
+            "movingStop": "QQQ 可用 3xATR；TQQQ trailing stop 因行情日期不齐而停算。",
+        })
     teacher_checks = [
-        {"label": "QQQ 天气", "value": state["label"], "ok": state["code"] not in ("break", "chop")},
+        {"label": "QQQ 天气", "value": state["label"], "ok": state["code"] not in ("break", "repair", "chop")},
+        {"label": "TQQQ 数据", "value": ("与 QQQ 同日" if tqqq_aligned else f"BLOCK · {t_as_of or '缺失'} vs {q_as_of}"), "ok": tqqq_aligned},
         {"label": "多头可对冲", "value": ("有 QQQ/TQQQ 多头" if has_long else "没有 QQQ/TQQQ 多头"), "ok": has_long},
         {"label": "CCS 风险", "value": "最大亏损 = 宽度 - credit；需实盘确认 delta/credit", "ok": True},
         {"label": "移动止盈", "value": "先写 QQQ 3ATR / TQQQ 8%-12% 线", "ok": True},
@@ -1089,10 +1767,12 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
     ]
     def option_status(kind):
         code = state["code"]
+        if not tqqq_aligned:
+            return ("BLOCK", f"TQQQ 行情截至 {t_as_of or '缺失'}，未与 QQQ {q_as_of} 对齐；所有 TQQQ 价格依赖结构停用。")
         if kind == "debit":
             if code == "ema21":
                 return ("WATCH", "EMA21 守住且未连续收破时，才评估 14-30DTE call debit spread。")
-            if code in ("break", "chop"):
+            if code in ("break", "repair", "chop"):
                 return ("BLOCK", "趋势破坏或均线纠缠时，不加 TQQQ/call 方向性风险。")
             return ("WATCH", "等 QQQ 回到 EMA21 期权区；高位不急着买期权。")
         if kind == "ccs":
@@ -1106,14 +1786,16 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
                 return ("WATCH", f"最多约 {tqqq_covered_contracts} 组 covered call；只有愿意交割 TQQQ 才做。")
             return ("BLOCK", f"TQQQ 仅 {htqqq.get('shares', 0)} 股，不足 100 股，不能叫 covered call。")
         if kind == "csp":
-            if tqqq_cash_contracts > 0:
+            if tqqq_cash_contracts and tqqq_cash_contracts > 0:
                 return ("WATCH", f"已知现金粗略可覆盖 {tqqq_cash_contracts} 组，但必须愿意接 TQQQ。")
             need = (t_close or 0) * 100
             return ("BLOCK", f"已知现金 ${known_cash:,.0f}，不足覆盖 1 张 TQQQ put 约 ${need:,.0f}。")
         return ("WATCH", "先确认结构、流动性、最大亏损和退出线。")
 
     tqqq_option_plan = {
-        "status": ("当前导出没有 TQQQ 期权合约；最近 TQQQ 记录是股票/ETF买入。"
+        "status": (f"TQQQ 行情日期 {t_as_of or '缺失'} 未与 QQQ {q_as_of} 对齐；价格依赖结构全部 BLOCK。"
+                   if not tqqq_aligned else
+                   "当前导出没有 TQQQ 期权合约；最近 TQQQ 记录是股票/ETF买入。"
                    if not tqqq_option_legs and not tqqq_hist_focus
                    else "发现 TQQQ 期权记录；先按当前腿和成交净额核对。"),
         "currentTqqqLegs": tqqq_option_legs,
@@ -1139,11 +1821,15 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
         ],
     }
 
-    return {"available": True, "asOf": dates[-1], "source": {"qqq": qsrc, "tqqq": tsrc},
+    return {"available": True, "asOf": q_as_of, "source": {"qqq": qsrc, "tqqq": tsrc},
+            "sourceAsOf": {"qqq": q_as_of, "tqqq": t_as_of},
+            "tqqqAligned": tqqq_aligned,
+            "tqqqExecutionGate": "PASS" if tqqq_aligned else "BLOCK_DATA",
             "state": state, "decisionPanel": decision_panel,
             "teacherChecks": teacher_checks, "nextTriggers": next_triggers,
             "trailing": trailing,
-            "latest": {"date": dates[-1], "qqq": _rn(c), "tqqq": _rn(t_close),
+            "latest": {"date": q_as_of, "tqqqDate": t_as_of,
+                       "tqqqAligned": tqqq_aligned, "qqq": _rn(c), "tqqq": _rn(t_close),
                        "ema8": _rn(e8), "ema13": _rn(e13), "ema21": _rn(e21),
                        "ema34": _rn(e34), "ema55": _rn(e55), "ema89": _rn(e89),
                        "atr14": _rn(a), "rsi14": _rn(rsi[-1], 1),
@@ -1151,7 +1837,9 @@ def build_qqq_tqqq_strategy(prices, ohlc, cur, account, dmax, opt_txns=None):
                        "distEma21": {"dollar": _rn(dist21), "pct": _rn(dist21 / e21 * 100, 2), "atr": _rn(dist21_atr, 2)},
                        "qqqRet5": _rn(q5, 2), "tqqqRet5": _rn(t5, 2),
                        "ema21Slope5": _rn(e21s, 2), "ema34Slope5": _rn(e34s, 2),
-                       "bandWidthPct": _rn(band, 2), "twoBelowEma21": two_below_21},
+                       "bandWidthPct": _rn(band, 2), "twoBelowEma21": two_below_21,
+                       "ema8UnderEma21": ribbon_broken,
+                       "priceAboveEma21": c >= e21},
             "zones": {"ema8Buyback": zone(e8, 0.5 * a), "ema21Options": zone(e21, 0.5 * a),
                       "ema34Defense": zone(e34, 0.25 * a), "ema55Regime": zone(e55, 0.25 * a)},
             "rules": rules, "series": series[-130:],
@@ -1200,6 +1888,11 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
     for s in stocks:
         rows = s["txns"]
         for j, t in enumerate(rows):
+            # Reinvestment and option-delivery rows affect holdings/accounting,
+            # but they are not discretionary stock decisions and therefore do
+            # not belong in overtrading, recency, anchoring, or avg-down flags.
+            if t.get("actionType", "TRADE") != "TRADE":
+                continue
             if t["side"] == "SELL" and t["realized"] is not None:
                 sells.append({"sym": s["sym"], "date": t["date"], "price": t["price"],
                               "proceeds": abs(t["amount"]), "realized": t["realized"]})
@@ -1232,7 +1925,8 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
     ntrades = nbuys + nsells
     span = max(1, (datetime.date.fromisoformat(dmax) - datetime.date.fromisoformat(dmin)).days)
     avg_val = (summary.get("netWorthStart", 0) + summary.get("netWorthNow", 0)) / 2 or mv
-    gross = summary.get("totalBuy", 0) + summary.get("totalSell", 0)
+    gross = (sum(abs(x["amount"]) for x in buys)
+             + sum(abs(x["proceeds"]) for x in sells))
     turn_ann = (gross / avg_val * (365.0 / span)) if avg_val else 0
     sp = summary.get("spReturn")
     alpha = (summary["curReturn"] - sp) if sp is not None else None
@@ -1291,9 +1985,13 @@ def analyze_behavior(stocks, summary, prices, dmin, dmax):
     buy_high = []
     for b in buys:
         d = datetime.date.fromisoformat(b["date"])
+        trade_close = price_on(prices, b["sym"], b["date"])
         pp = price_on(prices, b["sym"], (d - datetime.timedelta(days=20)).isoformat())
-        if pp and b["price"] > pp * 1.12:
-            buy_high.append({"sym": b["sym"], "date": b["date"], "runup": (b["price"] / pp - 1) * 100})
+        # Compare adjusted close with adjusted close. Broker execution prices
+        # are raw and can be on the pre-split scale (KLAC exposed a 10x false
+        # chase signal when mixed with Yahoo auto-adjusted history).
+        if pp and trade_close and trade_close > pp * 1.12:
+            buy_high.append({"sym": b["sym"], "date": b["date"], "runup": (trade_close / pp - 1) * 100})
     bh_frac = len(buy_high) / len(buys) if buys else 0
     avg_runup = (sum(x["runup"] for x in buy_high) / len(buy_high)) if buy_high else 0
     lvl = "watch" if (bh_frac > 0.25 and len(buys) >= 10) else "good"
@@ -1359,19 +2057,29 @@ def xirr(flows):
     amts = [a for _, a in flows if abs(a) > 1e-9]
     if not amts or min(amts) >= 0 or max(amts) <= 0:
         return None
+    min_rate, max_rate = -0.999999, 1_000_000.0
     r = 0.10
     for _ in range(100):
         f, d = _xnpv(r, flows), _xnpv_deriv(r, flows)
         if not (math.isfinite(f) and math.isfinite(d)) or abs(d) < 1e-10:
             break
         r2 = r - f / d
-        if r2 <= -0.9999:
-            r2 = (r - 0.9999) / 2
+        if r2 <= min_rate:
+            r2 = (r + min_rate) / 2
+        if not math.isfinite(r2) or r2 > max_rate:
+            break
         if abs(r2 - r) < 1e-7:
-            return r2 if (-0.9999 < r2 < 10 and abs(_xnpv(r2, flows)) < 1e-4) else None
+            return r2 if (min_rate < r2 < max_rate
+                          and abs(_xnpv(r2, flows)) < 1e-4) else None
         r = r2
-    lo, hi = -0.9999, 10.0
+    # A short-window gain can imply an annualized XIRR far above 1,000%; that is
+    # numerically extreme but not undefined. Expand the positive bracket rather
+    # than silently dropping the period return at an arbitrary 10x ceiling.
+    lo, hi = min_rate, 1.0
     flo, fhi = _xnpv(lo, flows), _xnpv(hi, flows)
+    while math.isfinite(flo) and math.isfinite(fhi) and flo * fhi > 0 and hi < max_rate:
+        hi = min(max_rate, hi * 10 + 1)
+        fhi = _xnpv(hi, flows)
     if not (math.isfinite(flo) and math.isfinite(fhi)) or flo * fhi > 0:
         return None
     for _ in range(200):
@@ -1506,7 +2214,9 @@ def add_counterfactual_scores(replays):
         s = ev.get("summary") or {}
         gross = float(ev.get("gross") or 0.0)
         delta = s.get("currentDelta")
-        impact = (float(delta) / gross * 100.0) if gross > 0 and delta is not None else None
+        coverage_ok = s.get("priceCoverageComplete", True)
+        impact = (float(delta) / gross * 100.0
+                  if coverage_ok and gross > 0 and delta is not None else None)
         score = _cf_score_from_impact(impact)
         ev["score"] = {
             "score": score,
@@ -1514,7 +2224,8 @@ def add_counterfactual_scores(replays):
             "outcome": _cf_outcome(score),
             "impactOnTurnoverPct": round(impact, 3) if impact is not None else None,
             "asOf": s.get("lastValidDate"),
-            "confidence": "truncated" if s.get("isTruncated") else "latest",
+            "confidence": ("price-coverage-failed" if not coverage_ok else
+                           ("truncated" if s.get("isTruncated") else "latest")),
         }
         if score is not None:
             valid.append(ev)
@@ -1633,11 +2344,15 @@ def simulate_counterfactual_event(txns, cur, prices, axis, event):
         for sym, qty in state.items():
             if abs(qty) <= 1e-9:
                 continue
-            p = price_on(prices, sym, d)
-            if p is None:
-                missing.append(sym); continue
+            p = price_on(prices, sym, d, max_age_calendar_days=0)
+            if p is None or p <= 0:
+                missing.append(sym)
+                continue
             total += qty * p
-        return total, missing
+        # A partially valued branch is not comparable.  Returning None forces
+        # the replay to stop instead of assigning an implicit zero to the
+        # missing holding or borrowing a future close.
+        return (None if missing else total), missing
 
     base = None
     start_written = False
@@ -1645,11 +2360,11 @@ def simulate_counterfactual_event(txns, cur, prices, axis, event):
         if not start_written:
             av, amiss = book_value(actual, actual_cash, d)
             cv, cmiss = book_value(alt, alt_cash, d)
-            if av <= 0 and cv <= 0:
+            if amiss or cmiss:
+                return None
+            if (av is None or av <= 0) and (cv is None or cv <= 0):
                 return None
             base = av if av > 0 else cv
-            if amiss or cmiss:
-                warnings.append({"date": d, "reason": "部分标的缺少价格，使用可得价格重估", "symbols": sorted(set(amiss + cmiss))[:5]})
             rows.append({
                 "date": d, "actual": round(av, 2), "actualPct": round((av / base - 1) * 100, 3),
                 "alt": round(cv, 2), "altPct": round((cv / base - 1) * 100, 3),
@@ -1671,7 +2386,10 @@ def simulate_counterfactual_event(txns, cur, prices, axis, event):
         av, amiss = book_value(actual, actual_cash, d)
         cv, cmiss = book_value(alt, alt_cash, d)
         if amiss or cmiss:
-            warnings.append({"date": d, "reason": "部分标的缺少价格，使用可得价格重估", "symbols": sorted(set(amiss + cmiss))[:5]})
+            warnings.append({"date": d,
+                             "reason": "价格覆盖不完整；停止回放且不使用部分估值",
+                             "symbols": sorted(set(amiss + cmiss))[:5]})
+            break
         row = {"date": d, "actual": round(av, 2), "actualPct": round((av / base - 1) * 100, 3)}
         row.update({
             "alt": round(cv, 2), "altPct": round((cv / base - 1) * 100, 3),
@@ -1694,6 +2412,8 @@ def simulate_counterfactual_event(txns, cur, prices, axis, event):
             "bestDelta": best["delta"], "bestDate": best["date"],
             "worstDelta": worst["delta"], "worstDate": worst["date"],
             "lastValidDate": last["date"], "isTruncated": len(rows) < len(axis[start_idx:]),
+            "priceCoverageComplete": not any(
+                w.get("reason", "").startswith("价格覆盖不完整") for w in warnings),
             "days": len(valid),
         },
         "warnings": warnings[:6],
@@ -1710,7 +2430,10 @@ def build_counterfactual_replays(txns, cur, prices, dmin, dmax, base_value=0.0, 
         if sim:
             replays.append(sim)
     aggregate = add_counterfactual_scores(replays)
-    return {"events": replays, "aggregate": aggregate, "mode": "skip-stage-then-real-trades"}
+    return {"events": replays, "aggregate": aggregate,
+            "detectedCount": len(events), "simulatedCount": len(replays),
+            "unavailableCount": len(events) - len(replays),
+            "mode": "skip-stage-then-real-trades"}
 
 # ---------------------------------------------------------------- risk
 def compute_risk(series, stocks):
@@ -1731,9 +2454,12 @@ def compute_risk(series, stocks):
     if len(series) < 25:
         return None
     cum = [1 + (p.get("ret") or 0) / 100 for p in series]
-    spcum = [1 + (p.get("sp500") or 0) / 100 for p in series]
+    benchmark_complete = all(p.get("sp500") is not None for p in series)
+    spcum = ([1 + p["sp500"] / 100 for p in series]
+             if benchmark_complete else None)
     r = [cum[i] / cum[i - 1] - 1 for i in range(1, len(cum))]
-    spr = [spcum[i] / spcum[i - 1] - 1 for i in range(1, len(spcum))]
+    spr = ([spcum[i] / spcum[i - 1] - 1 for i in range(1, len(spcum))]
+           if spcum else [])
     rt = 252 ** 0.5
 
     def underwater(c):
@@ -1742,14 +2468,15 @@ def compute_risk(series, stocks):
             peak = max(peak, v)
             out.append((v / peak - 1) * 100 if peak else 0.0)
         return out
-    uw, spuw = underwater(cum), underwater(spcum)
-    uwSeries = [{"date": series[i]["date"], "uw": round(uw[i], 2), "spuw": round(spuw[i], 2)}
+    uw, spuw = underwater(cum), (underwater(spcum) if spcum else None)
+    uwSeries = [{"date": series[i]["date"], "uw": round(uw[i], 2),
+                 "spuw": (round(spuw[i], 2) if spuw else None)}
                 for i in range(len(series))]
     maxdd = min(uw); mddi = uw.index(maxdd)
     peaki = cum.index(max(cum[:mddi + 1]))
     cur_uw = uw[-1]
     annVol = statistics.pstdev(r) * rt * 100 if len(r) >= 2 else 0.0
-    spAnnVol = statistics.pstdev(spr) * rt * 100 if len(spr) >= 2 else 0.0
+    spAnnVol = statistics.pstdev(spr) * rt * 100 if len(spr) >= 2 else None
     beta = None
     nb = min(len(r), len(spr))
     if nb >= 3:
@@ -1764,31 +2491,91 @@ def compute_risk(series, stocks):
     volSeries = []
     for t in range(len(series)):
         if t >= 21:
-            w, sw = r[t - 21:t], spr[t - 21:t]
+            w, sw = r[t - 21:t], (spr[t - 21:t] if spr else [])
             volSeries.append({"date": series[t]["date"],
                               "vol": round(statistics.pstdev(w) * rt * 100, 2) if len(w) >= 2 else None,
                               "spvol": round(statistics.pstdev(sw) * rt * 100, 2) if len(sw) >= 2 else None})
         else:
             volSeries.append({"date": series[t]["date"], "vol": None, "spvol": None})
 
-    # per-holding risk contribution (marginal contribution to portfolio vol)
+    # Per-holding risk contribution (marginal contribution to portfolio vol).
+    # Use only exact, common one-session price pairs.  A few new/illiquid names
+    # must not suppress the entire ledger, but a partial model is published only
+    # when the selected slice covers >=80% of held-equity value.  Its weights and
+    # risk shares are explicitly labeled as *within the covered slice*; full-book
+    # weights remain available separately.  No forward fill is ever used.
     axis = [p["date"] for p in series]
     held = [s for s in stocks if s["held"]]
     tot_val = sum(s["value"] for s in held) or 1.0
-    names, excluded = [], []
+    price_maps = {s["sym"]: dict(s.get("prices", [])) for s in held}
+    all_pairs = [(axis[i - 1], axis[i]) for i in range(1, len(axis))]
+    pair_sets = {}
     for s in held:
-        pm = dict(s.get("prices", []))
-        overlap = sum(1 for d in axis if d in pm)
-        first = next((pm[d] for d in axis if d in pm), None)
-        if overlap < 30 or first is None:
-            excluded.append(s["sym"]); continue
-        closes, last = [], first
-        for d in axis:
-            if d in pm:
-                last = pm[d]
-            closes.append(last)
-        rr = [closes[i] / closes[i - 1] - 1 if closes[i - 1] else 0.0 for i in range(1, len(closes))]
-        names.append({"sym": s["sym"], "w": s["value"] / tot_val, "r": rr})
+        pm = price_maps[s["sym"]]
+        pair_sets[s["sym"]] = {
+            (d0, d1) for d0, d1 in all_pairs
+            if pm.get(d0, 0) > 0 and pm.get(d1, 0) > 0
+        }
+
+    minimum_pairs = 29
+    selected = []
+    common_set = None
+    # Greedy by current market value: retain the economically important slice
+    # while preserving at least the minimum exact common-date sample.
+    for s in sorted(held, key=lambda row: (-row["value"], row["sym"])):
+        pairs = pair_sets[s["sym"]]
+        if len(pairs) < minimum_pairs:
+            continue
+        trial = pairs if common_set is None else common_set & pairs
+        if len(trial) >= minimum_pairs:
+            selected.append(s)
+            common_set = trial
+    common_pairs = sorted(common_set or [])
+    covered_value = sum(s["value"] for s in selected)
+    coverage_weight_pct = covered_value / tot_val * 100 if tot_val else 0.0
+    minimum_coverage_weight_pct = 80.0
+    publish_slice = bool(selected and len(common_pairs) >= minimum_pairs
+                         and coverage_weight_pct >= minimum_coverage_weight_pct)
+
+    names = []
+    if publish_slice:
+        for s in selected:
+            pm = price_maps[s["sym"]]
+            rr = [pm[d1] / pm[d0] - 1 for d0, d1 in common_pairs]
+            names.append({"sym": s["sym"], "w": s["value"] / covered_value,
+                          "portfolioW": s["value"] / tot_val, "r": rr})
+
+    incomplete_symbols = sorted(
+        s["sym"] for s in held
+        if any(price_maps[s["sym"]].get(d, 0) <= 0 for d in axis))
+    selected_symbols = {s["sym"] for s in selected}
+    excluded_symbols = sorted(s["sym"] for s in held if s["sym"] not in selected_symbols)
+    if not held:
+        contrib_status = "unavailable-no-held-equities"
+    elif not selected or len(common_pairs) < minimum_pairs:
+        contrib_status = "unavailable-insufficient-common-history"
+    elif coverage_weight_pct < minimum_coverage_weight_pct:
+        contrib_status = "unavailable-low-market-value-coverage"
+    elif excluded_symbols:
+        contrib_status = "partial-covered-equity-slice"
+    elif len(common_pairs) < max(0, len(axis) - 1):
+        contrib_status = "partial-common-date-sample"
+    else:
+        contrib_status = "complete"
+    contrib_quality = {
+        "status": contrib_status,
+        "requiredSymbols": [s["sym"] for s in held],
+        "modeledSymbols": [s["sym"] for s in selected] if publish_slice else [],
+        "excludedSymbols": (excluded_symbols if publish_slice else [s["sym"] for s in held]),
+        "incompleteSymbols": incomplete_symbols,
+        "axisSessions": len(axis), "commonReturnPairs": len(common_pairs),
+        "minimumReturnPairs": minimum_pairs,
+        "coverageWeightPct": round(coverage_weight_pct, 1),
+        "minimumCoverageWeightPct": minimum_coverage_weight_pct,
+        "riskShareBasis": "within covered held-equity slice",
+        "method": ("value-prioritized >=80% covered slice; exact common consecutive-session closes; "
+                   "no forward fill"),
+    }
 
     contrib = []
     if names:
@@ -1802,7 +2589,7 @@ def compute_risk(series, stocks):
         w = [nm["w"] for nm in names]
         Sw = [sum(Sigma[a][b] * w[b] for b in range(m)) for a in range(m)]
         pvar = sum(w[a] * Sw[a] for a in range(m))
-        pvol = pvar ** 0.5
+        pvol = max(0.0, pvar) ** 0.5
         if pvol > 0:
             mcr = [w[a] * Sw[a] / pvol for a in range(m)]
             tot = sum(mcr) or 1.0
@@ -1810,16 +2597,21 @@ def compute_risk(series, stocks):
                 rc = mcr[a] / tot * 100
                 avol = (Sigma[a][a] ** 0.5) * rt * 100 if Sigma[a][a] > 0 else 0.0
                 contrib.append({"sym": names[a]["sym"], "weightPct": round(w[a] * 100, 1),
+                                "portfolioWeightPct": round(names[a]["portfolioW"] * 100, 1),
                                 "riskPct": round(rc, 1), "gap": round(rc - w[a] * 100, 1),
                                 "annVol": round(avol, 1)})
             contrib.sort(key=lambda c: -c["riskPct"])
 
-    return {"annVol": round(annVol, 1), "spAnnVol": round(spAnnVol, 1),
+    return {"annVol": round(annVol, 1),
+            "spAnnVol": (round(spAnnVol, 1) if spAnnVol is not None else None),
             "beta": (round(beta, 2) if beta is not None else None),
             "maxDrawdown": round(maxdd, 1), "maxDDpeak": series[peaki]["date"],
             "maxDDtrough": series[mddi]["date"], "currentUnderwater": round(cur_uw, 2),
             "retVolRatio": round(retVolRatio, 2), "uwSeries": uwSeries, "volSeries": volSeries,
-            "contrib": contrib, "excluded": excluded,
+            "contrib": contrib,
+            "excluded": (excluded_symbols if names else [s["sym"] for s in held]),
+            "contribQuality": contrib_quality,
+            "benchmarkQuality": ("complete" if benchmark_complete else "unavailable"),
             "basisNote": "equity-only TWR basis; excludes cash/margin/options"}
 
 # ---------------------------------------------------------------- engine
@@ -1847,7 +2639,9 @@ def build_alloc(stocks, summary, risk, account, sectors):
     try:
         held = [s for s in stocks if s.get("held")]
         mv = summary.get("marketValue") or sum(s["value"] for s in held) or 1.0
-        rc = {c["sym"]: c["riskPct"] for c in ((risk or {}).get("contrib") or [])}
+        rc_rows = ((risk or {}).get("contrib") or [])
+        rc = {c["sym"]: c["riskPct"] for c in rc_rows}
+        rc_weight = {c["sym"]: c["weightPct"] for c in rc_rows}
         # by asset class (equity buckets + additive cash row)
         ac = {}
         for s in held:
@@ -1862,17 +2656,22 @@ def build_alloc(stocks, summary, risk, account, sectors):
         # by theme (equity only)
         th = {}
         for s in held:
-            t = th.setdefault(s["theme"], {"value": 0.0, "risk": 0.0, "hasRisk": False, "members": [], "src": s["themeSrc"]})
+            t = th.setdefault(s["theme"], {"value": 0.0, "risk": 0.0, "riskWeight": 0.0,
+                                               "hasRisk": False, "members": [], "src": s["themeSrc"]})
             t["value"] += s["value"]; t["members"].append(s["sym"])
             if s["sym"] in rc:
-                t["risk"] += rc[s["sym"]]; t["hasRisk"] = True
+                t["risk"] += rc[s["sym"]]
+                t["riskWeight"] += rc_weight[s["sym"]]
+                t["hasRisk"] = True
         byTheme = []
         for k, v in th.items():
             w = round(v["value"] / mv * 100, 1)
             rp = round(v["risk"], 1) if v["hasRisk"] else None
+            rwp = round(v["riskWeight"], 1) if v["hasRisk"] else None
             byTheme.append({"theme": k, "weightPct": w, "value": round(v["value"], 2), "n": len(v["members"]),
                             "members": sorted(v["members"]), "src": v["src"], "riskPct": rp,
-                            "gap": (round(rp - w, 1) if rp is not None else None)})
+                            "riskBasisWeightPct": rwp,
+                            "gap": (round(rp - rwp, 1) if rp is not None and rwp is not None else None)})
         byTheme.sort(key=lambda x: -x["weightPct"])
         # theme-level concentration: HHI + effective-N (dollar and, if complete, risk)
         def hhi(ws):
@@ -1899,19 +2698,44 @@ def build_alloc(stocks, summary, risk, account, sectors):
 def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dmax,
                   dividends=0.0, life_deposits=0.0, account=None, sectors=None,
                   ohlc=None, price_mode="broker", price_as_of=None,
-                  refreshed_prices=None):
-    tot_buy, tot_sell = totals
+                  refreshed_prices=None, corporate_action_cash=0.0,
+                  cash_events=None):
+    # Paired exercise/assignment stock legs are an option lifecycle cash event,
+    # not an equity round trip. Keep them in a provenance ledger while removing
+    # them from stock cost basis, realized P&L, TWR/MWR, and behavior analysis.
+    txns, option_settlements = partition_equity_option_settlements(txns)
+    tot_buy = sum(-fnum(t.get("amount")) for L in txns.values() for t in L
+                  if t.get("side") == "BUY")
+    tot_sell = sum(fnum(t.get("amount")) for L in txns.values() for t in L
+                   if t.get("side") == "SELL")
+    option_settlement_cash = sum(fnum(x.get("netCash")) for x in option_settlements)
+    paired_option_settlement_cash = sum(
+        fnum(x.get("netCash")) for x in option_settlements if x.get("pairedNetZero"))
     allsyms = sorted(set(list(txns) + list(cur)))
     stocks, total_realized = [], 0.0
+    realized_quality_counts = {"high": 0, "medium": 0, "low": 0}
     for sym in allsyms:
-        tl = sorted(txns.get(sym, []), key=lambda x: x["date"])
+        tl = sorted((t for t in txns.get(sym, []) if t.get("side") in ("BUY", "SELL")),
+                    key=lambda x: x["date"])
         net = sum((t["qty"] if t["side"] == "BUY" else -t["qty"]) for t in tl)
         final = cur.get(sym, {}).get("shares", 0.0)
         open_qty = round(final - net, 4)
         held = final > 0.0001
-        first_date = tl[0]["date"] if tl else dmin
-        est_open = price_on(prices, sym, first_date) or (tl[0]["price"] if tl else 0)
+        # ``open_qty`` is the inferred position at the analysis boundary, so its
+        # estimated basis belongs to dmin (not the date of the first later trade).
+        est_open = price_on(prices, sym, dmin) or (tl[0]["price"] if tl else 0)
         has_legacy = open_qty > 0.001
+        known_accounts = sorted({str(t.get("account") or "") for t in tl if t.get("account")})
+        unknown_account = any(not t.get("account") for t in tl)
+        realized_issues = []
+        if has_legacy:
+            realized_issues.append("opening basis estimated from market price")
+        if open_qty < -0.001:
+            realized_issues.append("negative inferred opening position; history/account transfer may be incomplete")
+        if len(known_accounts) > 1:
+            realized_issues.append("average cost pooled across accounts; not broker tax-lot P&L")
+        if unknown_account and tl:
+            realized_issues.append("one or more trades lack an account identifier")
         qty = open_qty if open_qty > 0 else 0.0
         cost = qty * est_open
         realized = 0.0
@@ -1919,21 +2743,51 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
         if has_legacy:
             rows.append({"date": "≤" + dmin, "side": "OPEN", "qty": round(open_qty, 3),
                          "price": round(est_open, 2), "amount": round(-open_qty * est_open, 2),
-                         "pos": round(qty, 3), "avg": round(est_open, 2), "realized": None})
+                         "pos": round(qty, 3), "avg": round(est_open, 2), "realized": None,
+                         "actionType": "OPEN"})
         for t in tl:
             if t["side"] == "BUY":
                 qty += t["qty"]; cost += abs(t["amount"]); r = None
             else:
+                if t["qty"] > qty + 1e-6:
+                    issue = "sell quantity exceeds reconstructed inventory; basis falls back to execution price"
+                    if issue not in realized_issues:
+                        realized_issues.append(issue)
                 avg = cost / qty if qty > 1e-9 else t["price"]
-                r = (t["price"] - avg) * t["qty"]; realized += r
+                # Broker amount is net cash and therefore preserves any fees;
+                # execution price × quantity alone can overstate sale proceeds.
+                proceeds = t["amount"] if t["amount"] > 0 else t["price"] * t["qty"]
+                r = proceeds - avg * t["qty"]
+                realized += r
                 cost = max(0.0, cost - avg * t["qty"]); qty = max(0.0, qty - t["qty"])
             avgnow = cost / qty if qty > 1e-9 else 0
             rows.append({"date": t["date"], "side": t["side"], "qty": round(t["qty"], 3),
                          "price": round(t["price"], 2), "amount": round(t["amount"], 2),
                          "pos": round(qty, 3), "avg": round(avgnow, 2),
-                         "realized": (round(r, 2) if r is not None else None)})
+                         "realized": (round(r, 2) if r is not None else None),
+                         "account": t.get("account") or None,
+                         "actionType": t.get("actionType") or "TRADE",
+                         **({"settlementType": t["settlementType"]}
+                            if t.get("settlementType") else {})})
+        if not tl:
+            realized_confidence = "not-applicable"
+        elif any("estimated" in x or "negative" in x or "exceeds" in x for x in realized_issues):
+            realized_confidence = "low"
+        elif realized_issues:
+            realized_confidence = "medium"
+        else:
+            # Even a complete single-account ledger is a modelled average-cost
+            # result, not the broker's elected tax-lot realization.
+            realized_confidence = "medium"
+        if realized_confidence in realized_quality_counts:
+            realized_quality_counts[realized_confidence] += 1
         total_realized += realized
         c = cur.get(sym, {})
+        # Caches are intentionally cumulative and may extend beyond a historical
+        # snapshot.  Indicators and browser charts must never see those future
+        # closes, even though earlier warm-up bars remain useful for EMA/RSI.
+        analysis_prices = sorted(
+            (d, p) for (d, p) in prices.get(sym, {}).items() if d <= dmax)
         sym_window = sorted((d, p) for (d, p) in prices.get(sym, {}).items() if dmin <= d <= dmax)
         # 'today's mover': use the last two trading-day closes in the window so the sort matches the trader's morning question
         day_pct = None
@@ -1950,8 +2804,14 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
             "value": round(c.get("value", 0), 2), "unreal": round(c.get("gain", 0), 2),
             "unrealPct": round(c.get("gainpct", 0), 2), "cost": round(c.get("cost", 0), 2),
             "realized": round(realized, 2), "hasLegacy": has_legacy,
-            "numTrades": len(tl), "prices": sorted(prices.get(sym, {}).items()),
-            "txns": rows, "fib": compute_fib(sorted(prices.get(sym, {}).items())),
+            "realizedConfidence": realized_confidence,
+            "realizedBasisScope": ("cross-account-average-cost" if len(known_accounts) > 1
+                                     else "single-account-average-cost" if known_accounts
+                                     else "account-unknown-average-cost"),
+            "realizedAccounts": known_accounts,
+            "realizedWarnings": realized_issues,
+            "numTrades": len(tl), "prices": analysis_prices,
+            "txns": rows, "fib": compute_fib(analysis_prices),
             "dayChangePct": day_pct, "dayChangeDollar": day_dollar})
 
     # per-stock momentum keyed by date (for the portfolio-level overlay)
@@ -1973,11 +2833,16 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
 
     opts, opt_net = [], 0.0
     for sym in sorted(opt_txns):
-        tl = sorted(opt_txns[sym], key=lambda x: x["date"])
+        tl = sorted(opt_txns[sym], key=lambda x: (
+            x["date"], x.get("actionType") in OPTION_TERMINAL_ACTION_TYPES))
         net = sum(t["amount"] for t in tl); opt_net += net
         opts.append({"sym": sym, "net": round(net, 2),
+                     "netQty": _rn(_option_lifecycle_net_qty(tl), 3),
                      "txns": [{"date": t["date"], "side": t["side"], "qty": t["qty"],
-                               "price": t["price"], "amount": round(t["amount"], 2)} for t in tl]})
+                               "price": t["price"], "amount": round(t["amount"], 2),
+                               "actionType": t.get("actionType") or (
+                                   "TRADE" if t.get("side") in ("BUY", "SELL") else "OTHER")}
+                              for t in tl]})
 
     # ---- daily portfolio net-worth + time-weighted return vs benchmarks ----
     stock_syms = sorted(set(txns) | set(cur))
@@ -1993,52 +2858,107 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     axis = market_axis(prices, dmin, dmax)
 
     def pval(d, shares_date=None):
-        """Portfolio equity value on day d, optionally using holdings as of shares_date."""
+        """Return a complete portfolio valuation and any unpriced holdings."""
         sd = shares_date or d
         tot = 0.0
+        missing = []
         for sym in stock_syms:
-            p = price_on(prices, sym, d)
-            if p:
-                tot += shares_after(sym, sd) * p
-        return tot
+            shares = shares_after(sym, sd)
+            if abs(shares) <= 1e-9:
+                continue
+            p = price_on(prices, sym, d, max_age_calendar_days=0)
+            if p is None or p <= 0:
+                missing.append(sym)
+                continue
+            tot += shares * p
+        return (None if missing else tot), sorted(missing)
 
-    sp_base = price_on(prices, "^GSPC", axis[0]) if axis else None
-    nq_base = price_on(prices, "^IXIC", axis[0]) if axis else None
-    series = []
-    cum = 1.0
-    prevd = None
-    vprev = 0.0
-    for i, d in enumerate(axis):
-        v = pval(d)
-        if i == 0 or vprev <= 0:
-            cumret = 0.0
-        else:
-            today_on_prev = pval(d, shares_date=prevd)   # yesterday's holdings at today's prices
-            r = today_on_prev / vprev - 1
-            cum *= (1 + r)
-            cumret = cum - 1
-        sp = price_on(prices, "^GSPC", d)
-        nq = price_on(prices, "^IXIC", d)
-        # value-weighted portfolio Fibonacci momentum on day d
+    def portfolio_momentum(d):
         num = den = 0.0
         for sym in stock_syms:
             sh = shares_after(sym, d)
             if sh <= 0:
                 continue
-            p = price_on(prices, sym, d)
+            p = price_on(prices, sym, d, max_age_calendar_days=0)
             m = mom_map.get(sym, {}).get(d)
             if p and m is not None:
-                num += sh * p * m; den += sh * p
-        pmom = round(num / den, 1) if den else 0
-        series.append({"date": d, "value": round(v, 2), "ret": round(cumret * 100, 3),
-                       "sp500": (round((sp / sp_base - 1) * 100, 3) if sp and sp_base else None),
-                       "nasdaq": (round((nq / nq_base - 1) * 100, 3) if nq and nq_base else None),
-                       "pmom": pmom})
-        prevd, vprev = d, v
+                num += sh * p * m
+                den += sh * p
+        return round(num / den, 1) if den else 0
 
-    # portfolio-level Fibonacci: the SAME EMA ribbon / RSI / golden-death engine,
-    # run on the daily net-worth curve so the whole portfolio gets its own ribbon
-    # and crossover signals (None if <21 trading days of curve).
+    # Keep separate complete-price segments.  If any required close is missing,
+    # the chain stops; it is never bridged with a partial value.  The latest
+    # complete segment is the published curve and its provenance is explicit.
+    segments, segment = [], []
+    coverage_failures = []
+    complete_valuation_dates = 0
+    cum = 1.0
+    prevd = None
+    vprev = 0.0
+    sp_base = nq_base = None
+    for d in axis:
+        v, missing = pval(d)
+        if missing or v is None or v <= 0:
+            coverage_failures.append({
+                "date": d, "phase": "end-of-day holdings",
+                "symbols": missing, "reason": ("missing-price" if missing else "zero-equity-value"),
+            })
+            if segment:
+                segments.append(segment)
+            segment, prevd, vprev, cum = [], None, 0.0, 1.0
+            sp_base = nq_base = None
+            continue
+        complete_valuation_dates += 1
+
+        restart = prevd is None
+        if not restart:
+            today_on_prev, transition_missing = pval(d, shares_date=prevd)
+            if transition_missing or today_on_prev is None or vprev <= 0:
+                coverage_failures.append({
+                    "date": d, "phase": "prior holdings at current close",
+                    "symbols": transition_missing,
+                    "reason": ("missing-price" if transition_missing else "zero-prior-value"),
+                })
+                if segment:
+                    segments.append(segment)
+                segment, prevd, vprev, cum = [], None, 0.0, 1.0
+                sp_base = nq_base = None
+                restart = True
+
+        if restart:
+            cumret = 0.0
+            sp_base = price_on(prices, "^GSPC", d, max_age_calendar_days=0)
+            nq_base = price_on(prices, "^IXIC", d, max_age_calendar_days=0)
+        else:
+            r = today_on_prev / vprev - 1
+            cum *= (1 + r)
+            cumret = cum - 1
+        sp = price_on(prices, "^GSPC", d, max_age_calendar_days=0)
+        nq = price_on(prices, "^IXIC", d, max_age_calendar_days=0)
+        segment.append({"date": d, "value": round(v, 2), "ret": round(cumret * 100, 3),
+                        "sp500": (round((sp / sp_base - 1) * 100, 3) if sp and sp_base else None),
+                        "nasdaq": (round((nq / nq_base - 1) * 100, 3) if nq and nq_base else None),
+                        "pmom": portfolio_momentum(d)})
+        prevd, vprev = d, v
+    if segment:
+        segments.append(segment)
+    series = segments[-1] if segments else []
+    missing_symbols = sorted({s for row in coverage_failures for s in row["symbols"]})
+    twr_quality = {
+        "status": ("complete" if len(series) == len(axis) and not coverage_failures else
+                   ("partial" if series else "unavailable")),
+        "method": "latest contiguous complete-price segment; no future backfill",
+        "axisSessions": len(axis), "completeValuationSessions": complete_valuation_dates,
+        "usableSessions": len(series), "excludedSessions": max(0, len(axis) - len(series)),
+        "coveragePct": (round(complete_valuation_dates / len(axis) * 100, 1) if axis else 0.0),
+        "seriesStart": series[0]["date"] if series else None,
+        "seriesEnd": series[-1]["date"] if series else None,
+        "missingSymbols": missing_symbols,
+        "failures": coverage_failures[:20],
+    }
+
+    # Portfolio-level Fibonacci runs on the adjusted-close value path used by
+    # TWR.  It is a trend index, not historical broker NAV.
     portfolio_fib = compute_fib([(p["date"], p["value"]) for p in series])
 
     held_val = sum(s["value"] for s in stocks if s["held"])
@@ -2049,18 +2969,42 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                "totalBuy": round(tot_buy, 2), "totalSell": round(tot_sell, 2),
                "deposits": round(deposits, 2), "lifeDeposits": round(life_deposits, 2),
                "dividends": round(dividends, 2), "optNet": round(opt_net, 2),
+               "corporateActionCash": round(corporate_action_cash, 2),
+               "optionSettlementCash": round(option_settlement_cash, 2),
+               "pairedOptionSettlementCash": round(paired_option_settlement_cash, 2),
+               "optionSettlementGroups": len(option_settlements),
+               "pairedOptionSettlementGroups": sum(
+                   1 for x in option_settlements if x.get("pairedNetZero")),
                "dateRange": [dmin, dmax], "numStocks": len(stocks),
                "numHeld": sum(1 for s in stocks if s["held"]),
                "curReturn": last.get("ret", 0), "spReturn": last.get("sp500"),
                "nasdaqReturn": last.get("nasdaq"), "netWorthNow": last.get("value", 0),
                "netWorthStart": series[0]["value"] if series else 0,
+               "seriesValueBasis": ("share-weighted split/distribution-adjusted-close path; "
+                                    "historical dollar points are a total-return scale, not broker NAV"),
                "priceMode": price_mode, "priceAsOf": price_as_of or dmax,
-               "refreshedPriceCount": len(refreshed_prices or {}),
+               "refreshedPriceCount": (len(MARK_STATUS.get("freshSymbols") or [])
+                                        if price_mode == "mark-to-market" else 0),
+               "valuedPriceCount": len(refreshed_prices or {}),
+               "freshPriceSymbols": MARK_STATUS.get("freshSymbols", []) if price_mode == "mark-to-market" else [],
+               "stalePriceSymbols": MARK_STATUS.get("staleSymbols", {}) if price_mode == "mark-to-market" else {},
+               "missingPriceSymbols": MARK_STATUS.get("missingSymbols", []) if price_mode == "mark-to-market" else [],
+               "oldestHeldPriceAsOf": MARK_STATUS.get("oldestAsOf") if price_mode == "mark-to-market" else None,
                "fetchOK": FETCH_STATUS.get("ok", True),
                "fetchStale": FETCH_STATUS.get("stale", False),
                "fetchReason": FETCH_STATUS.get("reason"),
+               "fetchPartial": FETCH_STATUS.get("downloadPartial", False),
+               "fetchMissingSymbols": FETCH_STATUS.get("downloadMissingSymbols", []),
                "cacheAgeDays": FETCH_STATUS.get("cacheAgeDays", 0),
-               "generatedAt": datetime.datetime.now().isoformat(timespec="seconds")}
+               "twrQuality": twr_quality,
+               "realizedPnlQuality": {
+                   "confidence": ("low" if realized_quality_counts["low"] else
+                                  ("medium" if realized_quality_counts["medium"] else
+                                   ("high" if realized_quality_counts["high"] else "not-applicable"))),
+                   "method": "average-cost reconstruction; not broker tax-lot accounting",
+                   "symbolsByConfidence": realized_quality_counts,
+               },
+               "generatedAt": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
 
     # ---- whole-account: fold cash + option mark-to-market into net worth ----
     # Strictly additive: NEW summary keys only. The 股票 bucket = held_val (the
@@ -2073,47 +3017,180 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
                       "optPctEquity": (round(account["optMarkGross"] / held_val * 100, 2) if held_val else None),
                       "asOf": account.get("asOf") or "券商最新快照"}
         acct_block["optionSpreads"] = build_option_spreads(acct_block.get("optLegs", []), dmax)
+        acct_block["optionRisk"] = build_unpaired_option_risk(acct_block, acct_block["optionSpreads"])
         summary["accountNetWorth"] = whole
         summary["cashTotal"] = account["cashTotal"]
         summary["pendingTotal"] = account["pending"]
         summary["optMarkNet"] = account["optMarkNet"]      # MTM net — distinct from summary.optNet (history cash-flow)
         summary["optMarkGross"] = account["optMarkGross"]
+        summary["optLegCount"] = len(account.get("optLegs") or [])
+        summary["optBrokerPnl"] = account.get("optBrokerPnl")
+        summary["optEntryCashNet"] = account.get("optEntryCashNet")
         summary["optPctEquity"] = acct_block["optPctEquity"]
         summary["marginDebitKnown"] = False
         assert abs(whole - (eq + summary["cashTotal"] + summary["optMarkNet"] + summary["pendingTotal"])) < 0.005
 
     # ---- money-weighted return (equity-book XIRR) + plain-dollar bridge ----
-    # Honest metric: equity-book IRR (cash & margin balances over time aren't
-    # tracked, so an account-level IRR would be a fudge factor). Flows = −V0 at
-    # dmin + each in-window trade's signed amount + terminal equity value.
-    V0 = series[0]["value"] if series else 0.0       # equity market value at window start
+    # Cash & margin balances over time are unavailable, so this is deliberately
+    # an equity-book IRR.  Every known flow uses its actual date; an undated
+    # aggregate fallback is explicitly downgraded rather than presented as exact.
     terminal = held_val
     bridge = None
     summary["mwrAnnual"] = summary["mwrPeriod"] = summary["behaviorGap"] = None
+    summary["mwrQuality"] = {
+        "status": "unavailable-no-complete-price-series",
+        "startDate": None, "terminalDate": None, "flowCount": 0,
+        "datedCashEventCount": 0, "fallbackAggregateCash": 0.0,
+        "exactTransactionFlowCount": 0, "estimatedOpeningValue": 0.0,
+        "estimatedOpeningSymbols": [], "estimatedTerminalValue": False,
+        "cashFlowSignChanges": 0, "potentialMultipleIrr": False,
+        "candidatePeriodPct": None, "candidateAnnualPct": None, "published": False,
+        "alignedWithTWR": False,
+        "method": ("equity-book XIRR from exact broker trade cash flows; "
+                   "pre-window inventory uses adjusted-close market value only when required"),
+    }
     if series:
-        # XIRR flows (equity book): −V0 at dmin + each in-window trade's signed
-        # amount (dmin trades already inside V0) + dividends + terminal value.
-        term_date = datetime.date.fromisoformat(dmax) + datetime.timedelta(days=2)
-        flows = [(datetime.date.fromisoformat(dmin), -V0)]
+        start_date = datetime.date.fromisoformat(series[0]["date"])
+        series_end = datetime.date.fromisoformat(series[-1]["date"])
+        snapshot_date = None
+        try:
+            snapshot_date = datetime.date.fromisoformat(str(price_as_of or ""))
+        except ValueError:
+            pass
+        use_snapshot = terminal > 0 and (
+            (snapshot_date is not None and snapshot_date >= series_end)
+            or series_end.isoformat() == dmax)
+        term_date = (snapshot_date if snapshot_date is not None and snapshot_date >= series_end
+                     else series_end) if use_snapshot else series_end
+        term_val = terminal if use_snapshot else series[-1]["value"]
+
+        # Use exact broker cash amounts from the first usable date, including
+        # trades on that date.  Only inventory already present immediately
+        # before the usable window needs an estimated opening market value.
+        # This avoids mixing a synthetic adjusted-close day-one valuation with
+        # real historical transaction dollars.
+        opening_value = 0.0
+        opening_symbols = []
+        opening_inventory_issues = []
+        for sym in sorted(set(txns) | set(cur)):
+            final_shares = fnum(cur.get(sym, {}).get("shares"))
+            changes_from_start = sum(
+                (t["qty"] if t["side"] == "BUY" else -t["qty"])
+                for t in txns.get(sym, [])
+                if t.get("side") in ("BUY", "SELL")
+                and datetime.date.fromisoformat(t["date"]) >= start_date)
+            opening_shares = final_shares - changes_from_start
+            if abs(opening_shares) <= 1e-7:
+                continue
+            if opening_shares < 0:
+                opening_inventory_issues.append(sym)
+                continue
+            opening_price = price_on(
+                prices, sym, start_date.isoformat(), max_age_calendar_days=0)
+            if opening_price is None or opening_price <= 0:
+                opening_inventory_issues.append(sym)
+                continue
+            opening_value += opening_shares * opening_price
+            opening_symbols.append(sym)
+
+        flows = []
+        if opening_value > 0:
+            flows.append((start_date, -opening_value))
         by_date = {}
-        for sym, tl in txns.items():
+        exact_transaction_count = 0
+        for tl in txns.values():
             for t in tl:
-                if t["date"] > dmin:
-                    by_date[t["date"]] = by_date.get(t["date"], 0.0) + t["amount"]
-        for dd in sorted(by_date):
-            flows.append((datetime.date.fromisoformat(dd), by_date[dd]))
-        if dividends:
-            flows.append((term_date, dividends))
-        term_val = terminal if terminal > 0 else series[-1]["value"]
+                td = datetime.date.fromisoformat(t["date"])
+                if start_date <= td <= term_date:
+                    by_date[td] = by_date.get(td, 0.0) + t["amount"]
+                    exact_transaction_count += 1
+        for td in sorted(by_date):
+            flows.append((td, by_date[td]))
+
+        dated_cash_count = 0
+        fallback_cash = 0.0
+        if cash_events is not None:
+            for event in cash_events:
+                if event.get("kind") not in ("DIV", "CORPORATE_ACTION"):
+                    continue
+                try:
+                    event_date = datetime.date.fromisoformat(event["date"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if start_date <= event_date <= term_date:
+                    flows.append((event_date, fnum(event.get("amount"))))
+                    dated_cash_count += 1
+        else:
+            # Compatibility for callers that provide only totals.  The metric
+            # remains usable, but the quality object makes the timing estimate
+            # visible and prevents false precision.
+            fallback_cash = dividends + corporate_action_cash
+            if fallback_cash:
+                flows.append((term_date, fallback_cash))
         if term_val > 0:
             flows.append((term_date, term_val))
-        rate = xirr(flows)
-        span_days = (term_date - datetime.date.fromisoformat(dmin)).days
+
+        combined_flows = {}
+        for flow_date, amount in flows:
+            combined_flows[flow_date] = combined_flows.get(flow_date, 0.0) + amount
+        flows = [(flow_date, amount) for flow_date, amount in sorted(combined_flows.items())
+                 if abs(amount) > 1e-9]
+        signs = [1 if amount > 0 else -1 for _, amount in flows]
+        sign_changes = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
+        rate = None if opening_inventory_issues else xirr(flows)
+        span_days = (term_date - start_date).days
+        aligned_with_twr = term_date == series_end
+        candidate_period = None
+        candidate_annual = None
         if rate is not None:
-            summary["mwrPeriod"] = round(((1 + rate) ** (span_days / 365.0) - 1) * 100, 2)
+            candidate_period = round(((1 + rate) ** (span_days / 365.0) - 1) * 100, 2)
             if span_days >= 60:                            # don't annualize a sub-2-month IRR
-                summary["mwrAnnual"] = round(rate * 100, 2)
-            summary["behaviorGap"] = round(summary["curReturn"] - summary["mwrPeriod"], 2)
+                candidate_annual = round(rate * 100, 2)
+            # More than one cash-flow sign change can produce multiple valid
+            # IRRs.  Keep the numerical root for audit, but do not publish it
+            # (or a behavioral conclusion derived from it) as a decision KPI.
+            if sign_changes <= 1:
+                summary["mwrPeriod"] = candidate_period
+                summary["mwrAnnual"] = candidate_annual
+            if sign_changes <= 1 and aligned_with_twr:
+                summary["behaviorGap"] = round(summary["curReturn"] - summary["mwrPeriod"], 2)
+        if opening_inventory_issues:
+            quality_status = "unavailable-opening-inventory"
+        elif rate is None:
+            quality_status = "unavailable-undefined-irr"
+        elif sign_changes > 1:
+            quality_status = "review-nonconventional-cashflows"
+        elif fallback_cash:
+            quality_status = "estimated-aggregate-cash-timing"
+        elif opening_symbols:
+            quality_status = "estimated-opening-market-value"
+        elif not use_snapshot:
+            quality_status = "estimated-terminal-market-value"
+        elif not aligned_with_twr:
+            quality_status = "complete-mwr-period-differs-from-twr"
+        else:
+            quality_status = "complete"
+        summary["mwrQuality"] = {
+            "status": quality_status,
+            "startDate": start_date.isoformat(), "terminalDate": term_date.isoformat(),
+            "flowCount": len(flows), "datedCashEventCount": dated_cash_count,
+            "fallbackAggregateCash": round(fallback_cash, 2),
+            "exactTransactionFlowCount": exact_transaction_count,
+            "estimatedOpeningValue": round(opening_value, 2),
+            "estimatedOpeningSymbols": opening_symbols,
+            "openingInventoryIssues": opening_inventory_issues,
+            "estimatedTerminalValue": not use_snapshot,
+            "cashFlowSignChanges": sign_changes,
+            "potentialMultipleIrr": sign_changes > 1,
+            "candidatePeriodPct": candidate_period,
+            "candidateAnnualPct": candidate_annual,
+            "published": rate is not None and sign_changes <= 1,
+            "alignedWithTWR": aligned_with_twr,
+            "terminalValueSource": ("broker/current snapshot" if use_snapshot
+                                    else "complete-price series"),
+            "method": ("equity-book XIRR from exact broker trade cash flows; "
+                       "pre-window inventory uses adjusted-close market value only when required"),
+        }
         # Plain-dollar bridge. EXACT, no fudge: 持仓成本 + 未实现 = 当前市值 (broker
         # identity). The four P&L buckets are the user's mental accounts; realized/
         # dividends/options are cash already taken, so they're shown beside (not
@@ -2121,13 +3198,18 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
         # to avoid double-counting pre-window embedded gains.
         held_cost = sum(s["cost"] for s in stocks if s["held"])
         bridge = {"heldCost": round(held_cost, 2), "terminal": round(terminal, 2),
-                  "totalPL": round(held_unreal + total_realized + dividends + opt_net, 2),
-                  "lifeDeposits": round(life_deposits, 2), "ok": rate is not None,
+                  "totalPL": round(held_unreal + total_realized + dividends + opt_net
+                                   + paired_option_settlement_cash, 2),
+                  "lifeDeposits": round(life_deposits, 2),
+                  "ok": rate is not None and sign_changes <= 1,
                   "legs": [
                       {"key": "unreal", "label": "未实现盈亏（持仓 vs 成本）", "amount": round(held_unreal, 2), "type": "pnl", "acc": "券商精确"},
                       {"key": "real", "label": "已实现盈亏（窗口）", "amount": round(total_realized, 2), "type": "pnl", "acc": "含估算均价"},
                       {"key": "div", "label": "股息", "amount": round(dividends, 2), "type": "pnl"},
                       {"key": "opt", "label": "期权净现金流", "amount": round(opt_net, 2), "type": "pnl"},
+                      {"key": "optSettlement", "label": "配对期权交割净现金",
+                       "amount": round(paired_option_settlement_cash, 2), "type": "pnl",
+                       "acc": "与股票已实现盈亏分离"},
                   ]}
 
     behavior = analyze_behavior(stocks, summary, prices, dmin, dmax)
@@ -2139,136 +3221,68 @@ def build_payload(txns, opt_txns, names, cur, prices, deposits, totals, dmin, dm
     return {"summary": summary, "stocks": stocks, "options": opts, "series": series,
             "portfolioFib": portfolio_fib, "behavior": behavior, "risk": risk,
             "bridge": bridge, "account": acct_block, "alloc": alloc, "qqqTqqq": qqq_tqqq,
-            "counterfactual": counterfactual}
+            "counterfactual": counterfactual, "optionSettlements": option_settlements}
 
 # ---------------------------------------------------------------- HTML
-def load_decision_analysis(out_dir):
-    """Optional, data-driven 'decision analysis' layer for the dashboard.
-
-    Reads ``output/decision_analysis.json`` (next to the dashboard) if present and
-    returns the parsed dict, else None. This is the reusable framework hook: drop a
-    JSON file matching the schema (asOf / title / thesis / cash / candidates[] /
-    noList[] / rules[] / recommendation / method / disclaimer) and the 决策分析 tab
-    renders it; absent or malformed → the tab shows a how-to placeholder instead of
-    breaking. See ``scripts/decision_analysis.py`` for the producer + schema docs.
-    """
-    path = os.path.join(out_dir, "decision_analysis.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped decision_analysis.json: {e})")
-        return None
+def _load_optional_artifact(out_dir, key, reference_date=None, health=None):
+    """Load research data only after schema, date, and finite-number checks."""
+    document, status = load_artifact(out_dir, key, reference_date)
+    if health is not None:
+        health[key] = status
+    if status["status"] in {"invalid", "stale", "provisional"}:
+        print(f"  ({key} artifact {status['status']}: {status['reason']})")
+    return document
 
 
-def load_ai_semi_quant(out_dir):
-    """Optional AI semiconductor framework layer.
-
-    Reads ``output/ai_semi_quant.json`` if present. The producer is
-    ``scripts/ai_semi_quant.py``; this loader is deliberately tolerant so a
-    malformed research artifact never breaks the core brokerage dashboard.
-    """
-    path = os.path.join(out_dir, "ai_semi_quant.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped ai_semi_quant.json: {e})")
-        return None
+def load_decision_analysis(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "decision", reference_date, health)
 
 
-def load_ai_watchlist(out_dir):
-    """Optional broader AI old-capability watchlist layer."""
-    path = os.path.join(out_dir, "ai_watchlist.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped ai_watchlist.json: {e})")
-        return None
+def load_ai_semi_quant(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "aiSemiQuant", reference_date, health)
 
 
-def load_aics_payload(out_dir):
-    """Optional AICS layer for the dedicated AI semiconductor tool tab.
-
-    Reads ``output/aics.json`` if present. The producer is
-    ``scripts/aics_tool.py``. Like the other research-artifact loaders, this is
-    tolerant: a malformed AICS file should never break the brokerage dashboard.
-    """
-    path = os.path.join(out_dir, "aics.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped aics.json: {e})")
-        return None
+def load_ai_watchlist(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "aiWatchlist", reference_date, health)
 
 
-def load_market_mass_dashboard(out_dir):
-    """Optional market-mass boundary visualization layer.
-
-    Reads ``output/market_mass_dashboard.json`` if present. The producer is
-    ``scripts/market_mass_dashboard.py``. This loader is intentionally tolerant
-    so malformed research output never breaks the core brokerage dashboard.
-    """
-    path = os.path.join(out_dir, "market_mass_dashboard.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped market_mass_dashboard.json: {e})")
-        return None
+def load_aics_payload(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "aics", reference_date, health)
 
 
-def load_momentum_top3(out_dir):
-    """Optional Momentum Top-3 strategy layer.
-
-    Reads ``output/momentum_top3/momentum_top3.json`` if present. The producer
-    is ``scripts/momentum_top3.py``. The dashboard treats this as a research
-    artifact, so malformed or missing strategy data should never break the
-    core brokerage dashboard.
-    """
-    path = os.path.join(out_dir, "momentum_top3", "momentum_top3.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped momentum_top3.json: {e})")
-        return None
+def load_market_mass_dashboard(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "marketMass", reference_date, health)
 
 
-def load_financial_status(out_dir):
-    """Optional FMP-backed company financial-status lens.
+def load_momentum_top3(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "momentumTop3", reference_date, health)
 
-    Reads ``output/financial_status.json`` if present. The producer is
-    ``scripts/financial_status_score.py``. This is deliberately optional and
-    tolerant because API-plan limits should not break the brokerage dashboard.
-    """
-    path = os.path.join(out_dir, "financial_status.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError) as e:
-        print(f"  (skipped financial_status.json: {e})")
-        return None
+
+def load_financial_status(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "financialStatus", reference_date, health)
+
+
+def load_close_vs_intraday(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "closeVsIntraday", reference_date, health)
+
+
+def load_memory_flow(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "memoryFlow", reference_date, health)
 
 
 def render_html(payload):
+    # DATA is embedded inside an executable <script>, not a JSON script island.
+    # JSON permits literal ``</script>`` and U+2028/U+2029, all of which can end
+    # or corrupt the surrounding script before JavaScript sees the object.  Hex
+    # escaping the HTML-significant code points preserves the parsed values while
+    # making every payload safe to embed, including broker/research text we do not
+    # control.
     DATA = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    DATA = (DATA.replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
     tpl = HTML_TEMPLATE.replace("__DATA__", DATA)
     return tpl
 
@@ -2424,6 +3438,10 @@ header .sub b,header .sub .mono{
   font-family:var(--f-mono); font-weight:500; letter-spacing:0;
   text-transform:none; color:var(--txt);
 }
+.freshchip{flex:none;font-family:var(--f-mono);white-space:nowrap}
+.freshchip[data-level="fresh"]{color:var(--mut);border-color:var(--line)}
+.freshchip[data-level="watch"]{color:var(--accent);border-color:var(--chip-bd-amber)}
+.freshchip[data-level="bad"]{color:var(--red);border-color:var(--chip-bd-red)}
 
 /* ============================== KPI LEDGER STRIP ============================== */
 /* collapse 8 floating cards into ONE ruled strip with hairline dividers */
@@ -2515,6 +3533,7 @@ body.ready .kpi:first-child:hover .l::after{transform:scaleX(1.6)}
 .trail .nm-co{font-size:var(--t-2xs); letter-spacing:var(--ls-label); text-transform:uppercase; color:var(--faint)}   /* broker string becomes the designed caps line */
 .trail .note{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .view-actions{display:flex; align-items:center; justify-content:flex-end; gap:7px; flex-wrap:wrap}
+.stock-jump{display:none;background:var(--bg2);border:1px solid var(--line);border-radius:var(--r-ctl);color:var(--txt);font:600 var(--t-sm)/1.2 var(--f-mono);padding:6px 8px;max-width:150px}
 .microbtn{
   display:inline-flex; align-items:center; justify-content:center; gap:5px;
   min-height:30px; padding:5px 10px;
@@ -2690,6 +3709,8 @@ body.ready .kpi:first-child:hover .l::after{transform:scaleX(1.6)}
 .chartbox{position:relative; width:100%; overflow:hidden; margin-top:10px}
 svg{width:100%; height:auto; display:block}
 svg text{font-family:var(--f-mono); font-variant-numeric:tabular-nums slashed-zero}
+.chartbox.wide-mobile{overflow-x:auto}
+.chartbox.wide-mobile>svg{min-width:760px}
 
 /* ============================== TOOLTIP ============================== */
 .tt{
@@ -2708,7 +3729,8 @@ svg text{font-family:var(--f-mono); font-variant-numeric:tabular-nums slashed-ze
 .gl:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
 .tt.gl-tt{pointer-events:auto; max-width:min(280px,80vw); white-space:normal; line-height:1.55; font-family:var(--f-ui)}
 .tt.gl-tt .gk{font-family:var(--f-disp); font-weight:600; color:var(--accent); display:block; margin-bottom:3px}
-.row:focus-visible,.seg-rail button:focus-visible,.tabs button:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-chip)}
+.row:focus-visible,.seg-rail button:focus-visible,.ws-rail button:focus-visible,.tabs button:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-chip)}
+.mk:focus-visible{outline:none;stroke:var(--accent);stroke-width:4px}
 /* interactive charts: crosshair + readout rows */
 svg.xh{cursor:crosshair}
 svg .cx{stroke:var(--accent); stroke-width:1; stroke-opacity:.55; pointer-events:none}
@@ -2721,7 +3743,7 @@ svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:no
   #onboard{white-space:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
   #onboard::-webkit-scrollbar{display:none} svg text{font-size:var(--t-base)} }
 /* sticky context pill + back-to-top */
-.ctx{position:fixed; top:calc(var(--header-h) + 12px); left:50%; transform:translateX(-50%); z-index:18; display:flex; align-items:center; gap:8px; padding:5px 12px; background:color-mix(in srgb,var(--panel2) 95%,transparent); border:1px solid var(--line); border-radius:var(--r-pill); font:600 11px/1 var(--f-ui); color:var(--mut); box-shadow:var(--sh-tt); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px)}
+.ctx{position:fixed; top:calc(var(--header-h) + 12px); left:50%; transform:translateX(-50%); z-index:21; display:flex; align-items:center; gap:8px; padding:5px 12px; background:color-mix(in srgb,var(--panel2) 95%,transparent); border:1px solid var(--line); border-radius:var(--r-pill); font:600 11px/1 var(--f-ui); color:var(--mut); box-shadow:var(--sh-tt); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px)}
 .ctx[hidden]{display:none}
 /* floating chrome eases in/out where the engine supports discrete-display transitions; hard toggle elsewhere */
 .ctx,.totop{transition:opacity .18s var(--ease),translate .18s var(--ease),display .18s allow-discrete}
@@ -2730,7 +3752,7 @@ svg .cxd{fill:var(--accent); stroke:var(--bg); stroke-width:1; pointer-events:no
 .totop[hidden]{translate:0 6px}
 @starting-style{.ctx:not([hidden]){opacity:0;translate:0 -4px}.totop:not([hidden]){opacity:0;translate:0 6px}}
 .ctx-tick{width:3px; height:11px; border-radius:1px; background:var(--accent); box-shadow:0 0 8px var(--accent-line)}
-.totop{position:fixed; right:22px; bottom:22px; z-index:18; width:42px; height:42px; border-radius:var(--r-pill); border:1px solid var(--line); background:var(--panel2); color:var(--accent); font-size:18px; cursor:pointer; box-shadow:var(--sh-lift)}
+.totop{position:fixed; right:22px; bottom:22px; z-index:18; width:44px; height:44px; border-radius:var(--r-pill); border:1px solid var(--line); background:var(--panel2); color:var(--accent); font-size:18px; cursor:pointer; box-shadow:var(--sh-lift)}
 .totop[hidden]{display:none}
 @media (pointer:coarse){ .totop{width:48px; height:48px} svg .cx{stroke-width:1.6} }
 /* first-glance insight banner */
@@ -2802,6 +3824,7 @@ tbody tr:hover{background:var(--panel2)}
    Desktop = table (12 cols), phone = stacked cards (nothing scrolls off-screen). */
 .score-cards{display:none}
 .smc{padding:12px 14px; border-bottom:1px solid var(--hair); cursor:pointer; border-radius:var(--r-card)}
+.smc.static{cursor:default}
 .smc:last-child{border-bottom:0}
 .smc:active{background:var(--panel2)}
 .smc:focus-visible{outline:2px solid var(--accent-line); outline-offset:-2px}
@@ -3020,7 +4043,7 @@ details[open] summary::before{content:"▾ "}
      Push #right down by the header height so the sticky viewbar (top:84) doesn't render behind the sticky header at scrollY=0 */
   body[data-view="stock"] .kpis{display:none}
   body[data-view="stock"] .right{padding-top:8px}   /* small breathing room above viewbar at top of page */
-  body[data-view="stock"] .wrap{padding-top:calc(var(--header-h) + var(--s3))}   /* push past the sticky header so the viewbar's natural position is below it */
+  body[data-view="stock"] .wrap{padding-top:var(--s3)}
   .kpi{padding:12px 14px}
   .kpi .v{font-size:18px; white-space:normal; overflow-wrap:anywhere}
   .kpi:first-child .v{font-size:20px}
@@ -3036,14 +4059,21 @@ details[open] summary::before{content:"▾ "}
   header h1::before{height:14px}
   header .sub{display:none}
   /* on stock view, hide the secondary "最近" chips row in the viewbar (still reachable via overview banner) */
-  body[data-view="stock"] .viewbar .view-actions .recent-chip,
-  body[data-view="stock"] .viewbar .view-actions:nth-of-type(2){display:none}
+  body[data-view="stock"] .viewbar .recent-actions{display:none}
   /* keep the back-button + breadcrumb visible after scrolling so the trader is never trapped below the fold.
      top:var(--header-h) sits BELOW the sticky page header (z:20); viewbar z:16 keeps it under header and above content */
   .viewbar{position:sticky; top:var(--header-h); z-index:16; background:var(--bg); align-items:center; flex-direction:row; flex-wrap:wrap; gap:var(--s2); padding:var(--s2) 0; margin:0 0 var(--s2); border-bottom:1px solid var(--hair)}
   .viewbar .trail{flex:1 1 auto; min-width:0}
   .view-actions{justify-content:flex-end}
   .microbtn{min-height:44px; padding:11px 14px; font-size:var(--t-base)}   /* 44pt iOS-recommended tap target */
+  /* Inline navigation and status chips are real controls too.  Give their
+     hit boxes a thumb-sized floor without enlarging ordinary prose spans. */
+  [role="button"].note-lk,[role="button"].ib-lk,.chip[role="button"]{min-width:var(--tap-min);min-height:var(--tap-min);display:inline-flex;align-items:center;justify-content:center;padding-top:8px;padding-bottom:8px}
+  /* Keep the signature bar visually 8px while extending its touch target
+     upward into the masthead. */
+  #qbar{overflow:visible}
+  #qbar::after{content:"";position:absolute;left:0;right:0;top:-36px;bottom:0}
+  .stock-jump{display:block;min-height:var(--tap-min);max-width:132px}
   .viewbar .microbtn.primary{flex:0 0 auto}
   /* tab rail: scroll horizontally; chevron edge instead of fading-mask so users know more tabs exist.
      Sticky below the header (84) + sticky viewbar (--viewbar-h), so tab switching is reachable from any scroll depth. */
@@ -3061,6 +4091,7 @@ details[open] summary::before{content:"▾ "}
   .tabs button{padding:14px 6px; min-height:44px}
   .row{padding:14px 14px; min-height:44px}
   .controls input,.controls select{min-height:44px; padding:12px 12px; font-size:14px}   /* search & sort dropdown also 44pt */
+  button,select,input:not([type="hidden"]){min-height:var(--tap-min)}
   /* dense tables: keep the ticker column visible while the rest scrolls */
   .scroll{overflow-x:auto}
   .scroll table th:first-child,.scroll table td:first-child{position:sticky; left:0; background:var(--panel); z-index:2}
@@ -3078,17 +4109,19 @@ details[open] summary::before{content:"▾ "}
   .attn-inline{display:inline-block!important; font-size:11px; padding:1px 5px; margin-left:4px; vertical-align:1px}
   .ib-row{font-size:var(--t-base)}
   /* keep the floating context pill visible on mobile — it doubles as a back-button when in a stock view */
-  .ctx{top:8px; right:8px; left:auto; transform:none; max-width:70vw; font-size:var(--t-sm); padding:9px 14px; cursor:pointer; min-height:38px}
+  .ctx{right:8px; left:auto; transform:none; max-width:70vw; font-size:var(--t-sm); padding:9px 14px; cursor:pointer; min-height:var(--tap-min)}
   #insight{margin:12px 12px 0}
   /* phone KPI strip: single-column is vertically cheap → keep the FULL ledger
      (realized P&L / dividends / deposits are the truth the strip exists to show) */
   /* dense secondary tables: priority-column drops so decision columns survive 390px */
   .seg[data-seg="sig"] table th:nth-child(8),.seg[data-seg="sig"] table td:nth-child(8){display:none}
-  .seg[data-seg="tx"] table th:nth-child(3),.seg[data-seg="tx"] table td:nth-child(3),
-  .seg[data-seg="tx"] table th:nth-child(4),.seg[data-seg="tx"] table td:nth-child(4),
-  .seg[data-seg="tx"] table th:nth-child(5),.seg[data-seg="tx"] table td:nth-child(5){display:none}
+  /* transaction evidence is audit data: quantity, execution price and amount stay visible via horizontal scroll */
   .badges{gap:14px; row-gap:12px}
   .badge .v{overflow-wrap:anywhere}
+  svg.xh text{font-size:20px}
+  #aics-map,.mt-chart{min-width:760px}
+  .seg[data-seg="aics"] .chartbox,.seg[data-seg="mom"] .chartbox{overflow-x:auto}
+  .ctx{top:calc(var(--header-h) + 8px);right:8px;left:auto;transform:none}
 }
 </style>
 </head>
@@ -3096,6 +4129,7 @@ details[open] summary::before{content:"▾ "}
 <a class="skip" href="#main" onclick="event.preventDefault();const m=document.getElementById('main');if(m){m.setAttribute('tabindex','-1');m.focus({preventScroll:false});m.scrollIntoView();}">跳到主要内容</a>
 <header>
  <h1>投资组合时间线<span class="h1-en">Portfolio Timeline</span><span id="qbar-name" aria-hidden="true"></span></h1>
+ <span id="freshchip" class="chip freshchip" data-level="fresh" role="status" aria-live="polite"></span>
  <span class="sub" id="rangelbl"></span>
  <div id="qbar" title="QQQ 近60日趋势状态带（绿=多头 · 暖琥珀=过热 · 红=破21 · 灰=转换）— 琥珀竖线=今天 · 点击打开 QQQ 决策台" role="button" tabindex="0" aria-label="QQQ 近60日趋势状态带 · 点击打开决策台" onclick="ovGo('qt')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ovGo('qt');}"></div>
 </header>
@@ -3117,58 +4151,125 @@ details[open] summary::before{content:"▾ "}
        <option value="sym">按代码字母</option>
      </select>
      <div class="tabs" role="tablist" aria-label="持仓筛选">
-       <button data-f="held" class="on" role="tab" aria-selected="true">持有中</button>
-       <button data-f="exited" role="tab" aria-selected="false">已清仓</button>
-       <button data-f="all" role="tab" aria-selected="false">全部</button>
+       <button data-f="held" class="on" role="tab" aria-selected="true" tabindex="0">持有中</button>
+       <button data-f="exited" role="tab" aria-selected="false" tabindex="-1">已清仓</button>
+       <button data-f="all" role="tab" aria-selected="false" tabindex="-1">全部</button>
      </div>
    </div>
-   <div class="list" id="list" role="listbox" aria-label="持仓"></div>
+   <div class="list" id="list" aria-label="持仓"></div>
  </nav>
  <section class="right" id="right" aria-label="详情面板"></section>
 </main>
-<div class="tt" id="tt"></div>
+<div class="tt" id="tt" role="tooltip" aria-live="polite"></div>
 <div id="ctx" class="ctx" hidden role="button" tabindex="0" aria-label="跳转 / 返回组合总览" onclick="if(sel!=='__OV__')goBack();else window.scrollTo({top:0,behavior:PRM?'auto':'smooth'});" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"><span class="ctx-tick"></span><span id="ctxt"></span></div>
 <div id="srlive" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%)"></div>
 <button id="totop" class="totop" aria-label="回到顶部" hidden>↑</button>
 <script>
 const DATA = __DATA__;
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const safeUrl=value=>{try{const u=new URL(String(value||''),window.location.href);return (u.protocol==='https:'||u.protocol==='http:')?esc(u.href):'';}catch(e){return'';}};
 const fmt=(n,d=2)=>n==null?'—':(n<0?'−$':'$')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});   // U+2212 true minus — in the embedded subset
 const fmtN=(n,d=0)=>n==null?'—':(n<0?'−':'')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:Math.max(d,2)});
 const pct=n=>n==null?'—':(n>=0?'+':'−')+Math.abs(n).toFixed(2)+'%';
 const ppf=n=>n==null?'—':(n>=0?'+':'−')+Math.abs(n).toFixed(2)+'pp';   // percentage-point difference (excess vs benchmark) — one canonical unit everywhere
 const cls=n=>n>0?'pos':(n<0?'neg':'');
 const chipBd=c=>({'#4FB286':'var(--chip-bd-green)','#E5707A':'var(--chip-bd-red)','#E8B339':'var(--chip-bd-amber)'}[c]||(c+'66'));   // one tinted-chip border convention
-const S=DATA.summary, D0=S.dateRange[0], D1=S.dateRange[1];
+const S=DATA.summary, ACCOUNT=DATA.account||null, D0=S.dateRange[0], D1=S.dateRange[1];
 const PRM=!!(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches);   // JS-driven smooth scrolls must honor it too (CSS *{scroll-behavior:auto} can't reach scrollTo options)
+function artifactHealthEntries(){
+ const H=DATA.artifactHealth;if(!H)return[];
+ let rows=[];
+ if(Array.isArray(H))rows=H;
+ else if(Array.isArray(H.artifacts))rows=H.artifacts;
+ else if(H.artifacts&&typeof H.artifacts==='object')rows=Object.keys(H.artifacts).map(k=>Object.assign({artifact:k},H.artifacts[k]||{}));
+ else if(Array.isArray(H.items))rows=H.items;
+ else rows=Object.keys(H).filter(k=>H[k]&&typeof H[k]==='object'&&!Array.isArray(H[k])).map(k=>Object.assign({artifact:k},H[k]));
+ return rows.map((x,i)=>Object.assign({artifact:x.artifact||x.name||x.id||('artifact '+(i+1))},x));
+}
+function ageDays(value){
+ const t=Date.parse(value||'');if(!Number.isFinite(t))return null;
+ return Math.max(0,(Date.now()-t)/86400000);
+}
+const MARKET_MONTH={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+function localMarketDate(value){
+ const raw=String(value||'').trim();let m=raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+ if(m)return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),12);
+ m=raw.match(/^([A-Za-z]{3})-(\d{1,2})-(\d{4})/);
+ if(m&&MARKET_MONTH[m[1].toLowerCase()]!=null)return new Date(Number(m[3]),MARKET_MONTH[m[1].toLowerCase()],Number(m[2]),12);
+ const t=Date.parse(raw);if(!Number.isFinite(t))return null;const d=new Date(t);return new Date(d.getFullYear(),d.getMonth(),d.getDate(),12);
+}
+function nthWeekday(y,m,wd,n){const d=new Date(y,m,1,12);d.setDate(1+(wd-d.getDay()+7)%7+7*(n-1));return d;}
+function lastWeekday(y,m,wd){const d=new Date(y,m+1,0,12);d.setDate(d.getDate()-(d.getDay()-wd+7)%7);return d;}
+function easterSunday(y){const a=y%19,b=Math.floor(y/100),c=y%100,d=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3),h=(19*a+b-d-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,m=Math.floor((a+11*h+22*l)/451),mo=Math.floor((h+l-7*m+114)/31)-1,day=(h+l-7*m+114)%31+1;return new Date(y,mo,day,12);}
+function dateKey(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function observedDate(d){const x=new Date(d);if(x.getDay()===6)x.setDate(x.getDate()-1);else if(x.getDay()===0)x.setDate(x.getDate()+1);return x;}
+const MARKET_HOLIDAYS=new Map();
+function usMarketHolidays(y){
+ if(MARKET_HOLIDAYS.has(y))return MARKET_HOLIDAYS.get(y);const s=new Set();
+ for(const by of [y,y+1])for(const md of [[0,1],[6,4],[11,25]]){const o=observedDate(new Date(by,md[0],md[1],12));if(o.getFullYear()===y)s.add(dateKey(o));}
+ [nthWeekday(y,0,1,3),nthWeekday(y,1,1,3),lastWeekday(y,4,1),nthWeekday(y,8,1,1),nthWeekday(y,10,4,4)].forEach(d=>s.add(dateKey(d)));
+ const gf=easterSunday(y);gf.setDate(gf.getDate()-2);s.add(dateKey(gf));if(y>=2022)s.add(dateKey(observedDate(new Date(y,5,19,12))));
+ MARKET_HOLIDAYS.set(y,s);return s;
+}
+function marketAgeDays(value){
+ let d=localMarketDate(value),end=new Date(),n=0;if(!d)return null;end.setHours(12,0,0,0);
+ while(d<end&&n<400){d.setDate(d.getDate()+1);const wd=d.getDay();if(wd!==0&&wd!==6&&!usMarketHolidays(d.getFullYear()).has(dateKey(d)))n++;}
+ return n;
+}
+function runtimeFreshness(){
+ const artifacts=artifactHealthEntries();
+ const severe=new Set(['invalid','error','failed','missing','blocked']);
+ const review=new Set(['stale','review','data_review','data-review','needs_review','warning','warn','insufficient','partial','provisional']);
+ const badArtifacts=artifacts.filter(x=>{const s=String(x.status||'').toLowerCase();return severe.has(s)||/invalid|error|fail|missing|blocked/.test(s);});
+ const watchArtifacts=artifacts.filter(x=>{const s=String(x.status||'').toLowerCase();return x.stale===true||review.has(s)||/stale|review|warn|insufficient|partial|provisional/.test(s);});
+ const researchArtifacts=artifacts.filter(x=>x.decisionGrade===false&&!badArtifacts.includes(x)&&!watchArtifacts.includes(x));
+ const pAge=marketAgeDays(S.priceAsOf||(ACCOUNT&&ACCOUNT.asOf)||D1),gHours=ageDays(S.generatedAt)==null?null:ageDays(S.generatedAt)*24,aAge=marketAgeDays(ACCOUNT&&ACCOUNT.asOf);
+ let level='fresh',reasons=[];
+ if(S.fetchOK===false){level='bad';reasons.push(S.fetchReason||'价格刷新失败');}
+ if(badArtifacts.length){level='bad';reasons.push(`${badArtifacts.length} 个数据产物无效/缺失`);}
+ if(level!=='bad'&&(pAge!=null&&pAge>3||gHours!=null&&gHours>96||aAge!=null&&aAge>5))level='bad';
+ if(level!=='bad'&&(S.fetchStale||pAge!=null&&pAge>1||gHours!=null&&gHours>36||aAge!=null&&aAge>1||watchArtifacts.length)){level='watch';}
+ if(S.fetchStale)reasons.push(S.fetchReason||'价格缓存过期');
+ if(pAge!=null&&pAge>1)reasons.push(`价格 ${pAge} 个交易日前`);
+ if(aAge!=null&&aAge>1)reasons.push(`账户快照 ${aAge} 个交易日前`);
+ if(gHours!=null&&gHours>36)reasons.push(`页面生成于 ${Math.floor(gHours)} 小时前`);
+ if(watchArtifacts.length)reasons.push(`${watchArtifacts.length} 个数据产物受限/待复核`);
+ const label=level==='bad'?'数据异常':(level==='watch'?'数据待核':('价格 '+(S.priceAsOf||(ACCOUNT&&ACCOUNT.asOf)||D1)));
+ return {level,label,reasons,pAge,gHours,aAge,artifacts,badArtifacts,watchArtifacts,researchArtifacts};
+}
+const FRESH=runtimeFreshness();
+const freshChip=document.getElementById('freshchip');
+if(freshChip){freshChip.dataset.level=FRESH.level;freshChip.textContent=(FRESH.level==='fresh'?'● ':'⚠ ')+FRESH.label;freshChip.title=(FRESH.reasons.join(' · ')||'价格、账户快照与生成时间在可用窗口内')+(S.generatedAt?' · generated '+S.generatedAt:'');if(FRESH.level!=='fresh')freshChip.setAttribute('role','alert');}
 const priceSrc=S.priceMode==='mark-to-market'
- ? `股票市值 Yahoo refreshed <b>${S.priceAsOf}</b> · 期权/现金 Fidelity 快照`
+ ? `股票市值 Yahoo refreshed <b>${esc(S.priceAsOf)}</b> · 期权/现金 Fidelity 快照`
  : `股票市值 Fidelity 快照 · 图表价格 Yahoo Finance`;
-document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${D0} → ${D1}</b> · ${priceSrc} · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
+document.getElementById('rangelbl').innerHTML=`数据窗口 <b>${esc(D0)} → ${esc(D1)}</b> · ${priceSrc}${ACCOUNT&&ACCOUNT.asOf?` · 账户快照 <b>${esc(ACCOUNT.asOf)}</b>`:''} · 共 ${S.numStocks} 只标的（持有 ${S.numHeld}）`;
 // loud banner when Yahoo prices are stale — trader must NOT mistake yesterday's numbers for live
 if(S.fetchOK===false||S.fetchStale){
- const reason=S.fetchReason||'缓存价格';
+ const reason=esc(S.fetchReason||'缓存价格');
  const age=S.cacheAgeDays||0;
  const ageTxt=age>0?` · 缓存约 ${age} 天前`:'';
  if(S.fetchOK===false){   // fetch FAILURE keeps the loud full-width band — data-integrity safeguard
   document.getElementById('fetchwarn').innerHTML=`<div role="alert" style="margin:10px var(--s7) 0;padding:9px 14px;border:1px solid var(--red);background:rgba(216,77,87,.10);border-radius:var(--r-card);color:var(--txt);font:600 12.5px/1.5 var(--f-ui)">⚠ ${reason}${ageTxt} · 价格数字可能与实时不一致 — 重跑 <code style="background:var(--bg2);padding:1px 5px;border-radius:4px">python3 sync.py</code> 刷新。</div>`;
- } else {   // merely stale: compact masthead chip — full sentence in the title attr, role=alert kept
-  const h1=document.querySelector('header h1');
-  if(h1)h1.insertAdjacentHTML('afterend',`<span id="stalechip" class="chip" role="alert" title="${reason}${ageTxt} · 价格数字可能与实时不一致 — 重跑 python3 sync.py 刷新" style="color:var(--accent);border-color:var(--chip-bd-amber);cursor:help;flex:none;font-family:var(--f-mono)">⏱ 数据${age>0?` −${age}d`:'缓存'} · sync.py</span>`);
  }
 }
 
 // Two-tier KPI strip. Tier 1 answers "did I make money / am I winning" at full size;
 // tier 2 is the accounting ledger — kept visible (it's the audit truth) but demoted so it
 // no longer competes with the four decision numbers.
+const qualityChip=(value,label)=>{const s=String(value||'unknown').toLowerCase(),good=s==='complete'||s==='high',bad=s==='low'||s==='unavailable'||s.startsWith('unavailable-'),c=good?'var(--green)':(bad?'var(--red)':'var(--accent)');return `<span class="chip" style="margin-left:5px;color:${c};border-color:${good?'var(--chip-bd-green)':(bad?'var(--chip-bd-red)':'var(--chip-bd-amber)')}">${esc(label||value||'unknown')}</span>`;};
 const kpis=[
- ['股票市值 (不含现金/期权)',fmt(S.marketValue),''],
+ [ACCOUNT?'账户快照算术总额':'股票市值 (不含现金/期权)',fmt(ACCOUNT?ACCOUNT.netWorthWhole:S.marketValue),''],
  [S.priceMode==='mark-to-market'?'未实现盈亏 (Yahoo重估)':'未实现盈亏 (券商实际)',fmt(S.unrealized),cls(S.unrealized)],
- ['区间收益 (时间加权)',pct(S.curReturn),cls(S.curReturn)],
+ ['区间收益 (时间加权) '+qualityChip((S.twrQuality||{}).status,(S.twrQuality||{}).status==='complete'?'完整':'待核'),pct(S.curReturn),cls(S.curReturn)],
  ['超额 vs 标普',(S.spReturn==null?'—':ppf(S.curReturn-S.spReturn)),(S.spReturn==null?'':cls(S.curReturn-S.spReturn))],
 ];
 const kpiLedger=[
+ ['股票市值',fmt(ACCOUNT?ACCOUNT.equity:S.marketValue),''],
+ ['已知正现金',ACCOUNT?fmt(ACCOUNT.cashTotal):'—',''],
+ ['待结算',ACCOUNT?fmt(ACCOUNT.pending):'—',ACCOUNT?cls(ACCOUNT.pending):''],
  ['期权毛敞口',(S.optMarkGross?fmt(S.optMarkGross)+' <span class="note">≈权益 '+S.optPctEquity+'%</span>':'—'),''],
- ['已实现盈亏 (窗口·含估算)',fmt(S.realized),cls(S.realized)],
+ ['已实现盈亏 (平均成本重建) '+qualityChip((S.realizedPnlQuality||{}).confidence,(S.realizedPnlQuality||{}).confidence||'待核'),fmt(S.realized),cls(S.realized)],
  ['期权净现金流',fmt(S.optNet),cls(S.optNet)],
  ['窗口内净买入',fmt(S.netInvested),''],
  ['现金转入 (窗口)',fmt(S.deposits),''],
@@ -3182,14 +4283,14 @@ document.getElementById('kpis').innerHTML=
 let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
 const DEFAULT_SEG={ov:'score',stk:'price'};
-const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
-const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
+const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
+const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', memflow:'存储资金流', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
 function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
 // Two-level portfolio nav: 5 themed workspaces (level 1) over the seg sub-rail (level 2).
 // Routing is untouched — hash stays #/portfolio/<seg>; the workspace is derived FROM the seg.
 const WS_MAP=[
  {id:'today', label:'今日决策', segs:['score','decide','qt','mass']},
- {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch']},
+ {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch','memflow']},
  {id:'perf',  label:'净值·表现', segs:['nw','cmp','mom','pfib','sig']},
  {id:'risk',  label:'风险·结构', segs:['risk','struct']},
  {id:'plan',  label:'行为·计划', segs:['beh','journal','rebal']},
@@ -3203,8 +4304,8 @@ function syncWs(seg){
  const r=document.getElementById('right');if(!r)return;
  const bar=r.querySelector('.ws-rail');if(!bar)return;
  const w=wsFor(seg);
- bar.querySelectorAll('button[data-ws]').forEach(b=>{const on=b.dataset.ws===w.id;b.classList.toggle('on',on);b.setAttribute('aria-selected',on?'true':'false');});
- r.querySelectorAll('.seg-rail button[data-seg]').forEach(b=>{b.hidden=w.segs.indexOf(b.dataset.seg)<0;});
+ bar.querySelectorAll('button[data-ws]').forEach(b=>{const on=b.dataset.ws===w.id;b.classList.toggle('on',on);b.setAttribute('aria-selected',on?'true':'false');b.tabIndex=on?0:-1;});
+ r.querySelectorAll('.seg-rail button[data-seg]').forEach(b=>{b.hidden=w.segs.indexOf(b.dataset.seg)<0;b.tabIndex=(!b.hidden&&b.dataset.seg===seg)?0:-1;});
 }
 let routeApplying=false;
 function findStock(sym){sym=(sym||'').toUpperCase();return stocks.find(x=>x.sym===sym)||null;}
@@ -3301,7 +4402,7 @@ function activateSeg(seg,opts){
  const chosen=b.dataset.seg;
  // overview panels are lazy-rendered — if the user clicks before idle-prefetch fills this panel, render it now
  if(sel==='__OV__'&&typeof ensureOvPanel==='function')ensureOvPanel(chosen);
- r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+ r.querySelectorAll('.seg-rail button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');x.tabIndex=on?0:-1;});
  if(sel==='__OV__'){try{syncWs(chosen);}catch(e){}}   // level-1 workspace bar follows the active seg (deep links auto-activate the owning workspace)
  r.querySelectorAll('.seg').forEach(p=>{const was=p.hidden;p.hidden=p.dataset.seg!==chosen;if(was&&!p.hidden)p.classList.add('segin');});   // .segin arms the panel-entry settle (CSS, motion block); display none→block restarts it per entry
  if(!routeApplying){rememberSeg(sel==='__OV__'?'ov':'stk',chosen);if(sel==='__OV__')rememberWsSeg(chosen);}   // don't overwrite user's last-chosen tab during back/forward replay
@@ -3309,6 +4410,7 @@ function activateSeg(seg,opts){
  if(!routeApplying)_updateDocTitleAndSR(sel,chosen);   // tab click should refresh window/tab title + SR-announce — applyRoute already covers route-driven changes
  if(!routeApplying){try{_tmLog({type:'tab',sym:sel,seg:chosen});}catch(e){}}
  if(!(opts&&opts.push===false)&&!routeApplying)writeRoute(sel,chosen,true);   // tab clicks are view-state, not pages: replaceState so back walks stock-to-stock
+ try{b.scrollIntoView({block:'nearest',inline:'nearest'});const wb=r.querySelector('.ws-rail button.on');if(wb)wb.scrollIntoView({block:'nearest',inline:'nearest'});}catch(e){}
  return chosen;
 }
 function applyRoute(route,opts){
@@ -3350,14 +4452,15 @@ function adjacentStock(dir){
 function viewBarOverview(){
  const rec=recentStocks().slice(0,5);
  // chips from overview = jumping IN to a stock — pushState (new history entry) is correct
- const chips=rec.map(sym=>`<button class="microbtn recent-chip" onclick="stockGo('${sym}')" aria-label="查看 ${sym}">${sym}</button>`).join('');
+ const chips=rec.map(sym=>`<button class="microbtn recent-chip" data-sym="${esc(sym)}" onclick="stockGo(this.dataset.sym)" aria-label="查看 ${esc(sym)}">${esc(sym)}</button>`).join('');
  return `<div class="viewbar"><div class="trail"><span class="here">组合总览</span></div>${chips?`<div class="view-actions"><span class="note">最近查看</span>${chips}</div>`:''}</div>`;
 }
 function viewBarStock(s){
  const rec=recentStocks().filter(x=>x!==s.sym).slice(0,4);
  // chips from a stock view = sibling jumps; use {replace:true} so back still goes to overview, not through chip history
- const chips=rec.map(sym=>`<button class="microbtn recent-chip" onclick="stockGo('${sym}',null,{replace:true,scroll:false})" aria-label="跳转到 ${sym}">${sym}</button>`).join('');
- return `<div class="viewbar"><div class="trail"><button class="microbtn primary" onclick="goBack()" aria-label="返回组合总览">← 组合总览</button><span aria-hidden="true">/</span><span class="here here-sym">${s.sym}</span><span class="note nm-co">${s.name||''}</span></div><div class="view-actions"><button class="microbtn" onclick="adjacentStock(-1)" aria-label="上一只持仓">上一只</button><button class="microbtn" onclick="adjacentStock(1)" aria-label="下一只持仓">下一只</button></div>${chips?`<div class="view-actions" style="flex-basis:100%"><span class="note">最近</span>${chips}</div>`:''}</div>`;
+ const chips=rec.map(sym=>`<button class="microbtn recent-chip" data-sym="${esc(sym)}" onclick="stockGo(this.dataset.sym,null,{replace:true,scroll:false})" aria-label="跳转到 ${esc(sym)}">${esc(sym)}</button>`).join('');
+ const opts=filtered().map(x=>`<option value="${esc(x.sym)}" ${x.sym===s.sym?'selected':''}>${esc(x.sym)}</option>`).join('');
+ return `<div class="viewbar"><div class="trail"><button class="microbtn primary" onclick="goBack()" aria-label="返回组合总览">← 组合总览</button><span aria-hidden="true">/</span><span class="here here-sym">${esc(s.sym)}</span><span class="note nm-co">${esc(s.name||'')}</span></div><div class="view-actions adjacent-actions"><select class="stock-jump" aria-label="直接跳转到持仓" onchange="stockGo(this.value,null,{replace:true,scroll:false})">${opts}</select><button class="microbtn" onclick="adjacentStock(-1)" aria-label="上一只持仓">上一只</button><button class="microbtn" onclick="adjacentStock(1)" aria-label="下一只持仓">下一只</button></div>${chips?`<div class="view-actions recent-actions" style="flex-basis:100%"><span class="note">最近</span>${chips}</div>`:''}</div>`;
 }
 function filtered(){
  let a=stocks.filter(s=>filter==='all'||(filter==='held'?s.held:!s.held));
@@ -3387,10 +4490,10 @@ function renderHoldingsList(){   // left-list-only rebuild — used by search/so
   const daytxt=showDay?` · 今日<span class="${cls(s.dayChangePct)}" style="font-weight:600">${s.dayChangePct>0?'+':''}${s.dayChangePct.toFixed(2)}%</span>`:'';
   const fr=finFind(s.sym),fo=finOmitFind(s.sym);
   const fintxt=fr?` · 财务<span style="color:${finScoreColor(fr.finalScore)};font-weight:600">${fr.finalScore??'—'}</span>`:(fo?` · 财务<span style="color:var(--faint)">N/A</span>`:'');
-  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${s.sym}" tabindex="0" role="button" aria-current="${sel===s.sym?'page':'false'}">
-    <div><div class="sym">${dot}${s.sym} ${zap}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
+  return `<div class="row ${sel===s.sym?'sel':''}" data-s="${esc(s.sym)}" tabindex="0" role="button" aria-current="${sel===s.sym?'page':'false'}">
+    <div><div class="sym">${dot}${esc(s.sym)} ${zap}${s.hasLegacy?'<span class="legacychip">含旧仓</span>':''}</div>
     <div class="meta">${s.held?fmtN(s.shares)+' 股 @ '+fmt(s.avg):'已清仓 · '+s.numTrades+' 笔'}${momtxt}${daytxt}${fintxt}</div></div>
-    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||`<div class="note" style="padding:16px">没有匹配「${q}」的标的 · 试试清空搜索，或切到上方 持有 / 已清仓 / 全部</div>`);
+    <div class="pnl ${cls(main)}">${fmt(main)}<div class="meta">${lbl}</div></div></div>`;}).join('')||`<div class="note" style="padding:16px">没有匹配「${esc(q)}」的标的 · 试试清空搜索，或切到上方 持有 / 已清仓 / 全部</div>`);
  document.querySelectorAll('.row').forEach(r=>{r.onclick=()=>{const sym=r.dataset.s;if(sym===sel)return;if(sym==='__OV__')ovGo();else stockGo(sym);};r.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();r.click();}};});
  listEl.scrollTop=_ls;
  if(sel!=='__OV__'&&!window.__ptrakRestoringScroll){const sr=listEl.querySelector('.row[data-s="'+sel+'"]');if(sr&&sr.scrollIntoView)sr.scrollIntoView({block:'nearest'});}
@@ -3477,7 +4580,7 @@ function chart(s){
    el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${C.accent}" stroke-width="1"/>`;   // live = SOLID amber rule; reference (cost basis) stays dashed muted amber
    el+=`<text x="${W-mR+6}" y="${y+4}" fill="${C.accent}" font-size="11">现价 $${s.curPrice}</text>`;}
  const cid='c'+(++CHARTID);
- const MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();CHARTREG[cid]={dates:prices.map(p=>+new Date(p[0])),ys:prices.map(p=>yc(p[1])),rows:prices.map(p=>{const dt=new Date(p[0]);const dd=(s.held&&s.curPrice&&p[1])?(s.curPrice/p[1]-1)*100:null;return '<b>'+s.sym+' '+fd(dt,MY)+'</b><br><span class="xr"><i style="background:'+C.price+'"></i>价格 '+fmt(p[1])+'</span>'+(dd!=null?'<span class="xr '+(dd>=0?'pos':'neg')+'">现价较该日 '+(dd>=0?'+':'')+dd.toFixed(1)+'%</span>':'');})};
+ const MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();CHARTREG[cid]={dates:prices.map(p=>+new Date(p[0])),ys:prices.map(p=>yc(p[1])),rows:prices.map(p=>{const dt=new Date(p[0]);const dd=(s.held&&s.curPrice&&p[1])?(s.curPrice/p[1]-1)*100:null;return '<b>'+esc(s.sym)+' '+fd(dt,MY)+'</b><br><span class="xr"><i style="background:'+C.price+'"></i>价格 '+fmt(p[1])+'</span>'+(dd!=null?'<span class="xr '+(dd>=0?'pos':'neg')+'">现价较该日 '+(dd>=0?'+':'')+dd.toFixed(1)+'%</span>':'');})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
  const amts=txns.filter(t=>t.side!=='OPEN').map(t=>Math.abs(t.amount)),amax=Math.max(...amts,1);
  const RMIN=(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches)?7:4;
@@ -3499,10 +4602,10 @@ function chart(s){
    const wp=qty?g.reduce((a,i)=>a+(txns[i].price||0)*(txns[i].qty||0),0)/qty:t0.price;
    const y=yc(wp||t0.price);
    const r=t0.side==='OPEN'?5:Math.max(RMIN,Math.min(crowded?7:10,4+6.5*Math.sqrt(amt/amax)));
-   const col=t0.side==='BUY'?C.green:(t0.side==='SELL'?C.red:C.grey);
-   const fo=t0.side==='SELL'?0:(crowded?0.18:0.3),sw=t0.side==='SELL'?2.4:1.2;   // SELL = hollow ring so buy/sell differ by shape, not hue alone (colorblind-safe); BUY translucent so the price line wins
-   el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="${fo}" stroke="${col}" stroke-width="${sw}" data-g="${g.join(',')}" data-i="${g[0]}" data-sym="${s.sym}" class="mk" style="cursor:pointer"/>`;});
- return `<svg id="${cid}" class="xh" role="img" aria-label="数据图表 · 关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+  const col=t0.side==='BUY'?C.green:(t0.side==='SELL'?C.red:C.grey);
+  const fo=t0.side==='SELL'?0:(crowded?0.18:0.3),sw=t0.side==='SELL'?2.4:1.2;   // SELL = hollow ring so buy/sell differ by shape, not hue alone (colorblind-safe); BUY translucent so the price line wins
+   el+=`<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" fill-opacity="${fo}" stroke="${col}" stroke-width="${sw}" data-g="${g.join(',')}" data-i="${g[0]}" data-sym="${esc(s.sym)}" class="mk" role="button" tabindex="0" aria-label="${esc(s.sym)} ${t0.side==='BUY'?'买入':(t0.side==='SELL'?'卖出':'期初底仓')} · ${esc(dd)} · ${g.length} 笔" style="cursor:pointer"/>`;});
+ return `<svg id="${cid}" class="xh" role="group" aria-label="价格与交易图；交易标记可用键盘查看，关键数值见下方表格与徽标" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 function svgLines(ser,defs,opts){
  const MOB=CHART_MOB,W=MOB?520:900,H=opts.h||340,mL=AXM.mL,mR=AXM.mR,mT=16,mB=MOB?32:40;
@@ -3547,10 +4650,10 @@ function svgLines(ser,defs,opts){
 // State ramp: NO pure amber — overheat wears the chart-ramp warm amber (#C99A3A) so the Barometer's
 // pure-amber now-tick can never dissolve into an overheat run. ema21-state shares the EMA21 line's
 // grey-blue. Product-wide, pure amber now means exactly: masthead tick · barometer now-tick · your live line.
-function qStateColor(s){return {trend:'#4FB286',overheat:'#C99A3A',ema8:'#4FB286',ema21:'#AEB4BE',below21:'#E5707A',mixed:'#888D96'}[s]||'#888D96';}
+function qStateColor(s){return {trend:'#4FB286',overheat:'#C99A3A',ema8:'#4FB286',ema21:'#AEB4BE',repair:'#C99A3A',below21:'#E5707A',mixed:'#888D96'}[s]||'#888D96';}
 // one source of truth for the QQQ weather chart palette — strokes, end-labels, legend and tooltip all read this
-const QTC={close:'#D9DCE1',ema8:'#B89030',ema21:'#AEB4BE',ema34:'#888D96',ema55:'#4B4F58'};   // ema8 = reference amber: indicators never claim the live accent
-function qStateLabel(s){return {trend:'多头',overheat:'过热',ema8:'EMA8',ema21:'EMA21',below21:'破21',mixed:'转换'}[s]||s;}
+const QTC={close:'#D9DCE1',ema8:'#B89030',ema21:'#AEB4BE',ema34:'#888D96',ema55:'#5F6168'};   // ema8 = reference amber: indicators never claim the live accent
+function qStateLabel(s){return {trend:'多头',overheat:'过热',ema8:'EMA8',ema21:'EMA21',repair:'修复',below21:'破21',mixed:'转换'}[s]||s;}
 function qqqStrategyChart(q){
  const ser=(q&&q.series)||[];if(!ser.length)return'<div class="note">QQQ 数据不足，无法绘图。</div>';
  const MOB=CHART_MOB,W=MOB?520:900,H=404,mL=AXM.mL,mR=AXM.mR,mT=16,mB=60,stripH=12,stripY=H-mB+24;
@@ -3612,9 +4715,9 @@ function nwChart(ser){
     el+=`<rect x="${x0}" y="${stripY}" width="${Math.max(1,x1-x0+0.6)}" height="${stripH}" fill="${col(ser[r0+1].pmom)}" fill-opacity="0.9"/>`;r0=i-1;}}}
  el+=`<text x="${mL-8}" y="${stripY+stripH-1}" fill="${C.mut}" font-size="10" text-anchor="end">${MOB?'动能':'组合动能'}</text>`;
  const v0=ser[0].value,mw=m=>m>15?'强':(m<-15?'弱':'中性');
- const MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),ys:ser.map(p=>yc(p.value)),rows:ser.map(p=>{const dt=new Date(p.date),d=p.value-v0;return '<b>'+fd(dt,MY)+'</b><br><span class="xr"><i style="background:#E8B339"></i>净值 $'+(p.value/1000).toFixed(1)+'k</span><span class="xr '+(d>=0?'pos':'neg')+'">较起点 '+(d>=0?'+':'')+fmt(d)+' ('+(v0?(d/v0*100).toFixed(1):'0')+'%)</span><span class="xr" style="color:'+col(p.pmom)+'">组合动能 '+mw(p.pmom)+'</span>';})};
+ const MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();CHARTREG[cid]={dates:ser.map(p=>+new Date(p.date)),ys:ser.map(p=>yc(p.value)),rows:ser.map(p=>{const dt=new Date(p.date),d=p.value-v0;return '<b>'+fd(dt,MY)+'</b><br><span class="xr"><i style="background:#E8B339"></i>调整价路径值 $'+(p.value/1000).toFixed(1)+'k</span><span class="xr '+(d>=0?'pos':'neg')+'">较起点 '+(d>=0?'+':'')+fmt(d)+' ('+(v0?(d/v0*100).toFixed(1):'0')+'%)</span><span class="xr" style="color:'+col(p.pmom)+'">组合动能 '+mw(p.pmom)+'</span>';})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB-stripH}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB-stripH}" fill="transparent"/>`;
- return `<svg id="${cid}" class="xh" role="img" aria-label="组合净值曲线 · 关键数值见上方与表格" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+ return `<svg id="${cid}" class="xh" role="img" aria-label="股票调整价价值路径 · 历史点不是券商 NAV" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
 let cfSel=null;
 function cfEvents(){return ((DATA.counterfactual||{}).events)||[];}
@@ -3634,15 +4737,15 @@ function cfUniverseChart(ev){
 }
 function cfComparisonTable(evs,activeId){
  const rows=evs.map(e=>{const s=e.summary||{},sc=e.score||{},on=e.id===activeId,score=sc.score,scoreTxt=score==null?'—':Number(score).toFixed(1),scoreCol=cfScoreColor(score);
-  return `<tr data-cfrow="${e.id}" tabindex="0" role="button" aria-pressed="${on?'true':'false'}" style="cursor:pointer;${on?'background:rgba(232,179,57,.075)':''}">
-    <td class="l"><b>${e.start}</b><br><span class="note">${(e.symbols||[]).join('/')}</span></td>
-    <td><span style="color:${scoreCol};font-family:var(--f-mono);font-weight:600">${scoreTxt}</span><br><span class="note">${sc.grade||'—'} · ${sc.outcome||''}</span></td>
+  return `<tr data-cfrow="${esc(e.id)}" tabindex="0" aria-current="${on?'true':'false'}" style="cursor:pointer;${on?'background:rgba(232,179,57,.075)':''}">
+    <td class="l"><b>${esc(e.start)}</b><br><span class="note">${(e.symbols||[]).map(esc).join('/')}</span></td>
+    <td><span style="color:${scoreCol};font-family:var(--f-mono);font-weight:600">${scoreTxt}</span><br><span class="note">${esc(sc.grade||'—')} · ${esc(sc.outcome||'')}</span></td>
     <td class="${cls(s.currentDelta||0)}">${fmt(s.currentDelta||0)}</td>
     <td class="${cls(s.currentDeltaPct||0)}">${ppf(s.currentDeltaPct||0)}</td>
     <td>${cfSignedPct(s.actualPct,1)}</td>
     <td>${cfSignedPct(s.altPct,1)}</td>
     <td class="${cls(sc.impactOnTurnoverPct||0)}">${cfSignedPct(sc.impactOnTurnoverPct,1)}</td>
-    <td><span class="note">${s.isTruncated?'截至 '+(s.lastValidDate||'可比日'):'最新'}</span></td>
+    <td><span class="note">${s.isTruncated?'截至 '+esc(s.lastValidDate||'可比日'):'最新'}</span></td>
    </tr>`;}).join('');
  return `<div style="margin-top:12px"><div class="cap" style="margin-bottom:6px">所有平行宇宙收益比较</div>
    <div class="scroll"><table><thead><tr><th class="l">调仓阶段</th><th>评分</th><th>真实−未调仓</th><th>组合差</th><th>真实回报</th><th>未调仓回报</th><th>成交额效率</th><th>口径</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
@@ -3650,32 +4753,32 @@ function cfComparisonTable(evs,activeId){
 function counterfactualCard(){
  const evs=cfEvents();
  if(!evs.length)return `<div class="card"><div class="dh"><h2 class="t">平行宇宙回放<span class="t-en">Counterfactual</span></h2><span class="nm">跳过某次调仓，和真实走势同屏比较</span></div><div class="note" style="line-height:1.7">当前交易窗口里没有识别到足够大的调仓阶段。规则：同一阶段内跨标的或买卖并存，且成交额达到组合规模阈值。后续同步有新的交易后会自动出现。<b>非投资建议。</b></div></div>`;
- const ev=cfActive(),s=ev.summary||{},warn=(ev.warnings||[])[0],agg=cfAgg(),esc=ev.score||{};
- const btn=(e,on)=>`<button data-cf="${e.id}" aria-pressed="${on?'true':'false'}" style="padding:5px 10px;border-radius:var(--r-ctl);border:1px solid ${on?'#E8B339':'var(--line)'};background:${on?'rgba(232,179,57,.12)':'transparent'};color:${on?'#E8B339':'var(--txt)'};cursor:pointer;font-size:var(--t-xs);margin:0 6px 6px 0;text-align:left">${e.label}<br><span class="note">${fmt(e.gross)} 成交</span></button>`;
+ const ev=cfActive(),s=ev.summary||{},warn=(ev.warnings||[])[0],agg=cfAgg(),evScore=ev.score||{};
+ const btn=(e,on)=>`<button data-cf="${esc(e.id)}" aria-pressed="${on?'true':'false'}" style="padding:5px 10px;border-radius:var(--r-ctl);border:1px solid ${on?'#E8B339':'var(--line)'};background:${on?'rgba(232,179,57,.12)':'transparent'};color:${on?'#E8B339':'var(--txt)'};cursor:pointer;font-size:var(--t-xs);margin:0 6px 6px 0;text-align:left">${esc(e.label)}<br><span class="note">${fmt(e.gross)} 成交</span></button>`;
  const deltaCls=cls(s.currentDelta||0),better=(s.currentDelta||0)>=0?'真实宇宙领先':'未调仓宇宙领先';
- const asof=s.isTruncated?`截至可比日 ${s.lastValidDate||''}`:'截至最新';
- const allAgg=agg.allComparable||{},scoreCol=cfScoreColor(esc.score),aggCol=cfScoreColor(agg.score),allCol=cfScoreColor(allAgg.score);
+ const asof=s.isTruncated?`截至可比日 ${esc(s.lastValidDate||'')}`:'截至最新';
+ const allAgg=agg.allComparable||{},scoreCol=cfScoreColor(evScore.score),aggCol=cfScoreColor(agg.score),allCol=cfScoreColor(allAgg.score);
  const aggScope=agg.scope==='latest'?'最新':'可比';
  const aggBadges=[
-  [`总调仓评分（${aggScope}）`,agg.score==null?'—':`<span style="color:${aggCol}">${Number(agg.score).toFixed(1)}</span> <span class="note">${agg.grade||''} · ${agg.outcome||''}</span>`],
+  [`总调仓评分（${aggScope}）`,agg.score==null?'—':`<span style="color:${aggCol}">${Number(agg.score).toFixed(1)}</span> <span class="note">${esc(agg.grade||'')} · ${esc(agg.outcome||'')}</span>`],
   [`${aggScope}差额合计`,`<span class="${cls(agg.totalDelta||0)}">${fmt(agg.totalDelta||0)}</span>`],
   ['成交额效率',`<span class="${cls(agg.impactOnTurnoverPct||0)}">${cfSignedPct(agg.impactOnTurnoverPct,1)}</span>`],
   ['胜率',agg.winRate==null?'—':`${agg.winRate.toFixed(1)}% <span class="note">${agg.winCount||0}/${agg.scoredCount||0}</span>`],
   ['覆盖调仓',`${agg.allScoredCount||agg.scoredCount||0} 次 <span class="note">${agg.completeCount||0} 最新 / ${agg.truncatedCount||0} 截至可比日</span>`],
   ['加权收益差',agg.avgSpreadPct==null?'—':`<span class="${cls(agg.avgSpreadPct||0)}">${ppf(agg.avgSpreadPct)}</span>`],
  ];
- if((agg.truncatedCount||0)>0&&allAgg.score!=null)aggBadges.push(['所有可比评分',`<span style="color:${allCol}">${Number(allAgg.score).toFixed(1)}</span> <span class="note">${allAgg.grade||''} · ${fmt(allAgg.totalDelta||0)}</span>`]);
+ if((agg.truncatedCount||0)>0&&allAgg.score!=null)aggBadges.push(['所有可比评分',`<span style="color:${allCol}">${Number(allAgg.score).toFixed(1)}</span> <span class="note">${esc(allAgg.grade||'')} · ${fmt(allAgg.totalDelta||0)}</span>`]);
  const badges=[
-  ['本次调仓评分',esc.score==null?'—':`<span style="color:${scoreCol}">${Number(esc.score).toFixed(1)}</span> <span class="note">${esc.grade||''} · ${esc.outcome||''}</span>`],
+  ['本次调仓评分',evScore.score==null?'—':`<span style="color:${scoreCol}">${Number(evScore.score).toFixed(1)}</span> <span class="note">${esc(evScore.grade||'')} · ${esc(evScore.outcome||'')}</span>`],
   [asof,`<span class="${deltaCls}">${fmt(s.currentDelta||0)}</span> <span class="note">${better}</span>`],
-  ['成交额效率',`<span class="${cls(esc.impactOnTurnoverPct||0)}">${cfSignedPct(esc.impactOnTurnoverPct,1)}</span>`],
+  ['成交额效率',`<span class="${cls(evScore.impactOnTurnoverPct||0)}">${cfSignedPct(evScore.impactOnTurnoverPct,1)}</span>`],
   ['真实宇宙',`${(s.actualPct==null?0:s.actualPct).toFixed(1)}%`],
   ['未调仓宇宙',`${(s.altPct==null?0:s.altPct).toFixed(1)}%`],
   ['最大领先/落后',`${fmt(s.bestDelta||0)} · ${fmt(s.worstDelta||0)}`],
-  ['分叉日',ev.branchDate||ev.start],
+  ['分叉日',esc(ev.branchDate||ev.start)],
  ];
- const legs=(ev.legs||[]).slice(0,10).map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.sym}</td><td>${t.side==='BUY'?'<span class="tag b">买入</span>':'<span class="tag s">卖出</span>'}</td><td>${t.qty}</td><td>${fmt(t.amount)}</td></tr>`).join('');
- const wnote=warn?`<div class="note" style="margin-top:8px;color:#C99A3A"><b>边界：</b>${warn.reason||'路径存在不可比边界'}${warn.sym?` · ${warn.sym}`:''}。图中平行线在不可比处停止。</div>`:'';
+ const legs=(ev.legs||[]).slice(0,10).map(t=>`<tr><td class="l">${esc(t.date)}</td><td class="l">${esc(t.sym)}</td><td>${t.side==='BUY'?'<span class="tag b">买入</span>':'<span class="tag s">卖出</span>'}</td><td>${t.qty}</td><td>${fmt(t.amount)}</td></tr>`).join('');
+ const wnote=warn?`<div class="note" style="margin-top:8px;color:#C99A3A"><b>边界：</b>${esc(warn.reason||'路径存在不可比边界')}${warn.sym?` · ${esc(warn.sym)}`:''}。图中平行线在不可比处停止。</div>`:'';
  return `<div class="card" id="cfcard">
    <div class="dh"><h2 class="t">平行宇宙回放<span class="t-en">Counterfactual</span></h2><span class="nm">如果某个阶段的调仓没有发生，后续走势会怎样</span></div>
    <div class="note" style="margin-bottom:8px;line-height:1.6">选择一个历史调仓阶段：实线=真实宇宙；虚线=跳过该阶段、后续真实交易照常重放的平行宇宙。两条线从分叉日归一到 0%。主总分只统计能一路回放到最新价格的事件；截断事件在表内按最后可比日标注。</div>
@@ -3683,7 +4786,7 @@ function counterfactualCard(){
    <div style="display:flex;align-items:center;gap:10px;margin:2px 0 12px"><span class="note">总评分刻度</span>${cfScoreMeter(agg)}<span class="note">50 = 中性</span></div>
    <div style="display:flex;flex-wrap:wrap;max-height:128px;overflow:auto;margin:4px 0 8px;padding-top:2px;border-bottom:1px solid var(--hair)">${evs.map(e=>btn(e,e.id===ev.id)).join('')}</div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
-   <div style="display:flex;align-items:center;gap:10px;margin:2px 0 10px"><span class="note">本次评分刻度</span>${cfScoreMeter(esc)}<span class="note">成交额效率 = 差额 / 本次成交额</span></div>
+   <div style="display:flex;align-items:center;gap:10px;margin:2px 0 10px"><span class="note">本次评分刻度</span>${cfScoreMeter(evScore)}<span class="note">成交额效率 = 差额 / 本次成交额</span></div>
    <div class="legend"><span><i class="ln" style="color:#E8B339"></i>真实宇宙</span><span><i class="lnd" style="color:#B6BAC1"></i>未调仓宇宙</span><span class="note">悬停看每日差额</span></div>
    ${cfUniverseChart(ev)}
    ${wnote}
@@ -3707,23 +4810,23 @@ function structureCard(){
  if(!X||(!X.byAssetClass.length&&!X.byTheme.length))return '<div class="card"><div class="dh"><h2 class="t">结构</h2></div><div class="note">结构数据不足。</div></div>';
  // Card 1: asset-class structure (always-on floor)
  const acRows=X.byAssetClass.map(b=>{const w=Math.min(b.weightPct,100);
-   return `<div class="frow acrow"><span class="fsym">${b.bucket}</span>
+   return `<div class="frow acrow"><span class="fsym">${esc(b.bucket)}</span>
      <div class="fbar"><div class="p" style="left:0;width:${w}%;background:${b.isCash?'var(--faint)':'var(--mut)'}"></div></div>
      <span class="acpct">${b.weightPct.toFixed(1)}%</span>
      <span class="note acval">${fmt(b.value)}</span></div>`;}).join('');
  const card1=`<div class="card"><div class="dh"><h2 class="t">资产类别结构</h2><span class="nm">个股 vs 宽基ETF vs 主题ETF vs 杠杆 vs 商品 vs 现金 · 零额外数据，总是可得</span></div>${acRows}</div>`;
  // Card 2: theme/sector structure (weight vs risk)
  const lt=X.largestTheme;
- const callout=lt?`<div class="note" style="margin:4px 0 10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.6"><b>最大主题集中：${lt.theme}</b> · ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?` / ${lt.riskPct.toFixed(0)}% 风险`:''} · ${lt.n} 只标的。${lt.n>1?`这 ${lt.n} 只高度相关，名义上分散、实为一笔约 ${lt.weightPct.toFixed(0)}% 的单一主题押注。`:''}</div>`:'';
+ const callout=lt?`<div class="note" style="margin:4px 0 10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.6"><b>最大主题集中：${esc(lt.theme)}</b> · ${lt.weightPct.toFixed(0)}% 资金${lt.riskPct!=null?` / ${lt.riskPct.toFixed(0)}% 风险`:''} · ${lt.n} 只标的。${lt.n>1?`这 ${lt.n} 只高度相关，名义上分散、实为一笔约 ${lt.weightPct.toFixed(0)}% 的单一主题押注。`:''}</div>`:'';
  const tRows=X.byTheme.map(t=>{const grey=t.theme==='未分类'?'color:var(--mut)':'';
    let riskCell='<td>—</td>',gapCell='<td></td><td>—</td>';
    if(t.riskPct!=null){const g=t.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
      riskCell=`<td>${t.riskPct.toFixed(1)}%</td>`;
      gapCell=`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td><td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}pp</td>`;}
-   return `<tr style="${grey}"><td class="l">${t.theme}</td><td><span class="chip">${t.src}</span></td>
+   return `<tr style="${grey}"><td class="l">${esc(t.theme)}</td><td><span class="chip">${esc(t.src)}</span></td>
      <td>${t.weightPct.toFixed(1)}%</td>${riskCell}${gapCell}<td class="note">${t.n}</td></tr>`;}).join('');
- const ex=(DATA.risk&&DATA.risk.excluded)||[];
- const exNote=ex.length?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险贡献（故各主题风险占比之和可能 <100%）：${ex.join('、')}</div>`:'';
+ const rq=(DATA.risk&&DATA.risk.contribQuality)||{},ex=(DATA.risk&&DATA.risk.excluded)||[];
+ const exNote=(rq.status&&rq.status!=='complete')?`<div class="note" style="margin-top:8px">风险贡献采用覆盖切片：${rq.coverageWeightPct??0}% 股票市值 · ${rq.commonReturnPairs??0} 个共同日收益。风险−资金比较的是<b>切片内风险占比</b>与<b>切片内资金占比</b>；全组合资金仍单独显示。${ex.length?` 未纳入：${esc(ex.join('、'))}。`:''}</div>`:'';
  const card2=`<div class="card"><div class="dh"><h2 class="t">主题 / 行业结构</h2><span class="nm">把相关标的合成一个敞口 · 资金占比 vs 风险占比（复用风险贡献，零重算）</span></div>${callout}
    <div class="scroll"><table><thead><tr><th class="l">主题</th><th>来源</th><th>资金权重</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该主题风险占比减资金占比；正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th>只数</th></tr></thead><tbody>${tRows}</tbody></table></div>${exNote}</div>`;
  // Card 3: concentration / effective-N
@@ -3732,7 +4835,7 @@ function structureCard(){
    if(c.effNRisk!=null)badges.push(['主题 HHI（风险）',c.hhiRisk.toFixed(2)],['主题有效持仓数（风险）','≈ '+c.effNRisk.toFixed(1)]);
    badges.push(['名义 → 主题有效',`${c.nominalN} 只 → ≈ ${c.effNWeight!=null?c.effNWeight.toFixed(0):'—'}`]);}
  const p=X.provenance||{};
- const howto=`<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>逐只看权重，会把同一驱动的多只标的读成多笔独立小仓；本页做的是<b>你自己不会做的汇总</b>——把同一因子的标的合成<b>一个敞口</b>，同屏看它占多少<b>资金</b>、又占多少<b>风险</b>（Thaler p.1582：逐项割裂 vs 联合判断）。机制：<b>窄框架</b> · <b>相关性忽视</b>（N 只不同代码 ≠ N 笔独立押注）· <b>朴素 1/N 分散</b>与<b>分散幻觉</b>（有效持仓数 ≪ 名义只数）。<br>风险贡献为<b>窗口内已实现风险</b>的描述性分解（小样本、非预测），仅含股票，<b>低估</b>杠杆(TQQQ)与期权真实敞口${DATA.account?` <span class="note-lk" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key==='\ '){event.preventDefault();this.click();}" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}。主题标签来源：Yahoo 行业 / 人工标注 / 资产类别${p.asOf&&p.asOf!=='—'?` · 缓存于 ${p.asOf}`:''} · ${p.unclassified||0} 项未分类。结构是“你的钱与波动落在哪里”的描述，<b>不评判任何标的高估/低估</b>（Thaler p.1588）。<b>非投资建议。</b></div>`;
+ const howto=`<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>逐只看权重，会把同一驱动的多只标的读成多笔独立小仓；本页做的是<b>你自己不会做的汇总</b>——把同一因子的标的合成<b>一个敞口</b>，同屏看它占多少<b>资金</b>、又占多少<b>风险</b>（Thaler p.1582：逐项割裂 vs 联合判断）。机制：<b>窄框架</b> · <b>相关性忽视</b>（N 只不同代码 ≠ N 笔独立押注）· <b>朴素 1/N 分散</b>与<b>分散幻觉</b>（有效持仓数 ≪ 名义只数）。<br>风险贡献为<b>窗口内已实现风险</b>的描述性分解（小样本、非预测），仅含股票，<b>低估</b>杠杆(TQQQ)与期权真实敞口${DATA.account?` <span class="note-lk" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key==='\ '){event.preventDefault();this.click();}" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}。主题标签来源：Yahoo 行业 / 人工标注 / 资产类别${p.asOf&&p.asOf!=='—'?` · 缓存于 ${esc(p.asOf)}`:''} · ${p.unclassified||0} 项未分类。结构是“你的钱与波动落在哪里”的描述，<b>不评判任何标的高估/低估</b>（Thaler p.1588）。<b>非投资建议。</b></div>`;
  const card3=`<div class="card"><div class="dh"><h2 class="t">集中度 · 有效持仓数</h2><span class="nm">名义持仓 ≠ 独立押注：主题层 HHI 与有效 N（1/HHI）</span></div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>${howto}</div>`;
  return card1+card2+card3;
@@ -3747,12 +4850,63 @@ function contributionCard(){
  const showShare=Math.abs(totUn)>maxAbs;   // only show % when the net dominates the largest single name (else share is sign-mixed nonsense)
  const rows=ranked.slice(0,10).map(x=>{const hw=Math.min(Math.abs(x.unreal)/maxAbs,1)*50,left=x.unreal>=0?50:50-hw,c=x.unreal>0?'#4FB286':(x.unreal<0?'#E5707A':'var(--mut)');
    const share=showShare?`<span class="fst" style="color:${c}">${(x.unreal/totUn*100).toFixed(0)}%</span>`:'<span class="fst"></span>';
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')"><span class="fsym">${x.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${hw}%;background:${c}"></div></div><span class="fval" style="color:${c}">${fmt(x.unreal)}</span>${share}</div>`;}).join('');
+   return `<div class="frow" data-sym="${esc(x.sym)}" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)"><span class="fsym">${esc(x.sym)}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${hw}%;background:${c}"></div></div><span class="fval" style="color:${c}">${fmt(x.unreal)}</span>${share}</div>`;}).join('');
  const shareNote=showShare?'右列=占组合未实现盈亏净额的比例。':'各仓盈亏方向不一、净额较小，占比无意义，故只看绝对金额（条形）。';
  return `<div class="card"><div class="dh"><h2 class="t">盈亏贡献 · 谁在拉高 / 拉低</h2><span class="nm">按未实现盈亏绝对额排序（点击看个股）</span></div>
    <div class="legend"><span><i style="background:#4FB286"></i>拉高</span><span><i style="background:#E5707A"></i>拉低</span><span class="note">条形=相对最大贡献的金额</span></div>
    ${rows}
    <div class="note" style="margin-top:8px;line-height:1.6"><b>怎么读：</b>这是<b>未实现盈亏的“金额”贡献</b>（每只 = 当前市值 − 成本），看谁在把组合拉高、谁在拖累。${shareNote}<b>这不是时间加权(TWR)归因</b>——真正的 TWR 拆解需要每日持仓权重，本导出无法重建，故此处只用金额。<b>非投资建议。</b></div></div>`;
+}
+// One alert ledger powers both the hero verdict and per-position ranking.  Every
+// item is deduplicated by semantic key and points to the screen where its
+// evidence lives; informational limitations remain visible without inflating
+// the actionable-alert count.
+function buildAlertModel(){
+ const levelRank={critical:3,warn:2,info:1},items=new Map();
+ const put=(x)=>{x=Object.assign({level:'warn',sym:null,seg:'score',detail:''},x);if(VALID_SEG.ov.indexOf(x.seg)<0)x.seg='score';x.score=(levelRank[x.level]||1)*100+(x.weight||0);const old=items.get(x.key);if(!old||x.score>old.score)items.set(x.key,x);};
+ const held=stocks.filter(s=>s.held),bias=(DATA.behavior&&DATA.behavior.biasBySym)||{},rc={};
+ ((DATA.risk&&DATA.risk.contrib)||[]).forEach(x=>rc[x.sym]=x);
+ let drift={map:{},band:5};try{drift=rebalDriftMap();}catch(e){}
+ held.forEach(s=>{
+  const n=s.fib&&s.fib.now,c=rc[s.sym],d=drift.map[s.sym];
+  if(s.dayChangePct!=null&&s.dayChangePct<-3)put({key:'day:'+s.sym,type:'day_drop',sym:s.sym,level:s.dayChangePct<=-5?'critical':'warn',weight:Math.min(30,Math.abs(s.dayChangePct)),label:`${s.sym} 今日 ${pct(s.dayChangePct)}`,detail:'日内下跌超过 3%'});
+  if(s.unrealPct!=null&&s.unrealPct<-15)put({key:'loss:'+s.sym,type:'deep_loss',sym:s.sym,weight:Math.min(25,Math.abs(s.unrealPct)/2),label:`${s.sym} 未实现 ${pct(s.unrealPct)}`,detail:'未实现亏损超过 15%'});
+  if(n&&n.state==='down')put({key:'trend:'+s.sym,type:'trend_down',sym:s.sym,weight:9,label:`${s.sym} 技术趋势向下`,detail:n.label||'趋势状态 down'});
+  if(n&&n.rsi>75)put({key:'rsi:'+s.sym,type:'rsi_hot',sym:s.sym,weight:Math.min(12,n.rsi-70),label:`${s.sym} RSI ${n.rsi}`,detail:'RSI 超过 75，留意过热'});
+  if(c&&c.gap>10)put({key:'riskgap:'+s.sym,type:'risk_gap',sym:s.sym,weight:Math.min(25,c.gap),label:`${s.sym} 风险贡献高于覆盖切片资金 ${c.gap.toFixed(1)}pp`,detail:'覆盖切片内的波动风险占比显著高于同切片资金权重'});
+  (bias[s.sym]||[]).filter(b=>b.level==='alert').forEach(b=>put({key:'behavior:'+s.sym+':'+b.id,type:'behavior',sym:s.sym,weight:7,label:`${s.sym} 行为标记：${b.label||b.id}`,detail:b.reason||''}));
+  if(d&&Math.abs(d.drift)>drift.band)put({key:'drift:'+s.sym,type:'drift',sym:s.sym,weight:Math.min(20,Math.abs(d.drift)),label:`${s.sym} 偏离目标 ${d.drift>0?'+':''}${d.drift.toFixed(1)}pp`,detail:`超过已设 ${drift.band}pp 区间`,seg:'rebal'});
+ });
+ if(S.fetchOK===false)put({key:'data:fetch',type:'freshness',level:'critical',weight:40,label:'价格刷新失败',detail:S.fetchReason||'当前数字可能是缓存值',seg:'nw'});
+ else if(S.fetchStale||FRESH.pAge!=null&&FRESH.pAge>1)put({key:'data:prices',type:'freshness',level:FRESH.pAge!=null&&FRESH.pAge>3?'critical':'warn',weight:30,label:'价格数据过期',detail:FRESH.pAge!=null?`${FRESH.pAge} 个交易日前`:(S.fetchReason||''),seg:'nw'});
+ if(FRESH.aAge!=null&&FRESH.aAge>1)put({key:'data:account',type:'freshness',level:FRESH.aAge>5?'critical':'warn',weight:28,label:'账户快照过期',detail:`${FRESH.aAge} 个交易日前`,seg:'nw'});
+ if(FRESH.gHours!=null&&FRESH.gHours>36)put({key:'data:generated',type:'freshness',level:FRESH.gHours>96?'critical':'warn',weight:20,label:'仪表板需重新生成',detail:`${Math.floor(FRESH.gHours)} 小时前生成`,seg:'nw'});
+ (S.missingPriceSymbols||[]).forEach(sym=>put({key:'data:missing-price:'+sym,type:'data_quality',sym:findStock(sym)?sym:null,level:'critical',weight:25,label:`${sym} 缺少价格`,detail:'估值与相关指标不完整',seg:'nw'}));
+ FRESH.badArtifacts.forEach(x=>put({key:'artifact:'+x.artifact,type:'artifact',level:'critical',weight:25,label:`${x.artifact} 无效`,detail:x.reason||x.status||'',seg:x.segment||'nw'}));
+ FRESH.watchArtifacts.forEach(x=>put({key:'artifact:'+x.artifact,type:'artifact',level:'warn',weight:15,label:`${x.artifact} 待复核`,detail:x.reason||x.status||'',seg:x.segment||'nw'}));
+ const tq=S.twrQuality||{},mq=S.mwrQuality||{},rq=S.realizedPnlQuality||{};
+ if(tq.status&&tq.status!=='complete')put({key:'quality:twr',type:'data_quality',level:'warn',weight:22,label:`TWR 质量：${tq.status}`,detail:`${tq.usableSessions||0}/${tq.axisSessions||0} 可用交易日；缺失 ${(tq.missingSymbols||[]).join('、')||'—'}`,seg:'nw'});
+ if(mq.status&&mq.status!=='complete')put({key:'quality:mwr',type:'data_quality',level:'warn',weight:20,label:`MWR 质量：${mq.status}`,detail:`dated flows ${mq.datedCashEventCount||0} · fallback ${fmt(mq.fallbackAggregateCash||0)} · aligned ${mq.alignedWithTWR===true?'是':'否'}`,seg:'nw'});
+ if(rq.confidence&&rq.confidence!=='high'&&rq.confidence!=='not-applicable')put({key:'quality:realized',type:'data_quality',level:rq.confidence==='low'?'warn':'info',weight:18,label:`已实现 P&L 置信度 ${rq.confidence}`,detail:rq.method||'平均成本重建，非券商税务 lot 口径',seg:'nw'});
+ stocks.filter(x=>x.realizedConfidence==='low').forEach(x=>put({key:'quality:realized:'+x.sym,type:'data_quality',sym:x.sym,stockSeg:'tx',level:'warn',weight:16,label:`${x.sym} 已实现 P&L 低置信`,detail:(x.realizedWarnings||[]).join('；')||x.realizedBasisScope||''}));
+ const A=ACCOUNT,R=A&&A.optionRisk,rs=R&&R.summary||{};
+ if((rs.marginShortPutContracts||0)>0)put({key:'option:margin-short-put',type:'option_margin',level:'critical',weight:45,label:`${fmtN(rs.marginShortPutContracts,0)} 张非现金担保 short put`,detail:`潜在指派 ${fmt(rs.shortPutAssignmentValue||0)}；已知正现金 ${fmt(A.cashTotal)}`,seg:'nw'});
+ if((rs.uncoveredCallContracts||0)>0)put({key:'option:uncovered-call',type:'option_margin',level:'critical',weight:50,label:`${fmtN(rs.uncoveredCallContracts,0)} 张未覆盖 short call`,detail:'最大风险未定义，需实时购买力/Greeks',seg:'nw'});
+ if(A&&A.optMarkGross>0&&A.optPctEquity>25)put({key:'option:gross',type:'option_exposure',level:'warn',weight:Math.min(35,A.optPctEquity/2),label:`期权毛市值 ≈ 股票权益 ${A.optPctEquity}%`,detail:`毛额 ${fmt(A.optMarkGross)}，不是 Delta/名义敞口`,seg:'nw'});
+ if(A&&A.optLegs&&A.optLegs.length)put({key:'account:margin-unknown',type:'margin_unknown',level:'warn',weight:18,label:'保证金借记/购买力未知',detail:'导出不含 margin debit 或 buying power，已知现金不等于可动用现金',seg:'nw'});
+ if(A&&A.cashTotal+(A.pending||0)<0)put({key:'account:cash-pending',type:'cash',level:'critical',weight:35,label:'已知正现金 + 待结算为负',detail:`${fmt(A.cashTotal)} + ${fmt(A.pending)} = ${fmt(A.cashTotal+(A.pending||0))}`,seg:'nw'});
+ else if(A&&A.pending<0)put({key:'account:pending',type:'cash',level:'warn',weight:12,label:`待结算 ${fmt(A.pending)}`,detail:'不要将已知正现金直接视为可部署金额',seg:'nw'});
+ const soon=((R&&R.rows)||[]).filter(x=>{const t=Date.parse(x.expiry||'');if(!Number.isFinite(t))return false;const days=(t-Date.now())/86400000;return days>=-1&&days<=3;});
+ if(soon.length)put({key:'option:expiry',type:'option_expiry',level:'critical',weight:42,label:`${soon.length} 条期权腿 3 天内到期`,detail:soon.map(x=>x.sym).join('、'),seg:'nw'});
+ const hist=DATA.aics&&DATA.aics.backtest&&DATA.aics.backtest.historyValidation;
+ if(hist&&hist.status==='insufficient_history')put({key:'research:aics-history',type:'research_validation',level:'info',weight:20,label:'AICS 历史验证不足',detail:`${hist.snapshotCount||0} 快照 · ${hist.evaluatedPairs||0} 对 · ${hist.historySpanDays||0} 天`,seg:'aics'});
+ if(DATA.aics&&DATA.aics.decisionGrade===false)put({key:'research:aics-decision-grade',type:'research_validation',level:'warn',weight:19,label:'AICS 尚未达决策级',detail:DATA.aics.decisionGradeReason||'只可用于研究排序，不可视为交易信号',seg:'aics'});
+ if(DATA.decision&&/no_discretionary|incomplete|review/i.test(DATA.decision.analysisStatus||''))put({key:'research:decision-status',type:'research_validation',level:'info',weight:15,label:'决策分析仅完成量化审查',detail:DATA.decision.analysisStatus,seg:'decide'});
+ const aw=DATA.aiWatchlist&&DATA.aiWatchlist.scores||[],quarantine=aw.filter(x=>x.dataQuarantined||!['','clean'].includes(String(x.dataQualitySeverity||'').toLowerCase()));
+ if(quarantine.length)put({key:'research:aiwatch-quality',type:'data_quality',level:'warn',weight:18,label:`AI 观察池 ${quarantine.length} 项需数据复核`,detail:'进场评分应在复核前冻结',seg:'aiwatch'});
+ const sorted=[...items.values()].sort((a,b)=>b.score-a.score||String(a.label).localeCompare(String(b.label)));
+ const bySym={};sorted.forEach(x=>{if(x.sym)(bySym[x.sym]||(bySym[x.sym]=[])).push(x);});
+ return {items:sorted,actionable:sorted.filter(x=>x.level!=='info'),info:sorted.filter(x=>x.level==='info'),bySym};
 }
 function scorecardCard(){
  const mv=S.marketValue||1;
@@ -3762,64 +4916,62 @@ function scorecardCard(){
  const BL={concentration:'集中',disposition:'浮亏持有',sunkcost:'越跌越买',recency:'追涨',anchoring:'回本卖'};
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now);
  if(!held.length)return'<div class="card"><div class="dh"><h2 class="t">决策一览</h2></div><div class="note">暂无可汇总的持仓信号：每只持仓需 ≥21 个交易日的价格样本才能计算技术姿态。新加入的持仓会在样本积累后出现于此。本表为客观汇总，非投资建议。</div></div>';
+ const ALERTS=buildAlertModel();
  const data=held.map(x=>{
    const w=x.value/mv*100,n=x.fib.now,sig=(x.fib.signals||[]).slice(-1)[0],c=rc[x.sym],bl=bias[x.sym]||[],d=dm.map[x.sym];
-   let attn=0;
-   if(n.rsi>70)attn++;
-   if(c&&c.gap>10)attn++;
-   attn+=bl.filter(b=>b.level==='alert').length;
-   if(d&&Math.abs(d.drift)>dm.band)attn++;
-   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
+   const symAlerts=ALERTS.bySym[x.sym]||[],attn=symAlerts.length,attnScore=symAlerts.reduce((n,a)=>n+a.score,0);
+   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${esc(sig.date.slice(5))}</span>`:`<span class="neg">死叉 ${esc(sig.date.slice(5))}</span>`):'—';
    const rsiCls=n.rsi>70?'neg':(n.rsi<30?'pos':'');
    let riskCell='<td class="cell-empty">—</td><td class="cell-empty">—</td>';
    if(c){const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-bw;
      // zero-width bar carries no signal: show a muted dash instead of an empty track
      const bar=bw>0?`<div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div>`:'<span class="cell-empty">—</span>';
      riskCell=`<td>${c.riskPct.toFixed(1)}%</td><td>${bar}</td>`;}
-   const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#B89030';return `<span class="chip" style="color:${col};border-color:${chipBd(col)}">${BL[b.id]||b.id}</span>`;}).join(' '):'<span class="note cell-empty">—</span>';
+   const biasHtml=bl.length?bl.map(b=>{const col=b.level==='alert'?'#E5707A':'#B89030';return `<span class="chip" style="color:${col};border-color:${chipBd(col)}">${esc(BL[b.id]||b.id)}</span>`;}).join(' '):'<span class="note cell-empty">—</span>';
    let driftCell='<td class="cell-empty">—</td>';
    if(d){const g=d.drift,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),bw=Math.min(Math.abs(g),15)/15*50,left=g>=0?50:50-bw;
      driftCell=bw>0?`<td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${bw}%;background:${gc}"></div></div></td>`:'<td class="cell-empty">—</td>';}
    const attnBadge=attn>0?`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">${attn}</span>`:'<span class="note cell-empty">—</span>';
    // Mobile drops 7 columns, leaving 关注度 as the rightmost (often offscreen). Inline a small attention chip next to the ticker so the priority signal travels with the symbol.
    const attnInline=attn>0?` <span class="chip attn-inline" style="color:#E5707A;border-color:var(--chip-bd-red)" aria-label="关注度 ${attn}">${attn}🚩</span>`:'';
-   const html=`<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
-     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}${attnInline}</td>
+   const html=`<tr style="cursor:pointer" tabindex="0" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${esc(x.sym)}${attnInline}</td>
      <td>${fmt(x.value)} <span class="note">${w.toFixed(1)}%</span></td>
      <td class="${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</td>
-     <td style="color:${FIBCOL[n.state]}">${n.label}</td>
+     <td style="color:${FIBCOL[n.state]}">${esc(n.label)}</td>
      <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
      <td class="${rsiCls}">${n.rsi}</td><td>${sigTxt}</td>${riskCell}
      <td class="l">${biasHtml}</td>${driftCell}<td>${attnBadge}</td></tr>`;
    // phone: same data as one stacked card — nothing scrolls off-screen, signals travel with the symbol
-   const card=`<div class="smc" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
-     <div class="smc-top"><span style="color:${FIBCOL[n.state]}">●</span> <b class="smc-sym">${x.sym}</b>${attn>0?`<span class="chip attn-inline" style="display:inline-block;color:#E5707A;border-color:var(--chip-bd-red)" aria-label="关注度 ${attn}">${attn}🚩</span>`:''}<span class="smc-state" style="color:${FIBCOL[n.state]}">${n.label}</span><span class="smc-pnl ${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</span></div>
+   const card=`<div class="smc" role="button" tabindex="0" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <div class="smc-top"><span style="color:${FIBCOL[n.state]}">●</span> <b class="smc-sym">${esc(x.sym)}</b>${attn>0?`<span class="chip attn-inline" style="display:inline-block;color:#E5707A;border-color:var(--chip-bd-red)" aria-label="关注度 ${attn}">${attn}🚩</span>`:''}<span class="smc-state" style="color:${FIBCOL[n.state]}">${esc(n.label)}</span><span class="smc-pnl ${cls(x.unrealPct)}">${x.unrealPct>=0?'+':''}${x.unrealPct.toFixed(1)}%</span></div>
      <div class="smc-mid"><span style="white-space:nowrap">${fmt(x.value)}</span> · <span style="white-space:nowrap">${w.toFixed(1)}% 仓位</span> · <span style="white-space:nowrap">动能 <span style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</span></span> · <span style="white-space:nowrap">RSI <span class="${rsiCls}">${n.rsi}</span></span>${sig?` · <span style="white-space:nowrap">${sigTxt}</span>`:''}</div>
      ${bl.length?`<div class="smc-bias">${biasHtml}</div>`:''}</div>`;
-   return {attn,w,html,card};
+   return {attn,attnScore,w,html,card};
  });
- data.sort((a,b)=>b.attn-a.attn||b.w-a.w);
+ data.sort((a,b)=>b.attnScore-a.attnScore||b.w-a.w);
  return `<div class="card t1"><div class="dh"><h2 class="t">决策一览<span class="t-en">Decision Board</span></h2><span class="nm">每只持仓的 技术 · 风险 · 行为 · 再平衡偏离 同屏，联合评估而非逐项割裂（点击看个股）</span></div>
    <div class="scroll score-tablewrap"><table><thead><tr><th class="l">代码</th><th>市值/权重</th><th>未实现%</th><th>状态</th><th>${gl('mom','动能')}</th><th>${gl('rsi','RSI')}</th><th>${gl('cross','最近信号')}</th><th>${gl('rc','风险贡献')}</th><th title="该标的风险占比减资金占比，正(红)=隐藏的波动放大器、负(绿)=分散器">风险−资金</th><th class="l">行为标记</th><th title="按你在再平衡计划里设定的区间，当前权重偏离目标多少">偏离目标</th><th>${gl('attn','关注度')}</th></tr></thead>
    <tbody>${data.map(r=>r.html).join('')}</tbody></table></div>
    <div class="score-cards" aria-label="决策一览（手机版卡片）">${data.map(r=>r.card).join('')}</div>
-   <details class="note" style="margin-top:8px;line-height:1.6"><summary style="cursor:pointer">怎么读 · 口径说明</summary><b>怎么读：</b>本表把已有的四类信号<b>汇总同屏</b>，让你把每只仓位放回整个组合里联合判断（Thaler：避免逐项割裂导致的被支配选择，p.1582）。“关注度”是<b>四类红色信号的计数</b>（默认排序键），<b>不是评分、更不是买卖建议</b>——技术姿态为客观描述，行为标记来自你自己的交易，偏离目标按“再平衡计划”里你自己设定的规则计算。缺数据的单元显示“—”。<b>非投资建议。</b></details></div>`;
+   <details class="note" style="margin-top:8px;line-height:1.6"><summary style="cursor:pointer">怎么读 · 口径说明</summary><b>怎么读：</b>本表与页顶“今日要点”共用同一份去重警报账本。“关注度”只计入该标的的实际预警，并按严重度排序；全账户期权、现金、保证金、新鲜度与数据质量风险会在页顶汇总，不会被强行归给某只股票。它<b>不是买卖评分</b>。缺数据的单元显示“—”。<b>非投资建议。</b></details></div>`;
 }
 function wholeAccountCard(){
- const A=DATA.account;if(!A)return'';
- const tiles=[['全账户净值',fmt(A.netWorthWhole)],['股票',fmt(A.equity)],['现金',fmt(A.cashTotal)],
+ const A=DATA.account;if(!A)return`<div class="card t1"><div class="dh"><h2 class="t">账户快照不可用<span class="t-en">Account Snapshot Missing</span></h2><span class="chip" style="color:var(--accent);border-color:var(--chip-bd-amber)">数据缺口</span></div><div class="note" style="line-height:1.7">当前仅能展示股票层分析；未读取到现金、待结算、期权腿和账户快照日。请用含完整 Fidelity 持仓的 CSV 重跑 <b>python3 sync.py</b>。在补齐前，不要把股票市值当作全账户净清算值。</div></div>`;
+ const tiles=[['账户快照算术总额',fmt(A.netWorthWhole)],['股票',fmt(A.equity)],['已知正现金',fmt(A.cashTotal)],
    ['期权净·市价',`<span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span>`],['待结算',fmt(A.pending)]];
- const W=A.netWorthWhole||1,seg=(amt,c)=>amt>0?`<div style="width:${amt/W*100}%;background:${c}"></div>`:'';
- const bar=`<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin:10px 0 6px">${seg(A.equity,'#E8B339')}${seg(A.cashTotal,'#888D96')}${seg(Math.max(0,A.optMarkNet),'#7F8794')}${seg(A.pending,'#555A63')}</div>`;
- const cashRows=A.cash.map(c=>`<tr><td class="l">${c.acct}</td><td class="l">${c.sym}</td><td style="text-align:right">${fmt(c.value)}</td></tr>`).join('');
+ const raw=[{label:'股票',value:+A.equity||0,color:'#E8B339'},{label:'已知正现金',value:+A.cashTotal||0,color:'#888D96'},{label:'期权净市价',value:+A.optMarkNet||0,color:'#7F8794'},{label:'待结算',value:+A.pending||0,color:'#555A63'}];
+ const assets=raw.filter(x=>x.value>0),liabs=raw.filter(x=>x.value<0).map(x=>Object.assign({},x,{value:Math.abs(x.value)}));
+ const barRow=(label,rows,tone)=>{const total=rows.reduce((n,x)=>n+x.value,0);return `<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;gap:8px"><span class="kl-l">${label}</span><span class="kl-v ${tone}">${fmt(tone==='neg'?-total:total)}</span></div>${total?`<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin:5px 0 5px;background:var(--bg2)">${rows.map(x=>`<div title="${esc(x.label)} ${fmt(x.value)}" style="width:${x.value/total*100}%;background:${x.color}"></div>`).join('')}</div><div class="legend">${rows.map(x=>`<span><i style="background:${x.color}"></i>${x.label} ${fmt(x.value)}</span>`).join('')}</div>`:`<div class="note" style="margin-top:4px">无</div>`}</div>`;};
+ const composition=barRow('资产（正额分项）',assets,'')+barRow('负债 / 净负额（单独展示）',liabs,'neg');
+ const cashRows=(A.cash||[]).map(c=>`<tr><td class="l">${esc(c.acct)}</td><td class="l">${esc(c.sym)}</td><td style="text-align:right">${fmt(c.value)}</td></tr>`).join('');
  return `<div class="card t1">
-   <div class="dh"><h2 class="t">全账户净值<span class="t-en">Net Worth</span></h2><span class="nm">截至 ${A.asOf} · 股票＋现金＋期权按市价＋待结算（券商精确美元口径，非敞口/杠杆口径）</span></div>
+   <div class="dh"><h2 class="t">账户快照总额<span class="t-en">Provisional Snapshot</span></h2><span class="nm">截至 ${esc(A.asOf)} · CSV 算术恒等式，不等于券商实时 net liquidation</span></div>
    <div class="badges">${tiles.map(t=>`<div class="badge"><div class="l">${t[0]}</div><div class="v">${t[1]}</div></div>`).join('')}</div>
-   ${bar}
-   <div class="legend"><span><i style="background:#E8B339"></i>股票</span><span><i style="background:#888D96"></i>现金</span><span><i style="background:#7F8794"></i>期权净</span><span><i style="background:#555A63"></i>待结算</span></div>
-   <div class="note" style="line-height:1.6;margin-top:6px">恒等式：股票 ${fmt(A.equity)} ＋ 现金 ${fmt(A.cashTotal)} ＋ 期权净市价 ${fmt(A.optMarkNet)} ＋ 待结算 ${fmt(A.pending)} ＝ 全账户净值 ${fmt(A.netWorthWhole)}（四项皆券商当前价值，逐项相加，精确）。这是“净值”口径，不是“敞口/杠杆”口径——后者本导出无法计算（见下方期权敞口卡片）。</div>
+   ${composition}
+   <div class="note" style="line-height:1.6;margin-top:8px">CSV 恒等式：股票 ${fmt(A.equity)} ＋ 已知正现金 ${fmt(A.cashTotal)} ＋ 期权净 last-price ${fmt(A.optMarkNet)} ＋ 待结算 ${fmt(A.pending)} ＝ 快照算术总额 ${fmt(A.netWorthWhole)}。资产与负债用<b>两条各自 100% 的组成条</b>表示，负期权/待结算不再被截掉或伪装成资产权重。<b>加法核对精确，但价值是暂定的</b>：期权各腿可能是异步 last trade。</div>
    <div class="scroll" style="margin-top:8px"><table><thead><tr><th class="l">账户</th><th class="l">货币基金</th><th style="text-align:right">当前价值</th></tr></thead><tbody>${cashRows}<tr style="border-top:1px solid #1A1C21"><td class="l"><b>合计</b></td><td></td><td style="text-align:right"><b>${fmt(A.cashTotal)}</b></td></tr></tbody></table></div>
-   <div class="note" style="margin-top:6px">现金仅含 Fidelity 货币基金核心(正)余额；<b>保证金借记(margin debit)余额不在本导出中</b>——若存在借记，本净值可能高估你的可动用现金。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:6px"><b>已知正现金</b>仅含 Fidelity 货币基金核心正余额；<b>保证金借记 (margin debit) 与购买力不在本导出中</b>，待结算另列。不要把它当作可动用现金或实时清算值。<b>非投资建议。</b></div>
  </div>`;}
 function optionsExposureCard(){
  const A=DATA.account;if(!A||!A.optLegs.length)return'';
@@ -3827,16 +4979,16 @@ function optionsExposureCard(){
  const maxAbs=Math.max(1,...legs.map(l=>Math.abs(l.mark)));
  const dol=(v,c)=>`<span style="display:inline-block;width:92px;text-align:right;color:${c};font-variant-numeric:tabular-nums">${fmt(v)}</span>`;
  const leg=l=>{const c=l.mark<0?'#E5707A':'#4FB286',wd=Math.abs(l.mark)/maxAbs*50,left=l.mark>=0?50:50-wd;
-   return `<div class="frow"><span class="fsym" style="width:auto;min-width:150px"><span class="chip" style="color:${c};border-color:${c}55">${l.side==='short'?'空头':'多头'}</span> ${l.sym.trim()}</span>
+   return `<div class="frow"><span class="fsym" style="width:auto;min-width:150px"><span class="chip" style="color:${c};border-color:${c}55">${l.side==='short'?'空头':'多头'}</span> ${esc(l.sym.trim())}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>${dol(l.mark,c)}</div>`;};
  const legsHtml=legs.map(leg).join('')+`<div class="frow" style="border-top:1px solid #1A1C21;margin-top:4px;padding-top:6px"><span class="fsym" style="width:auto;min-width:150px"><b>净市价小计</b></span><div class="fbar"></div>${dol(A.optMarkNet,A.optMarkNet<0?'#E5707A':'#4FB286')}</div>`;
- const tbl=`<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th class="l">数量</th><th style="text-align:right">当前市价</th><th class="l">账户</th></tr></thead><tbody>${legs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name}</td><td class="l">${fmtN(l.qty,0)}</td><td style="text-align:right" class="${cls(l.mark)}">${fmt(l.mark)}</td><td class="l">${l.type||'—'}</td></tr>`).join('')}</tbody></table></div>`;
+ const tbl=`<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th>数量</th><th>当前 last</th><th>成本基础</th><th>P&amp;L</th><th class="l">账户</th></tr></thead><tbody>${legs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${esc(l.name)}</td><td>${fmtN(l.qty,0)}</td><td class="${cls(l.mark)}">${fmt(l.mark)}</td><td>${fmt(l.costBasis)}</td><td class="${cls(l.brokerPnl)}">${fmt(l.brokerPnl)}</td><td class="l">${esc(l.type||'—')}</td></tr>`).join('')}</tbody></table></div>`;
  return foldCard('期权敞口（隐藏杠杆）',`毛额 ${fmt(A.optMarkGross)} ≈ 权益 ${A.optPctEquity}% · 净市价 ${fmt(A.optMarkNet)} · ${A.optLegs.length} 条腿`,`
    <div class="hero-fig" style="margin:6px 0 2px">期权总市值（毛额/GROSS） ${fmt(A.optMarkGross)} <span style="font-size:var(--t-base);color:var(--mut)">≈ 权益的 ${A.optPctEquity}%</span></div>
-   <div class="note" style="margin-bottom:8px">净市价仅 <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> —— 这是<b>盈亏口径</b>，不是你的敞口（小净值会掩盖大总额，Thaler p.1582）。</div>
+   <div class="note" style="margin-bottom:8px">净 last-price <span class="${cls(A.optMarkNet)}">${fmt(A.optMarkNet)}</span> · 推算入场净现金 <span class="${cls(A.optEntryCashNet)}">${fmt(A.optEntryCashNet)}</span> · broker P&amp;L <span class="${cls(A.optBrokerPnl)}">${fmt(A.optBrokerPnl)}</span>（入场现金＋当前净值＝P&amp;L）。小净值仍会掩盖大总额与 assignment 风险。</div>
    ${(A.optionSpreads&&A.optionSpreads.length)?`<div class="note" style="margin-bottom:8px">其中可配对的垂直价差，理论盈亏被<b>价差宽度</b>封顶（合计约 ${fmt(A.optionSpreads.reduce((s,x)=>s+(x.widthValue||0),0))}，远小于上面的毛额）——这部分是<b>定义化风险</b>，详见下方 <b>Spread Risk Ledger</b>；未配对的单腿真实杠杆才是毛额低估的来源。</div>`:''}
    ${legsHtml}${tbl}
-   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>重要：</b>以上为<b>市价(mark-to-market)</b>，不是 delta、不是名义本金(notional)、不是希腊字母(Greeks)——本 CSV 只给“当前市值”。<b>真实杠杆比这更大，且在此无法计算。</b>保证金借记(margin debit)余额不在本导出中（只显示正的货币基金现金），故“全账户净值”若存在借记可能高估可动用现金。${(()=>{const a=[...new Set(A.optLegs.map(l=>l.type||'—'))];return A.optLegs.length+' 条期权腿，'+(a.length===1?'均在 <b>'+a[0]+'</b> 账户':'分布于 <b>'+a.join(' / ')+'</b> 账户');})()}。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:10px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>重要：</b>CSV 给的是各腿 <b>Last Price</b>，不是同一时刻 bid/ask mid；深度价内/低流动性腿可能异步，组合净值会失真。这里也没有 delta、gamma、名义本金或 margin debit。${(()=>{const a=[...new Set(A.optLegs.map(l=>l.type||'—'))].map(esc);return A.optLegs.length+' 条期权腿，'+(a.length===1?'均在 <b>'+a[0]+'</b> 账户':'分布于 <b>'+a.join(' / ')+'</b> 账户');})()}。<b>非投资建议。</b></div>
    <div class="note" style="margin-top:6px">Thaler 2016 · p.1582 / p.1589 / p.1594</div>`);}
 function optionsSpreadLedgerCard(){
  const A=DATA.account;if(!A||!A.optLegs||!A.optLegs.length)return'';
@@ -3845,41 +4997,63 @@ function optionsSpreadLedgerCard(){
  if(!spreads.length)return `<div class="card"><div class="dh"><h2 class="t">全账户 Spread Risk Ledger</h2><span class="nm">自动配对垂直价差失败时，先按单腿管理风险</span></div>
    <div class="note">当前有 ${A.optLegs.length} 条期权腿，但没有自动识别出同标的 / 同到期 / 同 CALL-PUT 类型的一多一空垂直价差。请按单腿查看 liquidity、assignment、margin 与最大风险；不要把未配对 short option 当作 defined-risk spread。<b>非投资建议。</b></div></div>`;
  const rows=spreads.map(s=>{const er=s.expectedRange||[null,null],bad=s.warnings&&s.warnings.length;
-   const warn=bad?`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">核对</span> ${s.warnings.join('；')}`:`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">范围内</span> 仍需实盘 bid/ask/Greeks`;
-   return `<tr><td class="l">${s.underlying}<br><span class="note">${s.kind}</span></td><td>${s.expiry}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${s.right}</td><td>${fmt(s.widthValue)}</td><td class="${cls(s.netMark)}">${fmt(s.netMark)}</td><td>${fmt(er[0])} - ${fmt(er[1])}</td><td class="l">${warn}</td></tr>`;}).join('');
+   const warn=bad?`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">核对</span> ${s.warnings.map(esc).join('；')}`:`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">范围内</span> 仍需实盘 bid/ask/Greeks`;
+   const entry=s.entryType==='credit'?`credit ${fmt(s.entryCredit)}`:`debit ${fmt(s.entryDebit)}`;
+   return `<tr><td class="l">${esc(s.underlying)}<br><span class="note">${esc(s.kind)}</span></td><td>${esc(s.expiry)}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${esc(s.right)}</td><td>${entry}</td><td>${fmt(s.maxProfit)} / ${fmt(s.maxLoss)}</td><td class="${cls(s.currentPnl)}">${fmt(s.currentPnl)}</td><td class="${cls(s.netMark)}">${fmt(s.netMark)}</td><td class="l">${warn}</td></tr>`;}).join('');
  return foldCard('全账户 Spread Risk Ledger',`${spreads.length} 组价差${warnN?` · ${warnN} 个需核对`:' · 全部范围内'}`,`
-   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>宽度</th><th>当前净Mark</th><th>理论范围</th><th class="l">风险提示</th></tr></thead><tbody>${rows}</tbody></table></div>
-   <div class="note" style="margin-top:10px;line-height:1.6">这是从券商持仓名、数量、方向保守识别出的垂直价差。它只能检查<b>当前市价是否落在理论区间</b>，不能替代 entry debit/credit、Delta/Gamma、实时盘口和流动性。老师视角：先确定结构是不是 defined risk，再决定能不能移动止盈、平仓、滚仓或拆腿。<b>非投资建议。</b></div>`);}
+   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>入场</th><th>Max profit / loss</th><th>当前 P&amp;L</th><th>净 last</th><th class="l">风险提示</th></tr></thead><tbody>${rows}</tbody></table></div>
+   <div class="note" style="margin-top:10px;line-height:1.6">入场 debit/credit、最大盈亏与当前 P&amp;L 来自同一券商快照的 cost basis；结构上可核对，实时退出价值仍需同一时刻 bid/ask、Greeks 与流动性。老师视角：先确认 defined risk，再决定平仓、滚仓或拆腿。<b>非投资建议。</b></div>`);}
+function optionResidualRiskCard(){
+ const R=DATA.account&&DATA.account.optionRisk;if(!R||!(R.rows||[]).length)return'';
+ const S0=R.summary||{};
+ const rows=R.rows.map(r=>`<tr><td class="l"><b>${esc(r.sym)}</b><br><span class="note">${esc(r.name||'')}</span></td><td>${r.contracts}</td><td><span class="chip" style="color:${r.riskClass==='MARGIN_SHORT_PUT'||r.riskClass==='UNCOVERED_CALL'?'#E5707A':'#E8B339'}">${esc(r.riskClass)}</span></td><td>${r.assignmentValue!=null?fmt(r.assignmentValue):(r.maxLoss!=null?fmt(r.maxLoss):'—')}</td><td class="${cls(r.currentPnl)}">${fmt(r.currentPnl)}</td><td class="l">${esc(r.riskNote||'—')}</td></tr>`).join('');
+ return foldCard('未配对期权风险','单腿不能被垂直价差净额掩盖',`
+  <div class="badges">
+   <div class="badge"><div class="l">Margin short puts</div><div class="v">${S0.marginShortPutContracts||0}</div></div>
+   <div class="badge"><div class="l">Put assignment</div><div class="v">${fmt(S0.shortPutAssignmentValue)}</div></div>
+   <div class="badge"><div class="l">Covered calls</div><div class="v">${S0.coveredCallContracts||0}</div></div>
+   <div class="badge"><div class="l">Uncovered calls</div><div class="v">${S0.uncoveredCallContracts||0}</div></div>
+   <div class="badge"><div class="l">Long premium at risk</div><div class="v">${fmt(S0.longPremiumAtRisk)}</div></div>
+  </div>
+  <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">合约</th><th>张数</th><th>结构</th><th>指派值 / Max loss</th><th>P&amp;L</th><th class="l">核对</th></tr></thead><tbody>${rows}</tbody></table></div>
+  <div class="note" style="margin-top:8px">Cash-secured 判断只使用<b>同账户已知货币基金现金</b>；不把 margin buying power 当现金。Covered call 也按同账户正股股数核对。<b>非投资建议。</b></div>`);}
 function diagnosticsCard(){
  const mode=S.priceMode==='mark-to-market'?'Yahoo mark-to-market':'Fidelity snapshot';
  const refreshed=S.refreshedPriceCount!=null?`${S.refreshedPriceCount}/${S.numHeld} held prices refreshed`:'—';
+ const healthRows=FRESH.artifacts.map(x=>`<tr><td class="l">${esc(x.artifact)}</td><td>${esc(x.status||'—')}${x.stale?' · stale':''}</td><td>${esc(x.asOf||'—')}</td><td>${esc(x.generatedAt||'—')}</td><td>${esc(x.schemaVersion||'—')}</td><td class="l">${esc(x.reason||'—')}</td></tr>`).join('');
  return `<div class="card"><details><summary>数据新鲜度 / 口径诊断</summary>
    <div class="badges" style="margin-top:10px">
-    <div class="badge"><div class="l">生成时间</div><div class="v" style="font-size:var(--t-base)">${S.generatedAt||'—'}</div></div>
+    <div class="badge"><div class="l">生成时间</div><div class="v" style="font-size:var(--t-base)">${esc(S.generatedAt||'—')}</div></div>
     <div class="badge"><div class="l">价格口径</div><div class="v" style="font-size:var(--t-base)">${mode}</div></div>
-    <div class="badge"><div class="l">价格 as of</div><div class="v">${S.priceAsOf||S.dateRange[1]}</div></div>
+    <div class="badge"><div class="l">价格 as of</div><div class="v">${esc(S.priceAsOf||S.dateRange[1])}</div></div>
+    <div class="badge"><div class="l">账户快照 as of</div><div class="v" style="font-size:var(--t-base)">${ACCOUNT&&ACCOUNT.asOf?esc(ACCOUNT.asOf):'—'}</div></div>
     <div class="badge"><div class="l">刷新覆盖</div><div class="v" style="font-size:var(--t-base)">${refreshed}</div></div>
-    <div class="badge"><div class="l">数据窗口</div><div class="v" style="font-size:var(--t-base)">${D0} → ${D1}</div></div>
+    <div class="badge"><div class="l">数据窗口</div><div class="v" style="font-size:var(--t-base)">${esc(D0)} → ${esc(D1)}</div></div>
+    <div class="badge"><div class="l">TWR 质量</div><div class="v" style="font-size:var(--t-base)">${esc((S.twrQuality||{}).status||'未提供')}</div><div class="note">${(S.twrQuality||{}).usableSessions||0}/${(S.twrQuality||{}).axisSessions||0} sessions</div></div>
+    <div class="badge"><div class="l">MWR 质量</div><div class="v" style="font-size:var(--t-base)">${esc((S.mwrQuality||{}).status||'未提供')}</div><div class="note">${(S.mwrQuality||{}).published?'已发布':('未发布 · 现金流变号 '+((S.mwrQuality||{}).cashFlowSignChanges||0)+' 次')}${(S.mwrQuality||{}).estimatedOpeningValue?` · 期初估值 ${fmt((S.mwrQuality||{}).estimatedOpeningValue)}`:''}</div></div>
+    <div class="badge"><div class="l">已实现 P&amp;L</div><div class="v" style="font-size:var(--t-base)">${esc((S.realizedPnlQuality||{}).confidence||'未提供')}</div><div class="note">${esc((S.realizedPnlQuality||{}).method||'—')}</div></div>
    </div>
+   ${healthRows?`<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">数据产物</th><th>状态</th><th>As of</th><th>Generated</th><th>Schema</th><th class="l">原因</th></tr></thead><tbody>${healthRows}</tbody></table></div>`:`<div class="note" style="margin-top:8px">当前负载未提供 <b>artifactHealth</b> 逐产物状态；页顶新鲜度按 summary / account 时间戳回退判断。</div>`}
    <div class="note" style="margin-top:8px;line-height:1.6">普通 <b>sync</b> 会要求市值/未实现与 Fidelity CSV 完全一致；每日 <b>mark-to-market</b> 则用最新 Yahoo 股票价重估持仓，现金和期权仍保留 Fidelity 快照。若自动刷新失败，先看 <code>output/price_refresh.log</code> 与 <code>output/price_refresh_log.json</code>。<b>非投资建议。</b></div>
   </details></div>`;
 }
 function bridgeCard(){
  const B=DATA.bridge;if(!B||B.terminal==null)return'';
- const g=S.behaviorGap;
+ const g=S.behaviorGap,mq=S.mwrQuality||{};
  const maxAbs=Math.max(1,...B.legs.map(l=>Math.abs(l.amount)));
  const leg=l=>{const c=l.amount>0?'#4FB286':(l.amount<0?'#E5707A':'#888D96');
    const wd=Math.min(Math.abs(l.amount),maxAbs)/maxAbs*50,left=l.amount>=0?50:50-wd;
-   const chip=l.acc?` <span class="chip" style="opacity:.85">${l.acc}</span>`:'';
-   return `<div class="frow"><span class="fsym">${l.label}${chip}</span>
+   const chip=l.acc?` <span class="chip" style="opacity:.85">${esc(l.acc)}</span>`:'';
+   return `<div class="frow"><span class="fsym">${esc(l.label)}${chip}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${fmt(l.amount)}</span></div>`;};
  const legsHtml=B.legs.map(leg).join('')+`<div class="frow" style="border-top:1px solid #1A1C21;margin-top:4px;padding-top:6px"><span class="fsym"><b>合计盈亏</b></span><div class="fbar"></div><span class="fval ${cls(B.totalPL)}"><b>${fmt(B.totalPL)}</b></span></div>`;
  const badges=[['当前市值',fmt(B.terminal)],['持仓成本',fmt(B.heldCost)],
    ['合计盈亏（美元）',`<span class="${cls(B.totalPL)}">${fmt(B.totalPL)}</span>`],
-   ['你的钱实际回报 '+gl('MWR','MWR'),S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`]];
+   ['你的钱实际回报 '+gl('MWR','MWR')+' '+qualityChip((S.mwrQuality||{}).status,(S.mwrQuality||{}).status==='complete'?'完整':'待核'),S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`]];
  let lv,head,detail;
- if(g==null){lv=['#888D96','提示'];head='资金加权收益暂不可用';detail='IRR 在该现金流形态下无定义（现金流未变号或未收敛），故显示破折号。';}
+ if(g==null&&mq.status==='review-nonconventional-cashflows'){lv=['#E8B339','待核'];head='MWR 因非常规现金流暂停发布';detail=`股票账面现金流共变号 ${mq.cashFlowSignChanges||0} 次，可能存在多个合法 XIRR。系统保留候选根供审计，但不把它发布为“你的钱实际回报”，也不计算行为缺口。`;}
+ else if(g==null){lv=['#888D96','提示'];head='资金加权收益暂不可用';detail='IRR 在该现金流形态下无定义、未收敛或数据质量闸门未通过，故显示破折号。';}
  else if(g>0){lv=['#E8B339','留意'];head='你的钱表现弱于策略本身 · 典型行为缺口';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）落后于策略本身（时间加权 ${pct(S.curReturn)}）。机制上倾向在走平或下跌前加仓——这正是经典的“行为缺口”：追近期强势（过度外推）或下跌后犹豫（近视损失厌恶）。`;}
  else if(g<0){lv=['#4FB286','良好'];head='你的钱表现优于策略本身';detail=`你的钱（资金加权 ${pct(S.mwrPeriod)}）跑赢了策略本身（时间加权 ${pct(S.curReturn)}）。机制上你净在上涨前加仓，本窗口择时较好——但单一窗口是小样本，可能含运气成分，别据此过度自信。`;}
  else {lv=['#888D96','提示'];head='加仓节奏基本中性';detail='本窗口入金时点对结果影响不大。';}
@@ -3895,26 +5069,27 @@ function bridgeCard(){
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="note" style="margin:8px 0 6px;line-height:1.6">恒等式：持仓成本 ${fmt(B.heldCost)} ＋ 未实现 ＝ 当前市值 ${fmt(B.terminal)}（券商口径，精确）。下面按<b>美元</b>拆出你的盈亏分桶（同一零线、同一刻度，等额盈亏长度相同、不放大亏损）；未实现已在当前市值里，已实现/股息/期权为已落袋现金，故并列展示、不叠加进市值。</div>
    ${legsHtml}
-   <div class="note" style="margin-top:10px;line-height:1.6">仅股票口径（不含现金/保证金，为资金加权<b>权益账面</b> XIRR，非账户级）。未实现为券商精确，已实现为窗口内均价口径（含估算）；两者时间口径不同（未实现含建仓前浮盈，已实现仅本窗口）。累计入金约 ${fmt(B.lifeDeposits)}（净值还含“开始追踪入金前”已持有的仓位，故高于入金额）。单一窗口为小样本、描述性非预测。<b>非投资建议。</b></div>
+   <div class="note" style="margin-top:10px;line-height:1.6">仅股票口径（不含现金/保证金，为资金加权<b>权益账面</b> XIRR，非账户级）。MWR 质量状态 <b>${esc((S.mwrQuality||{}).status||'未提供')}</b>；${(S.mwrQuality||{}).alignedWithTWR===false?'<b>终值日与 TWR 不对齐，不应直接解读行为缺口。</b>':''}未实现为券商精确，已实现为窗口内平均成本重建（非券商 tax-lot）。累计入金约 ${fmt(B.lifeDeposits)}。单一窗口为小样本、描述性非预测。<b>非投资建议。</b></div>
  </div>${gapCard}`;
 }
 function insightBanner(){
  let dismissed=false;try{dismissed=localStorage.getItem('ptrak.onboard.v1')==='done';}catch(e){}
- const guide=dismissed?`<span class="ib-lk" role="button" tabindex="0" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</span>`:'';
+ const guide=dismissed?`<button type="button" class="microbtn" onclick="try{localStorage.removeItem('ptrak.onboard.v1')}catch(e){};renderOverview()">显示新手指南</button>`:'';
  const A=DATA.account,X=DATA.alloc,Q=DATA.qqqTqqq,pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,gap=S.behaviorGap;
  const al=(sp!=null)?pr-sp:null,lt=X&&X.largestTheme,lk=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" onclick="ovGo('${seg}')">${t} →</span>`;
- const stockChip=sym=>`<span class="ib-lk" role="button" tabindex="0" onclick="stockGo('${sym}')">${sym}</span>`;   // no trailing arrow; the surrounding sentence supplies the action verb
- // HERO VERDICT: one sentence, one primary action. Severity comes from count of attention items.
- const tr=(DATA.risk&&DATA.risk.contrib&&DATA.risk.contrib[0])?DATA.risk.contrib[0].sym:null;
+ const stockChip=(sym,seg)=>`<span class="ib-lk" role="button" tabindex="0" data-sym="${esc(sym)}" data-stock-seg="${esc(seg||'')}" onclick="stockGo(this.dataset.sym,this.dataset.stockSeg||null)">${esc(sym)}</span>`;   // no trailing arrow; the surrounding sentence supplies the action verb
+ // HERO VERDICT: the same deduplicated alert ledger used by the decision board.
+ const AM=buildAlertModel(),actionable=AM.actionable,primary=actionable[0]||null;
  const heldStocks=stocks.filter(s=>s.held);
- const bigDownToday=heldStocks.filter(s=>s.dayChangePct!=null&&s.dayChangePct<-3).length;
- const deepLoss=heldStocks.filter(s=>s.unrealPct!=null&&s.unrealPct<-15).length;
- const techBear=heldStocks.filter(s=>s.fib&&s.fib.now&&s.fib.now.state==='down').length;   // Python emits up/down/range/mixed — 'bear-trend' never matched, so 技术转空 silently counted 0
- const attnTotal=bigDownToday+deepLoss+techBear;
  let heroTone, heroTxt;
- if(attnTotal===0){heroTone='var(--green)'; heroTxt=`今日无紧急关注 · 区间收益 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?` · ${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}`;}
- else if(attnTotal<=2){heroTone='var(--amber-line)'; heroTxt=`${attnTotal} 件需要看${tr?` · 优先 ${stockChip(tr)}`:''} · ${bigDownToday?bigDownToday+' 只今日大跌·':''}${deepLoss?deepLoss+' 只深度亏损·':''}${techBear?techBear+' 只技术转空':''}`.replace(/·$/,'').replace(/·\s*$/,'');}
- else {heroTone='var(--red)'; heroTxt=`${attnTotal} 件需要看${tr?` · 优先 ${stockChip(tr)}`:''} → 建议先 ${lk('score','按关注度排序')}`;}
+ if(!primary){heroTone='var(--green)'; heroTxt=`当前无可执行警报 · 区间收益 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?` · ${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}`;}
+ else {
+  const critical=actionable.filter(x=>x.level==='critical').length;
+  heroTone=critical?'var(--red)':'var(--amber-line)';
+  const first=primary.sym?`${stockChip(primary.sym,primary.stockSeg)} · ${esc(primary.label)}`:lk(primary.seg||'score',esc(primary.label));
+  heroTxt=`${actionable.length} 件去重预警${critical?` · ${critical} 件紧急`:''} · 先核对 ${first}`;
+ }
+ const alertRows=AM.items.slice(0,8).map(a=>{const c=a.level==='critical'?'var(--red)':(a.level==='warn'?'var(--accent)':'var(--mut)');return `<button type="button" class="chip" data-sym="${esc(a.sym||'')}" data-stock-seg="${esc(a.stockSeg||'')}" data-ov-seg="${esc(a.seg||'score')}" style="color:${c};border-color:${a.level==='critical'?'var(--chip-bd-red)':(a.level==='warn'?'var(--chip-bd-amber)':'var(--line)')}" onclick="this.dataset.sym?stockGo(this.dataset.sym,this.dataset.stockSeg||null):ovGo(this.dataset.ovSeg)" title="${esc(a.detail)}">${a.level==='critical'?'●':'▲'} ${esc(a.label)}</button>`;}).join(' ');
  // one Barometer, one home (the masthead band) — the hero row carries only its text echo
  const qSer=(Q&&Q.available&&Q.series)?Q.series.slice(-60):[];
  let ribbon='';
@@ -3924,7 +5099,7 @@ function insightBanner(){
  }
  // 今日先看: top movers by |dayChange| ride the hero row (tap a chip to drill in)
  const movers=heldStocks.filter(s=>s.dayChangePct!=null).sort((a,b)=>Math.abs(b.dayChangePct)-Math.abs(a.dayChangePct)).slice(0,3);
- const moversChips=movers.map(s=>`<span class="chip" style="cursor:pointer" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${s.sym}')">${s.sym} <span class="${cls(s.dayChangePct)}">${s.dayChangePct>0?'+':''}${s.dayChangePct.toFixed(2)}%</span></span>`).join(' ');
+ const moversChips=movers.map(s=>`<span class="chip" style="cursor:pointer" role="button" tabindex="0" data-sym="${esc(s.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">${esc(s.sym)} <span class="${cls(s.dayChangePct)}">${s.dayChangePct>0?'+':''}${s.dayChangePct.toFixed(2)}%</span></span>`).join(' ');
  const hero=`<div class="ib-hero" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin:0 -6px 4px;background:var(--panel2);border-radius:4px"><span style="width:3px;height:17px;border-radius:1px;background:${heroTone};flex:none" aria-hidden="true"></span><span class="verdict" style="flex:1 1 auto;min-width:200px">${heroTxt}</span>${moversChips?`<span style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;flex:none">${moversChips}</span>`:''}${ribbon}</div>`;
  // Detailed rows preserved behind <details> — power users still get them but won't see them first
  const l1=`股票现值 <b>${fmt(S.marketValue)}</b>，未实现 <b class="${cls(S.unrealized)}">${fmt(S.unrealized)}</b>（区间 <b class="${cls(pr)}">${pct(pr)}</b>${al!=null?`，${al>=0?'跑赢':'跑输'}标普 ${ppf(al)}`:''}${(nq!=null&&pr<nq)?`，但略输纳指 ${ppf(pr-nq)}`:''}）`;
@@ -3938,12 +5113,13 @@ function insightBanner(){
  return `<div class="card ib" style="--hero-tone:${heroTone}"><div class="dh"><h2 class="t-cap">今日要点 · 一句话先看</h2>${guide}</div>
    ${hero}
    <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--mut);font-size:var(--t-sm);padding:6px 0">看其他信号 ▾</summary>
+     ${alertRows?`<div class="ib-row"><b>共用警报账本</b><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:7px">${alertRows}</div></div>`:''}
      <div class="ib-row">${l1} ${lk('nw','净值')}${lk('cmp','指数对比')}</div>
      ${qBrief?`<div class="ib-row">${qBrief} ${lk('qt','老师策略台')}</div>`:''}
      ${l2?`<div class="ib-row">${l2} ${lk('struct','结构')}</div>`:''}
      ${l3?`<div class="ib-row">${l3} ${lk('nw','期权敞口')}</div>`:''}
      ${l4?`<div class="ib-row">${l4} ${lk('beh','行为决策')}</div>`:''}
-     <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${tr?`最该看一眼 <b>${tr}</b>（最大风险贡献）　`:''}${lk('rebal','看再平衡动作清单')}</div>
+     <div class="ib-row" style="margin-top:7px;border-top:1px solid var(--hair);padding-top:7px"><b>下一步</b> → ${primary?(primary.sym?`核对 ${stockChip(primary.sym,primary.stockSeg)} 的原始证据`:`${lk(primary.seg||'score',esc(primary.label))}`):lk('rebal','看再平衡动作清单')}</div>
      <div class="note" style="margin-top:4px">所有指标为技术 / 描述性参考，<b>非投资建议</b>。</div>
    </details></div>`;
 }
@@ -3952,12 +5128,13 @@ function insightBanner(){
 const foldCard=(title,sub,body,open,chip)=>`<details class="card foldcard ref"${open?' open':''}><summary><h2 class="t">${title}</h2>${sub?`<span class="nm">${sub}</span>`:''}${chip?`<span class="fold-chip">${chip}</span>`:''}</summary><div class="foldbody">${body}</div></details>`;
 function qqqTqqqTab(){
  const q=DATA.qqqTqqq;
- if(!q||!q.available)return `<div class="card"><div class="dh"><h2 class="t">QQQ/TQQQ 决策台</h2></div><div class="note">${q&&q.reason?q.reason:'QQQ/TQQQ 数据不足。'} 技术参考，非投资建议。</div></div>`;
+ if(!q||!q.available)return `<div class="card"><div class="dh"><h2 class="t">QQQ/TQQQ 决策台</h2></div><div class="note">${esc(q&&q.reason?q.reason:'QQQ/TQQQ 数据不足。')} 技术参考，非投资建议。</div></div>`;
  const L=q.latest,st=q.state,tc=st.tone==='pos'?'#4FB286':(st.tone==='neg'?'#E5707A':'#E8B339');
  const dist=(d)=>d&&d.atr!=null?`${d.dollar>=0?'+':''}${d.dollar.toFixed(2)} (${d.pct>=0?'+':''}${d.pct.toFixed(2)}%, ${d.atr>=0?'+':''}${d.atr.toFixed(2)} ATR)`:'—';
- const sourceNote=(q.source&&q.source.qqq==='OHLC')?'ATR14 使用 Yahoo OHLC 高低点。':'ATR14 当前用收盘价近似，适合看节奏，不适合精确风控。';
+ const sourceNote=((q.source&&q.source.qqq==='OHLC')?'ATR14 使用 Yahoo OHLC 高低点。':'ATR14 当前用收盘价近似，适合看节奏，不适合精确风控。')+` QQQ ${esc((q.sourceAsOf||{}).qqq||q.asOf||'—')} / TQQQ ${esc((q.sourceAsOf||{}).tqqq||'—')}。`;
+ const alignmentWarn=q.tqqqAligned===false?`<div role="alert" class="note" style="color:var(--red);margin:8px 0">TQQQ 行情未与 QQQ 同日，TQQQ spot、收益、trailing、CCS 与现金担保张数已停用。</div>`:'';
  const badges=[
-  ['状态',`<span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${st.label}</span>`],
+  ['状态',`<span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${esc(st.label)}</span>`],
   ['QQQ 收盘',fmt(L.qqq)],
   ['TQQQ 收盘',fmt(L.tqqq)],
   ['EMA8',fmt(L.ema8)],
@@ -3971,18 +5148,18 @@ function qqqTqqqTab(){
  [gl('rsi','RSI14'),`${L.rsi14}`],
  ];
  const dp=q.decisionPanel||{},trail=q.trailing||{};
- const nextRows=(q.nextTriggers||[]).map(n=>`<tr><td class="l">${n.name}</td><td>${fmt(n.level)}</td><td>${n.distancePct>=0?'+':''}${n.distancePct}%</td><td class="l">${n.action}</td></tr>`).join('');
- const checks=(q.teacherChecks||[]).map(x=>`<div class="badge"><div class="l">${x.label}</div><div class="v" style="font-size:var(--t-base);line-height:1.45;color:${x.ok?'#4FB286':'#E8B339'}">${x.value}</div></div>`).join('');
+ const nextRows=(q.nextTriggers||[]).map(n=>`<tr><td class="l">${esc(n.name)}</td><td>${fmt(n.level)}</td><td>${n.distancePct>=0?'+':''}${n.distancePct}%</td><td class="l">${esc(n.action)}</td></tr>`).join('');
+ const checks=(q.teacherChecks||[]).map(x=>`<div class="badge"><div class="l">${esc(x.label)}</div><div class="v" style="font-size:var(--t-base);line-height:1.45;color:${x.ok?'#4FB286':'#E8B339'}">${esc(x.value)}</div></div>`).join('');
  const decisionBrief=`<div class="card t1" style="border-left:3px solid ${tc}">
    <div class="dh"><h2 class="t">老师 Decision Brief</h2><span class="nm">天气 → 仓位 → 工具 → 风控，一屏给结论</span></div>
    <div class="badges">
-    <div class="badge"><div class="l">现在</div><div class="v verdict" style="border-left:3px solid ${tc};padding-left:10px">${dp.headline||st.label}</div></div>
-    <div class="badge"><div class="l">允许动作</div><div class="v" style="font-size:var(--t-base);line-height:1.45">${dp.doNow||st.action}</div></div>
-    <div class="badge"><div class="l">不要做</div><div class="v" style="font-size:var(--t-base);line-height:1.45;color:#E8B339">${dp.avoid||'先等更清晰触发，不把单一信号当确定性。'}</div></div>
-    <div class="badge"><div class="l">CCS 身份</div><div class="v" style="font-size:var(--t-base);line-height:1.45">${dp.ccsRole||'必须先判断是 hedge 还是方向性做空。'}</div></div>
+    <div class="badge"><div class="l">现在</div><div class="v verdict" style="border-left:3px solid ${tc};padding-left:10px">${esc(dp.headline||st.label)}</div></div>
+    <div class="badge"><div class="l">允许动作</div><div class="v" style="font-size:var(--t-base);line-height:1.45">${esc(dp.doNow||st.action)}</div></div>
+    <div class="badge"><div class="l">不要做</div><div class="v" style="font-size:var(--t-base);line-height:1.45;color:#E8B339">${esc(dp.avoid||'先等更清晰触发，不把单一信号当确定性。')}</div></div>
+    <div class="badge"><div class="l">CCS 身份</div><div class="v" style="font-size:var(--t-base);line-height:1.45">${esc(dp.ccsRole||'必须先判断是 hedge 还是方向性做空。')}</div></div>
    </div>
    <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">下一触发</th><th>关键价</th><th>距现价</th><th class="l">老师动作</th></tr></thead><tbody>${nextRows}</tbody></table></div>
-   <div class="note" style="margin-top:10px"><b>移动止盈：</b>${dp.movingStop||'先定义防守线。'} QQQ 20日高点 ${fmt(trail.qqqHigh20)}，3xATR 参考 ${fmt(trail.qqqTrail3Atr)}（距现价 ${trail.qqqTrailGapPct==null?'—':trail.qqqTrailGapPct+'%'}）；TQQQ 20日高点 ${fmt(trail.tqqqHigh20)}，8%/12% trailing 参考 ${fmt(trail.tqqqTrail8Pct)} / ${fmt(trail.tqqqTrail12Pct)}。<b>技术参考，非投资建议。</b></div>
+   <div class="note" style="margin-top:10px"><b>移动止盈：</b>${esc(dp.movingStop||'先定义防守线。')} QQQ 20日高点 ${fmt(trail.qqqHigh20)}，3xATR 参考 ${fmt(trail.qqqTrail3Atr)}（距现价 ${trail.qqqTrailGapPct==null?'—':trail.qqqTrailGapPct+'%'}）；TQQQ 20日高点 ${fmt(trail.tqqqHigh20)}，8%/12% trailing 参考 ${fmt(trail.tqqqTrail8Pct)} / ${fmt(trail.tqqqTrail12Pct)}。<b>技术参考，非投资建议。</b></div>
    <div class="badges" style="margin-top:12px">${checks}</div>
   </div>`;
  const z=q.zones||{},zr=[
@@ -3991,8 +5168,8 @@ function qqqTqqqTab(){
   ['EMA34 防线',z.ema34Defense,'跌到这里不再当普通浅回调'],
   ['EMA55 regime',z.ema55Regime,'重新判断市场状态'],
  ].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]?fmt(r[1][0])+' - '+fmt(r[1][1]):'—'}</td><td class="l">${r[2]}</td></tr>`).join('');
- const rr=(q.rules||[]).map(r=>`<tr style="${r.active?'background:rgba(232,179,57,.08)':''}"><td class="l">${r.active?'<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">现在</span> ':''}${r.title}</td><td class="l">${r.trigger}</td><td class="l">${r.decision}</td></tr>`).join('');
- const h=Object.values(q.holdings||{}).map(x=>`<tr><td class="l">${x.sym}</td><td>${x.held?fmtN(x.shares,0):'—'}</td><td>${x.held?fmt(x.avg):'—'}</td><td>${x.held?fmt(x.value):'—'}</td><td class="${cls(x.gain)}">${x.held?fmt(x.gain)+' / '+pct(x.gainPct):'—'}</td></tr>`).join('');
+ const rr=(q.rules||[]).map(r=>`<tr style="${r.active?'background:rgba(232,179,57,.08)':''}"><td class="l">${r.active?'<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">现在</span> ':''}${esc(r.title)}</td><td class="l">${esc(r.trigger)}</td><td class="l">${esc(r.decision)}</td></tr>`).join('');
+ const h=Object.values(q.holdings||{}).map(x=>`<tr><td class="l">${esc(x.sym)}</td><td>${x.held?fmtN(x.shares,0):'—'}</td><td>${x.held?fmt(x.avg):'—'}</td><td>${x.held?fmt(x.value):'—'}</td><td class="${cls(x.gain)}">${x.held?fmt(x.gain)+' / '+pct(x.gainPct):'—'}</td></tr>`).join('');
  const c=q.tqqqCcs;
  const A=DATA.account;
  const optExposure=A?foldCard('期权 / 杠杆风险抬头看','QQQ 决策前先看账户刹车距离',`
@@ -4014,18 +5191,18 @@ function qqqTqqqTab(){
    </div>
    <div class="note">这张卡不判断买卖，只防止结构误用：没有 100 股就不是 covered call；现金不足就不是 CSP；${gl('ccs','CCS')} 即使 ${gl('defrisk','defined risk')}，也不能大到压过核心多头和移动止盈能力。<b>非投资建议。</b></div>`);
  const tp=q.tqqqOptions||{};
- const statusChip=s=>{const c=s==='BLOCK'?'#E5707A':(s==='ALLOW'?'#4FB286':'#E8B339');return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${s||'WATCH'}</span>`;};
- const optLegRows=[...(tp.currentTqqqLegs||[]),...(tp.currentQqqLegs||[])].map(l=>`<tr><td class="l">${l.underlying||'—'}</td><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name||l.sym}</td><td>${fmtN(l.qty,0)}</td><td class="${cls(l.mark)}">${fmt(l.mark)}</td></tr>`).join('');
- const optHistRows=(tp.recentTqqqOrders||[]).concat(tp.recentQqqOrders||[]).map(o=>`<tr><td class="l">${o.underlying}</td><td class="l">${o.sym}</td><td>${o.lastDate||'—'}</td><td>${o.trades}</td><td>${fmtN(o.netQty,3)}</td><td class="${cls(o.netCash)}">${fmt(o.netCash)}</td></tr>`).join('');
- const structRows=(tp.structures||[]).map(x=>`<tr><td class="l">${x.name}<br><span class="note">${x.role}</span></td><td>${statusChip(x.status)}</td><td class="l">${x.rule}</td><td class="l">${x.risk}</td></tr>`).join('');
+ const statusChip=s=>{const c=s==='BLOCK'?'#E5707A':(s==='ALLOW'?'#4FB286':'#E8B339');return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${esc(s||'WATCH')}</span>`;};
+ const optLegRows=[...(tp.currentTqqqLegs||[]),...(tp.currentQqqLegs||[])].map(l=>`<tr><td class="l">${esc(l.underlying||'—')}</td><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${esc(l.name||l.sym)}</td><td>${fmtN(l.qty,0)}</td><td class="${cls(l.mark)}">${fmt(l.mark)}</td></tr>`).join('');
+ const optHistRows=(tp.recentTqqqOrders||[]).concat(tp.recentQqqOrders||[]).map(o=>`<tr><td class="l">${esc(o.underlying)}</td><td class="l">${esc(o.sym)}</td><td>${esc(o.lastDate||'—')}</td><td>${o.trades}</td><td>${fmtN(o.netQty,3)}</td><td class="${cls(o.netCash)}">${fmt(o.netCash)}</td></tr>`).join('');
+ const structRows=(tp.structures||[]).map(x=>`<tr><td class="l">${esc(x.name)}<br><span class="note">${esc(x.role)}</span></td><td>${statusChip(x.status)}</td><td class="l">${esc(x.rule)}</td><td class="l">${esc(x.risk)}</td></tr>`).join('');
  const tqqqOptionControl=foldCard('TQQQ 期权控制台','把 TQQQ 股票、QQQ 期权、TQQQ 期权分开，避免误判',`
-   <div class="note" style="margin-bottom:9px"><b>当前核对：</b>${tp.status||'—'} 已知现金 ${fmt(tp.cashKnown||0)}；TQQQ covered-call 可覆盖组数 ${tp.coveredContracts||0}；TQQQ CSP 可覆盖组数 ${tp.cashSecuredPutContracts||0}。<b>非投资建议。</b></div>
+   <div class="note" style="margin-bottom:9px"><b>当前核对：</b>${esc(tp.status||'—')} 已知现金 ${fmt(tp.cashKnown||0)}；TQQQ covered-call 可覆盖组数 ${tp.coveredContracts??'—'}；TQQQ CSP 可覆盖组数 ${tp.cashSecuredPutContracts??'—'}。<b>非投资建议。</b></div>
    <div class="scroll"><table><thead><tr><th class="l">TQQQ 结构</th><th>状态</th><th class="l">触发 / 纪律</th><th class="l">风险口径</th></tr></thead><tbody>${structRows}</tbody></table></div>
    <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">标的</th><th class="l">方向</th><th class="l">当前 QQQ/TQQQ 期权腿</th><th>数量</th><th>Mark</th></tr></thead><tbody>${optLegRows||'<tr><td class="l" colspan="5">当前持仓快照没有 QQQ/TQQQ 期权腿。</td></tr>'}</tbody></table></div>
    <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">标的</th><th class="l">合约</th><th>最近日期</th><th>成交数</th><th>净张数</th><th>净现金流</th></tr></thead><tbody>${optHistRows||'<tr><td class="l" colspan="6">本窗口没有 QQQ/TQQQ 期权成交。</td></tr>'}</tbody></table></div>
-   <div class="note" style="margin-top:10px">解读：TQQQ 股票买入不会自动变成 TQQQ 期权风险；当前 open 的 QQQ 708/711 是 QQQ call debit spread，和未来可能设计的 TQQQ CCS / debit spread 分开管理。任何 TQQQ 期权都先写 max loss、DTE、delta/credit、止盈和失效线。</div>`);
+   <div class="note" style="margin-top:10px">解读：TQQQ 股票买入不会自动变成 TQQQ 期权风险；上表按当前券商快照列出 QQQ/TQQQ 期权腿，不把历史合约写死在文案中。任何 TQQQ 期权都先写 max loss、DTE、delta/credit、止盈和失效线。</div>`);
  const ccs=c?foldCard('TQQQ 上方 CCS 对冲区','定义风险 · 小仓 · 给多头仓位加短线刹车',`
-   <div class="note" style="margin-bottom:8px"><b>身份检查：</b>${dp.ccsRole||'先判断是否有多头仓可 hedge。'} 没有多头仓时，它不是 hedge，是偏空 short-premium。</div>
+   <div class="note" style="margin-bottom:8px"><b>身份检查：</b>${esc(dp.ccsRole||'先判断是否有多头仓可 hedge。')} 没有多头仓时，它不是 hedge，是偏空 short-premium。</div>
    <div class="scroll"><table><thead><tr><th class="l">项目</th><th>当前量化</th><th class="l">执行含义</th></tr></thead><tbody>
    <tr><td class="l">TQQQ spot</td><td>${fmt(c.spot)}</td><td class="l">执行标的，不用它判断趋势</td></tr>
    <tr><td class="l">Short call 参考</td><td>${fmt(c.shortRange[0])} - ${fmt(c.shortRange[1])}</td><td class="l">当前价上方 3%-6%，或实盘用 0.15-0.25 delta</td></tr>
@@ -4036,10 +5213,10 @@ function qqqTqqqTab(){
    <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">1美元宽示例</th><th>Max profit/组</th><th>Max loss/组</th><th>Breakeven</th></tr></thead><tbody>${(c.example9122.creditScenarios||[]).map(s=>`<tr><td class="l">credit ${fmt(s.credit)}</td><td class="pos">${fmt(s.maxProfit)}</td><td class="neg">${fmt(s.maxLoss)}</td><td>${fmt(s.breakeven)}</td></tr>`).join('')}</tbody></table></div>
    <div class="note" style="margin-top:10px">退出纪律：赚到 credit 的 50%-70% 可收；亏损到 credit 的 1.5-2 倍或 QQQ 强势突破前高时不要硬扛。这里不读期权链，delta 需实盘确认。<b>非投资建议。</b></div>`):'';
  const spreadCard=(q.optionSpreads||[]).length?foldCard('Spread Risk Ledger','先看组合结构，再看单腿',`
-   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>宽度</th><th>当前净Mark</th><th>理论范围</th><th class="l">风险提示</th></tr></thead><tbody>${q.optionSpreads.map(s=>`<tr><td class="l">${s.underlying} ${s.kind}</td><td>${s.expiry}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${s.right}</td><td>${fmt(s.widthValue)}</td><td>${fmt(s.netMark)}</td><td>${fmt(s.expectedRange[0])} - ${fmt(s.expectedRange[1])}</td><td class="l">${(s.warnings&&s.warnings.length)?'<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">核对</span> '+s.warnings.join('；'):'<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">范围内</span> 仍需实盘 bid/ask/Greeks'}</td></tr>`).join('')}</tbody></table></div>
+   <div class="scroll"><table><thead><tr><th class="l">结构</th><th>到期/DTE</th><th>腿</th><th>宽度</th><th>当前净Mark</th><th>理论范围</th><th class="l">风险提示</th></tr></thead><tbody>${q.optionSpreads.map(s=>`<tr><td class="l">${esc(s.underlying)} ${esc(s.kind)}</td><td>${esc(s.expiry)}<br><span class="note">${s.dte==null?'—':s.dte+'d'}</span></td><td>${s.longStrike}/${s.shortStrike} ${esc(s.right)}</td><td>${fmt(s.widthValue)}</td><td>${fmt(s.netMark)}</td><td>${fmt(s.expectedRange[0])} - ${fmt(s.expectedRange[1])}</td><td class="l">${(s.warnings&&s.warnings.length)?'<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">核对</span> '+s.warnings.map(esc).join('；'):'<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">范围内</span> 仍需实盘 bid/ask/Greeks'}</td></tr>`).join('')}</tbody></table></div>
    <div class="note" style="margin-top:10px">这里根据券商持仓名和数量保守识别垂直价差；entry debit/credit 不在持仓 CSV 中，真实最大盈亏仍需结合成交记录和实时盘口。若 short leg 已接近 0.01/0.02 且 long leg 很便宜，才考虑老师的“买回 short、留 long 彩票”拆腿。<b>非投资建议。</b></div>`):'';
  const legs=(q.optionLegs||[]).length?foldCard('当前 QQQ/TQQQ 期权腿','券商快照市价，不是 Delta/名义敞口',`
-   <div class="scroll"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th>数量</th><th>Mark</th><th class="l">账户</th></tr></thead><tbody>${q.optionLegs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${l.name||l.sym}</td><td>${fmtN(l.qty,0)}</td><td>${fmt(l.mark)}</td><td class="l">${l.type||l.acct||'—'}</td></tr>`).join('')}</tbody></table></div>`):'';
+   <div class="scroll"><table><thead><tr><th class="l">方向</th><th class="l">合约</th><th>数量</th><th>Mark</th><th class="l">账户</th></tr></thead><tbody>${q.optionLegs.map(l=>`<tr><td class="l">${l.side==='short'?'空头':'多头'}</td><td class="l">${esc(l.name||l.sym)}</td><td>${fmtN(l.qty,0)}</td><td>${fmt(l.mark)}</td><td class="l">${esc(l.type||l.acct||'—')}</td></tr>`).join('')}</tbody></table></div>`):'';
  const playbook=foldCard('老师策略蒸馏','天气 · 执行 · 刹车 · 生存',`
    <div class="badges">
     <div class="badge"><div class="l">QQQ = 天气图</div><div class="v" style="font-size:var(--t-base);line-height:1.5">只用 QQQ 日线 EMA/ATR 判断 regime，不用 TQQQ 噪音决定世界观。</div></div>
@@ -4049,9 +5226,9 @@ function qqqTqqqTab(){
    </div>
    <div class="note" style="margin-top:10px">回测发现：强趋势里核心 QQQ 暴露最关键；更接近老师的版本是 90% QQQ core + TQQQ 回踩战术 + 过热卖一半留 runner；CCS 只在明确过热/停顿时小仓做。<b>非投资建议。</b></div>`);
  return `<div class="card" style="border-left:3px solid ${tc}">
-   <div class="dh"><h2 class="t">QQQ/TQQQ 决策台<span class="t-en">Decision Desk</span></h2><span class="nm">QQQ 判天气 · TQQQ/期权做执行 · as of ${q.asOf}</span></div>
-   <div class="hero-fig" style="margin:8px 0 3px;border-left:3px solid ${tc};padding-left:10px">${st.action}</div>
-   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
+   <div class="dh"><h2 class="t">QQQ/TQQQ 决策台<span class="t-en">Decision Desk</span></h2><span class="nm">QQQ 判天气 · TQQQ/期权做执行 · as of ${esc(q.asOf||'—')}</span></div>
+   <div class="hero-fig" style="margin:8px 0 3px;border-left:3px solid ${tc};padding-left:10px">${esc(st.action)}</div>
+   ${alignmentWarn}<div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="note">${sourceNote} 数据窗口跟随本次 CSV / Yahoo cache。<b>技术参考，非投资建议。</b></div>
  </div>
  ${decisionBrief}
@@ -4079,10 +5256,10 @@ function qqqTqqqTab(){
 function _ovPanelEnv(){
  const pr=S.curReturn,sp=S.spReturn,nq=S.nasdaqReturn,ser=DATA.series||[];
  const cards=[
-  ['当前持仓市值',fmt(S.netWorthNow)],
-  ['期初持仓市值',fmt(S.netWorthStart)],
-  ['选股策略本身的收益 ('+gl('TWR','时间加权 TWR')+')',`<span class="${cls(pr)}">${pct(pr)}</span>`],
-  ['你的钱实际经历的收益 ('+gl('MWR','资金加权 MWR')+')',S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`],
+  ['当前持仓市值（券商）',fmt(S.marketValue)],
+  ['期初调整价路径值',fmt(S.netWorthStart)],
+  ['选股策略本身的收益 ('+gl('TWR','时间加权 TWR')+') '+qualityChip((S.twrQuality||{}).status,(S.twrQuality||{}).status==='complete'?'完整':'待核'),`<span class="${cls(pr)}">${pct(pr)}</span>`],
+  ['你的钱实际经历的收益 ('+gl('MWR','资金加权 MWR')+') '+qualityChip((S.mwrQuality||{}).status,(S.mwrQuality||{}).status==='complete'?'完整':'待核'),S.mwrPeriod==null?'—':`<span class="${cls(S.mwrPeriod)}">${pct(S.mwrPeriod)}</span>`],
   ['你的钱年化收益 ('+gl('XIRR','XIRR')+')',S.mwrAnnual==null?'—':`<span class="${cls(S.mwrAnnual)}">${pct(S.mwrAnnual)}</span> <span class="note">数月年化·非预测</span>`],
   ['择时帮了还是拖了 ('+gl('gap','行为缺口')+')',S.behaviorGap==null?'—':`<span class="${cls(-S.behaviorGap)}">${S.behaviorGap>0?'+':''}${S.behaviorGap.toFixed(2)}pp</span> <span class="note">${S.behaviorGap>0?'你的钱落后策略':(S.behaviorGap<0?'你的钱跑赢策略':'基本中性')}</span>`],
   ['同期 S&P 500',sp==null?'—':`<span class="${cls(sp)}">${pct(sp)}</span>`],
@@ -4103,30 +5280,34 @@ function decisionLabCard(){
   return `<div class="card t1"><div class="dh"><h2 class="t">决策分析<span class="t-en">Decision Analysis</span></h2><span class="nm">现金部署 · 择时 · 多视角量化裁决</span></div><div class="note" style="line-height:1.8">暂无决策分析数据。<br>生成方式：运行 <b>python3 scripts/decision_analysis.py --tickers AMD,QQQ,TQQQ,SPMO,MU,NBIS,TSM,ASML</b> 计算量化指标，补上综合评分与裁决后写入 <b>output/decision_analysis.json</b>，再跑 <b>python3 sync.py</b>，本页即会渲染同样的现金 + 记分卡视图。<b>非投资建议。</b></div></div>`;
  }
  const cash=D.cash||{};
- const money=v=>'$'+Number(v).toLocaleString('en-US');
+ const money=v=>fmt(Number(v),2);
  const cashCards=[
-  ['可操作现金', cash.operable!=null?money(cash.operable):'—', cash.withPending!=null?('含在途 → '+money(cash.withPending)):''],
-  ['现金占比', cash.pctSettled!=null?(cash.pctSettled+'%'):'—', cash.pctWithPending!=null?('含在途 '+cash.pctWithPending+'%'):''],
-  ['净清算值', cash.netLiq!=null?('$'+Math.round(cash.netLiq/1000)+'k'):'—', cash.top4Pct!=null?('前4名占 '+cash.top4Pct+'%'):'']
+  ['已知正现金', cash.operable!=null?money(cash.operable):'—', cash.withPending!=null?('加待结算 → '+money(cash.withPending)):''],
+  ['已知现金占比', cash.pctSettled!=null?(cash.pctSettled+'%'):'—', cash.pctWithPending!=null?('加待结算 '+cash.pctWithPending+'%'):''],
+  ['账户快照算术总额', cash.netLiq!=null?money(cash.netLiq):'—', cash.top4Pct!=null?('前4名占 '+cash.top4Pct+'%'):'']
  ];
+ const statusRaw=String(D.analysisStatus||'unknown'),isLimited=/no_discretionary|incomplete|review/i.test(statusRaw);
+ const statusLabel=/no_discretionary/i.test(statusRaw)?'量化审查完成 · 未作主观裁决':statusRaw.replace(/_/g,' ');
  const rows=D.candidates.map(c=>{const tc=decisionTone(c.tone);
-  return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${c.ticker}')">
-    <td class="l"><b>${c.ticker}</b>${c.price!=null?` <span class="note">$${c.price}</span>`:''}</td>
+  return `<tr style="cursor:pointer" tabindex="0" data-sym="${esc(c.ticker)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+    <td class="l"><b>${esc(c.ticker)}</b>${c.price!=null?` <span class="note">$${c.price}</span>`:''}</td>
     <td><span style="font-family:var(--f-mono);font-size:15px;color:${tc}">${c.composite!=null?c.composite:'—'}</span></td>
-    <td style="color:${tc};font-size:var(--t-sm)">${c.status||''}</td>
+    <td style="color:${tc};font-size:var(--t-sm)">${esc(c.status||'')}</td>
     <td style="min-width:128px">${decBar('趋',c.momentum,'#9A8CF0')}${decBar('险',c.risk,'#4FB286')}${decBar('散',c.diversify,'#6FA8DC')}</td>
-    <td><span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${c.verdict||''}</span></td></tr>`;}).join('');
+    <td><span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${esc(c.verdict||'')}</span></td></tr>`;}).join('');
  const cards=D.candidates.map(c=>{const tc=decisionTone(c.tone);
-  return `<div class="smc" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${c.ticker}')">
-    <div class="smc-top"><b class="smc-sym">${c.ticker}</b><span class="smc-state" style="color:${tc}">综合 ${c.composite!=null?c.composite:'—'}</span><span class="smc-pnl" style="color:${tc}">${c.status||''}</span></div>
+  return `<div class="smc" role="button" tabindex="0" data-sym="${esc(c.ticker)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+    <div class="smc-top"><b class="smc-sym">${esc(c.ticker)}</b><span class="smc-state" style="color:${tc}">综合 ${c.composite!=null?c.composite:'—'}</span><span class="smc-pnl" style="color:${tc}">${esc(c.status||'')}</span></div>
     <div class="smc-mid">趋势 ${Math.round(c.momentum||0)} · 风险 ${Math.round(c.risk||0)} · 分散 ${Math.round(c.diversify||0)}${c.price!=null?' · $'+c.price:''}</div>
-    <div class="smc-bias"><span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${c.verdict||''}</span>${c.note?` <span class="note">${c.note}</span>`:''}</div></div>`;}).join('');
- const noList=(D.noList||[]).map(n=>`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">✕ ${n.ticker}${n.why?`<span class="note" style="margin-left:4px;font-weight:400">${n.why}</span>`:''}</span>`).join(' ');
- const rules=(D.rules||[]).map(r=>`<li style="margin:4px 0">${r}</li>`).join('');
+    <div class="smc-bias"><span class="chip" style="color:${tc};border-color:${chipBd(tc)}">${esc(c.verdict||'')}</span>${c.note?` <span class="note">${esc(c.note)}</span>`:''}</div></div>`;}).join('');
+ const noList=(D.noList||[]).map(n=>`<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">✕ ${esc(n.ticker)}${n.why?`<span class="note" style="margin-left:4px;font-weight:400">${esc(n.why)}</span>`:''}</span>`).join(' ');
+ const rules=(D.rules||[]).map(r=>`<li style="margin:4px 0">${esc(r)}</li>`).join('');
  return `<div class="card t1">
-   <div class="dh"><h2 class="t">决策分析<span class="t-en">Decision Analysis</span></h2><span class="nm">${(D.title||'现金部署 · 择时 · 多视角量化裁决')}${D.asOf?(' · '+D.asOf):''}</span></div>
-   ${D.thesis?`<div class="note" style="line-height:1.75;margin-bottom:10px"><b>核心结论：</b>${D.thesis}</div>`:''}
+   <div class="dh"><h2 class="t">决策分析<span class="t-en">Decision Analysis</span></h2><span class="nm">${esc(D.title||'现金部署 · 择时 · 多视角量化裁决')}${D.asOf?(' · '+esc(D.asOf)):''}</span></div>
+   <div role="status" class="note" style="padding:9px 11px;margin-bottom:10px;border-left:3px solid ${isLimited?'var(--accent)':'var(--green)'};background:var(--bg2);line-height:1.65"><b>分析状态：${esc(statusLabel)}</b>${D.generatedAt?` · generated ${esc(D.generatedAt)}`:''}<br>这是研究工作流标签，不是交易指令或人工投资建议。</div>
+   ${D.thesis?`<div class="note" style="line-height:1.75;margin-bottom:10px"><b>核心结论：</b>${esc(D.thesis)}</div>`:''}
    <div class="badges">${cashCards.map(m=>`<div class="badge"><div class="l">${m[0]}</div><div class="v">${m[1]}</div>${m[2]?`<div class="note" style="font-size:var(--t-xs);margin-top:2px">${m[2]}</div>`:''}</div>`).join('')}</div>
+   ${cash.note?`<div class="note" style="margin-top:8px;padding:8px 10px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.65"><b>现金口径：</b>${esc(cash.note)}</div>`:''}
    ${noList?`<div style="margin:14px 0 2px"><span class="cap">明确不要买</span><div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${noList}</div></div>`:''}
    <div class="scroll score-tablewrap" style="margin-top:12px"><table><thead><tr><th class="l">代码</th><th title="动量·风险·组合三视角均分">综合分</th><th>今日状态</th><th title="趋势=动量质量 · 险=回撤/估值安全 · 散=与现有持仓的分散度">趋势 / 险 / 散</th><th>裁决</th></tr></thead><tbody>${rows}</tbody></table></div>
    <div class="score-cards" aria-label="决策分析（手机版卡片）">${cards}</div>
@@ -4151,8 +5332,8 @@ function finOmitFind(sym){sym=(sym||'').toUpperCase();return finOmittedRows().fi
 function finReasonText(r){const x=((r&&r.gateReasons||[])[0]||{}).detail||'';return x.length>110?finEsc(x.slice(0,107))+'...':finEsc(x);}
 function financialMiniBadge(sym){
  const r=finFind(sym),o=finOmitFind(sym);
- if(r){const c=finTone(r.gate);return `<span class="chip" style="color:${c};border-color:${chipBd(c)};cursor:pointer" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${finEsc(sym)}','fin')" title="FMP 财务状态：${finEsc(r.gate)}">${finEsc(r.gate)} · ${r.finalScore??'—'}</span>`;}
- if(o)return `<span class="chip" style="color:var(--mut);border-color:var(--line);cursor:pointer" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${finEsc(sym)}','fin')" title="${finEsc(o.reason)}">财务 N/A</span>`;
+ if(r){const c=finTone(r.gate);return `<span class="chip" style="color:${c};border-color:${chipBd(c)};cursor:pointer" role="button" tabindex="0" data-sym="${finEsc(sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'fin')" title="FMP 财务状态：${finEsc(r.gate)}">${finEsc(r.gate)} · ${r.finalScore??'—'}</span>`;}
+ if(o)return `<span class="chip" style="color:var(--mut);border-color:var(--line);cursor:pointer" role="button" tabindex="0" data-sym="${finEsc(sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'fin')" title="${finEsc(o.reason)}">财务 N/A</span>`;
  return '';
 }
 function financialStatusCard(){
@@ -4175,8 +5356,8 @@ function financialStatusCard(){
   ['Source Coverage',Object.entries(sum.sourceFamilyCounts||{}).map(([k,v])=>`${k} ${v}`).join(' · ')||'—',`enabled ${(D.sourcesEnabled||[]).join(', ')||'—'}${D.secUserAgentConfigured?' · SEC on':' · SEC UA missing'}`],
  ];
  const table=rows.map(r=>{const m=r.metrics||{},e=r.earnings||{},c=finScoreColor(r.finalScore),rc=finRiskColor(r.nextEarningsRiskIndex);
-  return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${finEsc(r.ticker)}','fin')">
-   <td class="l"><b>${finEsc(r.ticker)}</b><br><span class="note">${finEsc(r.name)}</span><br><span class="note">src ${(r.sourceFamilies||[]).join('+')||'—'}</span></td>
+  return `<tr style="cursor:pointer" tabindex="0" data-sym="${finEsc(r.ticker)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'fin')">
+   <td class="l"><b>${finEsc(r.ticker)}</b><br><span class="note">${finEsc(r.name)}</span><br><span class="note">src ${finEsc((r.sourceFamilies||[]).join('+')||'—')}</span></td>
    <td>${gateChip(r.gate)}</td>
    <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore??'—'}</span></td>
    <td>${r.financialStatusScore??'—'}<br><span class="note">利 ${r.components?.profitability??'—'} · 资 ${r.components?.balanceSheet??'—'} · 现 ${r.components?.cashFlow??'—'}</span></td>
@@ -4187,17 +5368,17 @@ function financialStatusCard(){
    <td>${finRatioPct(m.revenueGrowthAvg)}<br><span class="note">net margin ${finRatioPct(m.netMarginTTM)} · P/E ${finNum(m.priceToEarningsTTM)}</span></td>
    <td class="l"><span class="note">${reason(r)||'—'}</span></td>
   </tr>`;}).join('');
- const mobile=rows.slice(0,16).map(r=>{const e=r.earnings||{},m=r.metrics||{},c=finScoreColor(r.finalScore);
-  return `<div class="smc" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${finEsc(r.ticker)}','fin')">
+ const mobile=rows.map(r=>{const e=r.earnings||{},m=r.metrics||{},c=finScoreColor(r.finalScore);
+  return `<div class="smc" role="button" tabindex="0" data-sym="${finEsc(r.ticker)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'fin')">
    <div class="smc-top"><b class="smc-sym">${finEsc(r.ticker)}</b><span class="smc-state" style="color:${c}">Lens ${r.finalScore??'—'} · Fin ${r.financialStatusScore??'—'}</span><span class="smc-pnl" style="color:${finTone(r.gate)}">${finEsc(r.gate)}</span></div>
-   <div class="smc-mid">财报 ${r.earningsReportScore??'—'} · event ${r.nextEarningsRiskIndex??'—'} · src ${(r.sourceFamilies||[]).join('+')||'—'} · ${finEsc(e.nextDate||'earnings n/a')}${e.daysToNext==null?'':' · '+e.daysToNext+'d'} · 仓位 ${finPct(r.portfolioWeightPct,2)}</div>
+   <div class="smc-mid">财报 ${r.earningsReportScore??'—'} · event ${r.nextEarningsRiskIndex??'—'} · src ${finEsc((r.sourceFamilies||[]).join('+')||'—')} · ${finEsc(e.nextDate||'earnings n/a')}${e.daysToNext==null?'':' · '+e.daysToNext+'d'} · 仓位 ${finPct(r.portfolioWeightPct,2)}</div>
    <div class="smc-bias">${reason(r)||''} <span class="note">Piotroski ${m.piotroskiScore??'—'} · Altman ${m.altmanZScore??'—'}</span></div>
   </div>`;}).join('');
  const omitted=om.map(o=>`<tr><td class="l"><b>${finEsc(o.ticker)}</b><br><span class="note">${finEsc(o.name)}</span></td><td>${finPct(o.portfolioWeightPct,2)}</td><td>${fmt(o.value)}</td><td class="l"><span class="note">${finEsc(o.reason)}</span></td></tr>`).join('');
  return `<div class="card t1">
-   <div class="dh"><h2 class="t">财务状态<span class="t-en">FMP Lens</span></h2><span class="nm">财务质量 · 财报记录 · 下一财报风险 · ${(D.asOfDate||D.generatedAt||'').slice(0,10)||'—'}</span></div>
+   <div class="dh"><h2 class="t">财务状态<span class="t-en">FMP Lens</span></h2><span class="nm">财务质量 · 财报记录 · 下一财报风险 · ${finEsc((D.asOfDate||D.generatedAt||'').slice(0,10)||'—')}</span></div>
    <div class="note" style="line-height:1.7">This lens scores operating-company holdings using FMP financial scores, TTM ratios, key metrics, financial growth, earnings history, and the earnings calendar. DATA_REVIEW means FMP did not provide enough usable fundamentals under the current API plan; the row remains visible rather than filled with invented data.</div>
-   <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('')}</div>
+   <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${finEsc(x[0])}</div><div class="v">${finEsc(x[1])}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${finEsc(x[2])}</div></div>`).join('')}</div>
    ${leaders?`<div style="margin-top:12px"><span class="cap">Leaders</span><div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${leaders}</div></div>`:''}
    ${upcoming?`<div style="margin-top:12px"><span class="cap">Upcoming Earnings</span><div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${upcoming}</div></div>`:''}
   </div>
@@ -4248,7 +5429,7 @@ function financialStockDetailCard(s){
   ['Financial Status',r.financialStatusScore??'—',`profit ${c.profitability??'—'} · balance ${c.balanceSheet??'—'} · cash ${c.cashFlow??'—'}`],
   ['Earnings Record',r.earningsReportScore??'—',`EPS beat ${e.epsBeatRate==null?'—':finPct(e.epsBeatRate)} · rows ${e.rowsUsed??0}`],
   ['Next Earnings Risk',`<span style="color:${riskColor}">${r.nextEarningsRiskIndex??'—'}</span>`,`${finEsc(e.nextDate||'unknown')}${e.daysToNext==null?'':' · '+e.daysToNext+'d'}${e.nextTime?' · '+finEsc(e.nextTime):''}`],
-  ['Data Confidence',r.dataConfidenceScore??'—',`sources ${(r.sourceFamilies||[]).join('+')||'—'} · sector ${finEsc(m.sector||'—')}`],
+  ['Data Confidence',r.dataConfidenceScore??'—',`sources ${finEsc((r.sourceFamilies||[]).join('+')||'—')} · sector ${finEsc(m.sector||'—')}`],
  ];
  const metricRows=[
   ['Profitability',`gross ${finRatioPct(m.grossMarginTTM)} · op ${finRatioPct(m.operatingMarginTTM)} · net ${finRatioPct(m.netMarginTTM)}`,`ROE ${finRatioPct(m.returnOnEquityTTM)} · ROA ${finRatioPct(m.returnOnAssetsTTM)} · ROIC ${finRatioPct(m.returnOnInvestedCapitalTTM)}`],
@@ -4264,7 +5445,7 @@ function financialStockDetailCard(s){
  ].map(x=>`<tr><td class="l"><b>${x[0]}</b></td><td>${x[1]}</td><td class="l"><span class="note">${x[2]}</span></td></tr>`).join('');
  const reasons=(r.gateReasons||[]).map(g=>`<span class="chip" style="color:${tone};border-color:${chipBd(tone)}">${finEsc(g.rule||'rule')}: <span class="note" style="margin-left:4px">${finEsc(g.detail||'')}</span></span>`).join(' ');
  return behaviorCard+`<div class="card">
-   <div class="dh"><h2 class="t">财务状态<span class="t-en">FMP</span></h2><span class="chip" style="color:${tone};border-color:${chipBd(tone)}">${finEsc(r.gate)}</span><span class="nm">${finEsc(r.name||s.name)} · ${(D.asOfDate||D.generatedAt||'').slice(0,10)||'—'}</span></div>
+   <div class="dh"><h2 class="t">财务状态<span class="t-en">FMP</span></h2><span class="chip" style="color:${tone};border-color:${chipBd(tone)}">${finEsc(r.gate)}</span><span class="nm">${finEsc(r.name||s.name)} · ${finEsc((D.asOfDate||D.generatedAt||'').slice(0,10)||'—')}</span></div>
    <div class="badges">${top.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('')}</div>
    ${reasons?`<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">${reasons}</div>`:''}
   </div>
@@ -4286,12 +5467,12 @@ function aiSemiQuantCard(){
   return `<div class="card t1"><div class="dh"><h2 class="t">AI半导体<span class="t-en">AI-SemiQuant</span></h2><span class="nm">产业链量化评分 · 资金瀑布 · 组合敞口</span></div><div class="note" style="line-height:1.8">暂无 AI-SemiQuant 数据。<br>生成方式：运行 <b>python3 scripts/ai_semi_quant.py</b> 写入 <b>output/ai_semi_quant.json</b> 和 <b>output/ai_semi_quant_report.md</b>，再跑 <b>python3 sync.py</b> 或 <b>python3 generate.py --no-fetch</b>。<b>研究框架，非投资建议。</b></div></div>`;
  }
  const sum=D.summary||{},leaders=sum.leaders||[],weights=D.factorWeights||{},labels=D.factorLabels||{},model=D.modelCard||{},gateCounts=sum.gateCounts||{},familyCounts=sum.gateFamilyCounts||{},torque=D.torqueOverlay||model.torqueOverlay||{};
- const gateChip=g=>{const c=aiqTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${g}</span>`;};
+ const gateChip=g=>{const c=aiqTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${esc(g)}</span>`;};
  const capFmt=v=>{if(v==null)return'—';v=Number(v);if(!isFinite(v))return'—';if(v>=1e12)return'$'+(v/1e12).toFixed(2)+'T';if(v>=1e9)return'$'+(v/1e9).toFixed(1)+'B';if(v>=1e6)return'$'+(v/1e6).toFixed(0)+'M';return'$'+Math.round(v).toLocaleString('en-US');};
- const reasonTxt=r=>{const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return x.length>92?x.slice(0,89)+'...':x;};
- const peerRankTxt=r=>r.peerPercentileDisplay||((r.peerGroupSize!=null&&r.peerGroupSize<3)?`N/A · n=${r.peerGroupSize}`:`P${r.peerPercentile??'—'}${r.peerGroupSize!=null?' · n='+r.peerGroupSize:''}`);
- const top=leaders.map(x=>`<span class="chip" style="color:${aiqScoreColor(x.score)};border-color:${chipBd(aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' ');
- const rankChips=(arr,key)=>((arr||[]).map(x=>`<span class="chip" style="color:${key==='tactical'?'#6FA8DC':aiqScoreColor(x.score)};border-color:${chipBd(key==='tactical'?'#6FA8DC':aiqScoreColor(x.score))}">${x.ticker} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${x.gate}</span>`).join(' '));
+ const reasonTxt=r=>{const x=String(((r.gateReasons||[])[0]||{}).detail||r.gateNote||'');return esc(x.length>92?x.slice(0,89)+'...':x);};
+ const peerRankTxt=r=>esc(r.peerPercentileDisplay||((r.peerGroupSize!=null&&r.peerGroupSize<3)?`N/A · n=${r.peerGroupSize}`:`P${r.peerPercentile??'—'}${r.peerGroupSize!=null?' · n='+r.peerGroupSize:''}`));
+ const top=leaders.map(x=>`<span class="chip" style="color:${aiqScoreColor(x.score)};border-color:${chipBd(aiqScoreColor(x.score))}">${esc(x.ticker)} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${esc(x.gate)}</span>`).join(' ');
+ const rankChips=(arr,key)=>((arr||[]).map(x=>`<span class="chip" style="color:${key==='tactical'?'#6FA8DC':aiqScoreColor(x.score)};border-color:${chipBd(key==='tactical'?'#6FA8DC':aiqScoreColor(x.score))}">${esc(x.ticker)} ${x.score}${x.percentile?' · P'+x.percentile:''} · ${esc(x.gate)}</span>`).join(' '));
  const cards=[
   ['数据日期',D.marketDataAsOf||'—','Yahoo adjusted close when available'],
   ['Gate Families',`${familyCounts.ALLOW||0} / ${familyCounts.WATCH||0} / ${familyCounts.BLOCK||0} / ${familyCounts.DATA_REVIEW||0}`,'ALLOW / WATCH / BLOCK / REVIEW 聚合口径'],
@@ -4302,14 +5483,14 @@ function aiSemiQuantCard(){
  const rows=D.scores.slice(0,24).map((r,i)=>{const m=r.market||{},p=r.portfolio||{},c=aiqScoreColor(r.finalScore);
   return `<tr>
    <td>${i+1}</td>
-   <td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td>
-   <td class="l">${r.node}<br><span class="note">${r.role}</span></td>
+   <td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td>
+   <td class="l">${esc(r.node)}<br><span class="note">${esc(r.role)}</span></td>
    <td>${gateChip(r.gate)}</td>
    <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore}</span><br><span class="note">P${r.universePercentile??'—'} / peer ${peerRankTxt(r)}</span></td>
    <td>${r.structuralScore??'—'} → ${r.torqueAdjustedScore??'—'}<br><span class="note">torque +${r.torqueBonus||0} / fragile -${r.fragilityPenalty||0}</span></td>
-   <td>${(r.factors||{}).sizeGrowthTorque??'—'}<br><span class="note">${capFmt(m.marketCapUsd)} · ${m.marketCapBucket||'—'}</span></td>
+   <td>${(r.factors||{}).sizeGrowthTorque??'—'}<br><span class="note">${capFmt(m.marketCapUsd)} · ${esc(m.marketCapBucket||'—')}</span></td>
    <td>${r.tacticalScore}<br><span class="note">趋 ${r.trendScore} / 险 ${r.riskScore}</span></td>
-   <td>${m.displayPrice||'—'}${m.priceUsd&&m.currency!=='USD'?`<br><span class="note">≈ ${fmt(m.priceUsd)}</span>`:''}</td>
+   <td>${esc(m.displayPrice||'—')}${m.priceUsd&&m.currency!=='USD'?`<br><span class="note">≈ ${fmt(m.priceUsd)}</span>`:''}</td>
    <td class="${cls(m.ret3m)}">${pct(m.ret3m)}</td>
    <td class="${cls(m.vs50)}">${pct(m.vs50)}</td>
    <td>${p.weightPct?`${p.weightPct.toFixed(2)}%`:'—'}${p.held?'<br><span class="note">持有中 · penalty '+(r.portfolioPenalty||0)+'</span>':''}</td>
@@ -4317,14 +5498,14 @@ function aiSemiQuantCard(){
   </tr>`;}).join('');
  const mobile=D.scores.slice(0,12).map(r=>{const m=r.market||{},p=r.portfolio||{},c=aiqScoreColor(r.finalScore);
   return `<div class="smc">
-   <div class="smc-top"><b class="smc-sym">${r.ticker}</b><span class="smc-state" style="color:${c}">总分 ${r.finalScore} · P${r.universePercentile??'—'}</span><span class="smc-pnl" style="color:${aiqTone(r.gate)}">${r.gate}</span></div>
-   <div class="smc-mid">${r.node} · ${m.displayPrice||'—'} · 结构 ${r.structuralScore??'—'}→${r.torqueAdjustedScore??'—'} · torque ${(r.factors||{}).sizeGrowthTorque??'—'} · ${capFmt(m.marketCapUsd)}${m.ret3m==null?'':' · 3M '+pct(m.ret3m)}</div>
-   <div class="smc-bias">${reasonTxt(r)||r.gateNote||''}${p.held?` <span class="chip" style="color:var(--mut);border-color:var(--line)">仓位 ${p.weightPct}%</span>`:''}</div></div>`;}).join('');
- const fRows=Object.keys(weights).map(k=>`<tr><td class="l">${labels[k]||k}</td><td>${Math.round(weights[k]*100)}%</td><td class="l">${({pricingPower:'市场份额、稀缺性、毛利率和合约涨价能力',profitElasticity:'跨过固定成本后新增收入转化为净利润的速度',capexConversion:'客户/晶圆厂资本开支转成订单和收入的确定性',valuationGrowth:'增长耐久度与估值之间的性价比'}[k]||'')}</td></tr>`).join('')+
-  `<tr><td class="l">${labels.sizeGrowthTorque||'Size/Growth Torque'}</td><td>overlay</td><td class="l">最高 +${torque.maxBonus??6}，并按客户集中、波动、过热和脆弱性扣分；不计入结构护城河。</td></tr>`;
- const wRows=(D.capitalWaterfall||[]).map(s=>`<tr><td class="l">${s.stage}</td><td class="l">${(s.beneficiaries||[]).join(', ')}</td><td class="l">${(s.leadingKpis||[]).join(' · ')}</td></tr>`).join('');
- const eRows=(D.capitalFlowEdges||[]).map(e=>`<tr><td class="l">${e.source}</td><td class="l">${e.target}</td><td class="l">${e.edgeType}</td><td>${e.weight}</td><td>${Math.round((e.confidence||0)*100)}%</td></tr>`).join('');
- const nRows=(sum.byNode||[]).map(n=>`<tr><td class="l">${n.node}</td><td>${n.count}</td><td>${n.avgScore}</td><td class="l">${(n.leaders||[]).join(', ')}</td></tr>`).join('');
+   <div class="smc-top"><b class="smc-sym">${esc(r.ticker)}</b><span class="smc-state" style="color:${c}">总分 ${r.finalScore} · P${r.universePercentile??'—'}</span><span class="smc-pnl" style="color:${aiqTone(r.gate)}">${esc(r.gate)}</span></div>
+   <div class="smc-mid">${esc(r.node)} · ${esc(m.displayPrice||'—')} · 结构 ${r.structuralScore??'—'}→${r.torqueAdjustedScore??'—'} · torque ${(r.factors||{}).sizeGrowthTorque??'—'} · ${capFmt(m.marketCapUsd)}${m.ret3m==null?'':' · 3M '+pct(m.ret3m)}</div>
+  <div class="smc-bias">${reasonTxt(r)||esc(r.gateNote||'')}${p.held?` <span class="chip" style="color:var(--mut);border-color:var(--line)">仓位 ${p.weightPct}%</span>`:''}</div></div>`;}).join('');
+ const fRows=Object.keys(weights).map(k=>`<tr><td class="l">${esc(labels[k]||k)}</td><td>${Math.round(weights[k]*100)}%</td><td class="l">${esc(({pricingPower:'市场份额、稀缺性、毛利率和合约涨价能力',profitElasticity:'跨过固定成本后新增收入转化为净利润的速度',capexConversion:'客户/晶圆厂资本开支转成订单和收入的确定性',valuationGrowth:'增长耐久度与估值之间的性价比'}[k]||''))}</td></tr>`).join('')+
+  `<tr><td class="l">${esc(labels.sizeGrowthTorque||'Size/Growth Torque')}</td><td>overlay</td><td class="l">最高 +${torque.maxBonus??6}，并按客户集中、波动、过热和脆弱性扣分；不计入结构护城河。</td></tr>`;
+ const wRows=(D.capitalWaterfall||[]).map(s=>`<tr><td class="l">${esc(s.stage)}</td><td class="l">${(s.beneficiaries||[]).map(esc).join(', ')}</td><td class="l">${(s.leadingKpis||[]).map(esc).join(' · ')}</td></tr>`).join('');
+ const eRows=(D.capitalFlowEdges||[]).map(e=>`<tr><td class="l">${esc(e.source)}</td><td class="l">${esc(e.target)}</td><td class="l">${esc(e.edgeType)}</td><td>${e.weight}</td><td>${Math.round((e.confidence||0)*100)}%</td></tr>`).join('');
+ const nRows=(sum.byNode||[]).map(n=>`<tr><td class="l">${esc(n.node)}</td><td>${n.count}</td><td>${n.avgScore}</td><td class="l">${(n.leaders||[]).map(esc).join(', ')}</td></tr>`).join('');
  const auditRows=[
   ['Model version',model.modelVersion||'—'],
   ['Universe',model.universeSize??'—'],
@@ -4335,17 +5516,17 @@ function aiSemiQuantCard(){
   ['Momentum = 100',model.momentumScoreAt100Count??'—'],
   ['Risk floor',(model.thresholds||{}).riskFloor??'—'],
   ['Single-name cap',((model.thresholds||{}).maxSinglePositionWeight??'—')+'%'],
- ].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+ ].map(r=>`<tr><td class="l">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('');
  const hardFlags=(model.hardDataFlags||[]).slice(0,8),softFlags=(model.softDataFlags||[]).slice(0,8);
- const flagRows=hardFlags.concat(softFlags).map(f=>`<tr><td class="l"><b>${f.ticker||'—'}</b><br><span class="note">${f.name||''}</span></td><td>${f.severity||'—'}</td><td class="l">${f.rule||'—'}</td><td class="l">${f.detail||'—'}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No named data-quality flags.</td></tr>';
+ const flagRows=hardFlags.concat(softFlags).map(f=>`<tr><td class="l"><b>${esc(f.ticker||'—')}</b><br><span class="note">${esc(f.name||'')}</span></td><td>${esc(f.severity||'—')}</td><td class="l">${esc(f.rule||'—')}</td><td class="l">${esc(f.detail||'—')}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No named data-quality flags.</td></tr>';
  const tacticalRaw=sum.tacticalLeadersRaw||[],tacticalInv=sum.tacticalLeadersInvestable||[];
- const tacticalRows=Array.from({length:Math.max(tacticalRaw.length,tacticalInv.length)}).map((_,i)=>{const a=tacticalRaw[i]||{},b=tacticalInv[i]||{};return `<tr><td>${i+1}</td><td class="l">${a.ticker||'—'}</td><td>${a.score??'—'}</td><td>${a.gate?gateChip(a.gate):'—'}</td><td class="l">${b.ticker||'—'}</td><td>${b.score??'—'}</td><td>${b.gate?gateChip(b.gate):'—'}</td></tr>`;}).join('');
- const riskRows=D.scores.slice(0,12).map(r=>{const b=r.riskBreakdown||{};return `<tr><td class="l">${r.ticker}</td><td>${r.riskScore}</td><td>${b.technicalOverextension||'—'}</td><td>${b.cycle||'—'}</td><td>${b.valuation||'—'}</td><td>${b.geopolitical||'—'}</td><td>${b.portfolioConcentration||'—'}</td></tr>`;}).join('');
- const src=(D.sources||[]).map(s=>`<li><a href="${s.url}" target="_blank" rel="noreferrer">${s.name}</a> <span class="note">${s.use||''}</span></li>`).join('');
+ const tacticalRows=Array.from({length:Math.max(tacticalRaw.length,tacticalInv.length)}).map((_,i)=>{const a=tacticalRaw[i]||{},b=tacticalInv[i]||{};return `<tr><td>${i+1}</td><td class="l">${esc(a.ticker||'—')}</td><td>${a.score??'—'}</td><td>${a.gate?gateChip(a.gate):'—'}</td><td class="l">${esc(b.ticker||'—')}</td><td>${b.score??'—'}</td><td>${b.gate?gateChip(b.gate):'—'}</td></tr>`;}).join('');
+ const riskRows=D.scores.slice(0,12).map(r=>{const b=r.riskBreakdown||{};return `<tr><td class="l">${esc(r.ticker)}</td><td>${r.riskScore}</td><td>${esc(b.technicalOverextension||'—')}</td><td>${esc(b.cycle||'—')}</td><td>${esc(b.valuation||'—')}</td><td>${esc(b.geopolitical||'—')}</td><td>${esc(b.portfolioConcentration||'—')}</td></tr>`;}).join('');
+ const src=(D.sources||[]).map(s=>{const u=safeUrl(s.url);return `<li>${u?`<a href="${u}" target="_blank" rel="noopener noreferrer">${esc(s.name||s.url)}</a>`:`<span>${esc(s.name||'未命名来源')}</span> <span class="chip" style="color:var(--red);border-color:var(--chip-bd-red)">链接已拦截</span>`} <span class="note">${esc(s.use||'')}</span></li>`;}).join('');
  return `<div class="card t1">
-  <div class="dh"><h2 class="t">AI半导体<span class="t-en">AI-SemiQuant</span></h2><span class="nm">${D.subtitle||'AI 半导体全产业链量化评分'} · ${D.marketDataAsOf||'结构数据'}</span></div>
-  <div class="note" style="line-height:1.7;margin-bottom:10px"><b>核心用法：</b>先看产业链瓶颈和结构分，再用趋势/风险闸门决定是否进入尽调队列。${D.disclaimer||'研究框架，非投资建议。'}</div>
- <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('')}</div>
+  <div class="dh"><h2 class="t">AI半导体<span class="t-en">AI-SemiQuant</span></h2><span class="nm">${esc(D.subtitle||'AI 半导体全产业链量化评分')} · ${esc(D.marketDataAsOf||'结构数据')}</span></div>
+  <div class="note" style="line-height:1.7;margin-bottom:10px"><b>核心用法：</b>先看产业链瓶颈和结构分，再用趋势/风险闸门决定是否进入尽调队列。${esc(D.disclaimer||'研究框架，非投资建议。')}</div>
+ <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${esc(x[0])}</div><div class="v">${esc(x[1])}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${esc(x[2])}</div></div>`).join('')}</div>
   <div style="margin-top:12px"><span class="cap">当前最高分</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${top}</div></div>
   <div style="margin-top:12px"><span class="cap">Strategic Rank</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${rankChips(sum.strategicLeaders,'strategic')}</div></div>
   <div style="margin-top:12px"><span class="cap">Raw Tactical Rank</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${rankChips(sum.tacticalLeadersRaw,'tactical')}</div></div>
@@ -4360,14 +5541,14 @@ function aiSemiQuantCard(){
  ${foldCard('因子权重与节点均分','结构评分口径',`<div class="scroll"><table><thead><tr><th class="l">因子</th><th>权重</th><th class="l">含义</th></tr></thead><tbody>${fRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">节点</th><th>公司数</th><th>均分</th><th class="l">代表</th></tr></thead><tbody>${nRows}</tbody></table></div>`,0,'5 因子')}
  ${foldCard('Raw vs Investable Tactical','战术强弱不等于可加仓',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">Raw Tactical</th><th>分</th><th>Gate</th><th class="l">Investable Tactical</th><th>分</th><th>Gate</th></tr></thead><tbody>${tacticalRows}</tbody></table></div><div class="note" style="margin-top:8px">Raw tactical 可以包含 BLOCK / DATA_REVIEW；Investable tactical 排除 hard BLOCK、PORTFOLIO_BLOCK 和 DATA_REVIEW，避免把“信号强”误读成“可以加”。</div>`,0,'v0.3.1')}
  ${foldCard('风险拆分 Risk Breakdown','不是“公司好坏”，而是风险类型叠加',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>风险分</th><th>技术拥挤</th><th>周期</th><th>估值/体量</th><th>地缘</th><th>组合集中</th></tr></thead><tbody>${riskRows}</tbody></table></div>`,0,'top 12')}
- ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flagRows}</tbody></table></div>`,0,`v${model.modelVersion||'—'}`)}
+ ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flagRows}</tbody></table></div>`,0,esc(`v${model.modelVersion||'—'}`))}
  ${foldCard('来源与边界','当前事实需要随财报 / 产业数据更新',`<ul style="margin:0;padding-left:18px;line-height:1.8">${src}</ul><div class="note" style="margin-top:10px">结构因子来自本次目标文件和参考研究的人工先验；价格和趋势来自 Yahoo Finance（如果可用）。请在财报、法说会、TrendForce/SEMI/Counterpoint 数据更新后重跑并复核。<b>非投资建议。</b></div>`,0,(D.sources||[]).length+' sources')}`;
 }
 function aicsTone(g){return aiqTone(g);}
 function aicsScoreColor(v){return v>=86?'#4FB286':(v>=76?'#E8B339':(v>=66?'#B89030':'#E5707A'));}
-function aicsGateChip(g){const c=aicsTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${g||'—'}</span>`;}
+function aicsGateChip(g){const c=aicsTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${esc(g||'—')}</span>`;}
 function aicsCap(v){if(v==null)return'—';v=Number(v);if(!isFinite(v))return'—';if(v>=1e12)return'$'+(v/1e12).toFixed(2)+'T';if(v>=1e9)return'$'+(v/1e9).toFixed(1)+'B';if(v>=1e6)return'$'+(v/1e6).toFixed(0)+'M';return'$'+Math.round(v).toLocaleString('en-US');}
-function aicsReason(r){const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return x.length>110?x.slice(0,107)+'...':x;}
+function aicsReason(r){const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return esc(x.length>110?x.slice(0,107)+'...':x);}
 function aicsMapSvg(D){
  const rows=(D.scores||[]).slice(0,26),edges=(D.relationshipEdges||[]).slice(0,34),W=940,H=430;
  if(!rows.length)return'<div class="note">暂无 AICS 图谱数据。</div>';
@@ -4393,11 +5574,11 @@ function aicsMapSvg(D){
  let el=`<rect x="16" y="18" width="${W-32}" height="${H-36}" rx="8" fill="${C.bg2}" stroke="${C.line}"/>`;
  Object.keys(laneX).forEach(k=>{const x=laneX[k];el+=`<line x1="${x}" y1="52" x2="${x}" y2="${H-48}" stroke="${C.hair}"/><text x="${x}" y="38" fill="${C.mut}" font-size="10" text-anchor="middle">${laneName[k]}</text>`;});
  edges.forEach(e=>{const a=pos[e.sourceCompanyId],b=pos[e.targetCompanyId];if(!a||!b)return;const w=1+Math.max(0,Math.min(100,e.edgeWeight||0))/28,op=.18+Math.max(0,Math.min(100,e.sourceConfidence||50))/170;
-   el+=`<path d="M ${a.x+16} ${a.y} C ${(a.x+b.x)/2} ${a.y}, ${(a.x+b.x)/2} ${b.y}, ${b.x-16} ${b.y}" fill="none" stroke="${C.accent}" stroke-width="${w.toFixed(1)}" stroke-opacity="${op.toFixed(2)}"><title>${e.sourceName} → ${e.targetName} · ${e.relationshipType} · 权重 ${e.edgeWeight}</title></path>`;});
+   el+=`<path d="M ${a.x+16} ${a.y} C ${(a.x+b.x)/2} ${a.y}, ${(a.x+b.x)/2} ${b.y}, ${b.x-16} ${b.y}" fill="none" stroke="${C.accent}" stroke-width="${w.toFixed(1)}" stroke-opacity="${op.toFixed(2)}"><title>${esc(e.sourceName)} → ${esc(e.targetName)} · ${esc(e.relationshipType)} · 权重 ${e.edgeWeight}</title></path>`;});
  Object.keys(pos).forEach(id=>{const n=pos[id],r=n.r,score=n.score||50,rad=n.external?14:Math.max(8,Math.min(18,8+(score-55)/5)),fill=n.external?C.panel:aicsScoreColor(score),stroke=r?(r.riskScore<45?C.red:(r.riskScore>65?C.green:C.line)):C.line;
    const op=n.external ? .18 : .88;
-   const click=r?` onclick="aicsSelect('${r.companyId}')" style="cursor:pointer"`:'';el+=`<g${click}><circle cx="${n.x}" cy="${n.y}" r="${rad}" fill="${fill}" fill-opacity="${op}" stroke="${stroke}" stroke-width="${r?2:1}"><title>${n.label}${r?' · score '+r.finalInvestmentScore+' · '+r.gate:''}</title></circle><text x="${n.x}" y="${n.y+rad+13}" fill="${r?C.mut2:C.mut}" font-size="10" text-anchor="middle">${n.label}</text></g>`;});
- return `<div class="chartbox"><svg id="aics-map" role="img" aria-label="AICS industry map with weighted supply-chain edges" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg></div>`;
+   const click=r?` role="button" tabindex="0" data-aics-id="${esc(r.companyId)}" aria-label="${esc(n.label)} AICS ${r.finalInvestmentScore} · ${esc(r.gate)}" onclick="aicsSelect(this.dataset.aicsId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();aicsSelect(this.dataset.aicsId);}" style="cursor:pointer"`:' aria-hidden="true"';el+=`<g${click}><circle cx="${n.x}" cy="${n.y}" r="${rad}" fill="${fill}" fill-opacity="${op}" stroke="${stroke}" stroke-width="${r?2:1}"><title>${esc(n.label)}${r?' · score '+r.finalInvestmentScore+' · '+esc(r.gate):''}</title></circle><text x="${n.x}" y="${n.y+rad+13}" fill="${r?C.mut2:C.mut}" font-size="10" text-anchor="middle">${esc(n.label)}</text></g>`;});
+ return `<div class="chartbox"><svg id="aics-map" role="group" aria-label="AICS industry map with weighted supply-chain edges; company nodes are keyboard selectable" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg></div>`;
 }
 function aicsCompanyHtml(r){
  if(!r)return'<div class="note">暂无公司数据。</div>';
@@ -4409,23 +5590,23 @@ function aicsCompanyHtml(r){
   ['Bottleneck',r.bottleneckPowerScore],['Growth',r.growthRealizationScore],['Profit Quality',r.profitQualityScore],
   ['Industrial Flow',r.industrialCapitalFlowScore],['Financial Flow',r.financialCapitalFlowScore],['Valuation',r.valuationScore],['Momentum',r.momentumScore],['Risk',r.riskScore]
  ].map(x=>`<tr><td class="l">${x[0]}</td><td style="color:${aicsScoreColor(x[1])}">${x[1]??'—'}</td></tr>`).join('');
- const edges=[...edgeIn.map(e=>`<tr><td class="l">${e.sourceName} → ${e.targetName}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td></tr>`),...edgeOut.map(e=>`<tr><td class="l">${e.sourceName} → ${e.targetName}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td></tr>`)].join('');
- const reasons=(r.gateReasons||[]).map(x=>`<li><b>${x.rule||'reason'}:</b> ${x.detail||''}</li>`).join('');
- return `<div class="dh"><h2 class="t">${r.ticker}<span class="t-en">${r.name||''}</span></h2><span class="nm">${r.valueChainRole||''} · ${r.peerGroup||''}</span></div>
+ const edges=[...edgeIn.map(e=>`<tr><td class="l">${esc(e.sourceName)} → ${esc(e.targetName)}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td></tr>`),...edgeOut.map(e=>`<tr><td class="l">${esc(e.sourceName)} → ${esc(e.targetName)}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td></tr>`)].join('');
+ const reasons=(r.gateReasons||[]).map(x=>`<li><b>${esc(x.rule||'reason')}:</b> ${esc(x.detail||'')}</li>`).join('');
+ return `<div class="dh"><h2 class="t">${esc(r.ticker)}<span class="t-en">${esc(r.name||'')}</span></h2><span class="nm">${esc(r.valueChainRole||'')} · ${esc(r.peerGroup||'')}</span></div>
   <div class="badges">
    <div class="badge"><div class="l">Final</div><div class="v" style="color:${aicsScoreColor(r.finalInvestmentScore)}">${r.finalInvestmentScore}</div></div>
    <div class="badge"><div class="l">Gate</div><div class="v">${aicsGateChip(r.gate)}</div></div>
    <div class="badge"><div class="l">Quality Rank</div><div class="v">#${r.companyQualityRank}</div></div>
    <div class="badge"><div class="l">Stock Rank</div><div class="v">#${r.stockAttractivenessRank}</div></div>
-   <div class="badge"><div class="l">Price</div><div class="v">${m.displayPrice||'—'}</div></div>
+   <div class="badge"><div class="l">Price</div><div class="v">${esc(m.displayPrice||'—')}</div></div>
    <div class="badge"><div class="l">Portfolio</div><div class="v">${p.weightPct?p.weightPct.toFixed(2)+'%':'—'}</div></div>
   </div>
-  <div class="note" style="line-height:1.7"><b>Thesis:</b> ${r.thesis||'—'}</div>
+  <div class="note" style="line-height:1.7"><b>Thesis:</b> ${esc(r.thesis||'—')}</div>
   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Score</th><th>Value</th></tr></thead><tbody>${subs}</tbody></table></div>
   <div class="note" style="margin-top:10px"><b>Gate reasons</b></div><ul style="margin:6px 0 0;padding-left:18px;color:var(--mut);font-size:var(--t-sm);line-height:1.7">${reasons||'<li>No gate reason recorded.</li>'}</ul>
-  <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Risk</th><th>Level</th></tr></thead><tbody>${Object.keys(risks).map(k=>`<tr><td class="l">${k}</td><td>${risks[k]}</td></tr>`).join('')}</tbody></table></div>
+  <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Risk</th><th>Level</th></tr></thead><tbody>${Object.keys(risks).map(k=>`<tr><td class="l">${esc(k)}</td><td>${esc(risks[k])}</td></tr>`).join('')}</tbody></table></div>
   <div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Relationship edge</th><th>Weight</th><th>Conf.</th></tr></thead><tbody>${edges||'<tr><td class="l">No direct edge in MVP graph.</td><td>—</td><td>—</td></tr>'}</tbody></table></div>
-  <div class="note" style="margin-top:10px">3M attribution proxy: total ${attr.totalReturn==null?'—':pct(attr.totalReturn)} · earnings ${attr.earningsRevisionContribution==null?'—':pct(attr.earningsRevisionContribution)} · multiple ${attr.valuationMultipleContribution==null?'—':pct(attr.valuationMultipleContribution)} · flow ${attr.capitalFlowMomentumContribution==null?'—':pct(attr.capitalFlowMomentumContribution)}. ${attr.method||''}</div>`;
+  <div class="note" style="margin-top:10px">3M attribution proxy: total ${attr.totalReturn==null?'—':pct(attr.totalReturn)} · earnings ${attr.earningsRevisionContribution==null?'—':pct(attr.earningsRevisionContribution)} · multiple ${attr.valuationMultipleContribution==null?'—':pct(attr.valuationMultipleContribution)} · flow ${attr.capitalFlowMomentumContribution==null?'—':pct(attr.capitalFlowMomentumContribution)}. ${esc(attr.method||'')}</div>`;
 }
 function aicsSelect(id){
 	 const D=DATA.aics||{},r=(D.scores||[]).find(x=>x.companyId===id||x.ticker===id);
@@ -4448,13 +5629,13 @@ function aicsScoreboardSortRows(rows,key){
  return ranked;
 }
 function aicsScoreboardRowsHtml(rows){
- return rows.map((r,i)=>`<tr style="cursor:pointer" tabindex="0" role="button" onclick="aicsSelect('${r.companyId}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();aicsSelect('${r.companyId}');}">
-  <td>${i+1}</td><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td><td class="l">${r.valueChainRole}<br><span class="note">${r.peerGroup}</span></td><td>${aicsGateChip(r.gate)}</td>
+ return rows.map((r,i)=>`<tr style="cursor:pointer" tabindex="0" data-aics-id="${esc(r.companyId)}" onclick="aicsSelect(this.dataset.aicsId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();aicsSelect(this.dataset.aicsId);}">
+  <td>${i+1}</td><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td><td class="l">${esc(r.valueChainRole)}<br><span class="note">${esc(r.peerGroup)}</span></td><td>${aicsGateChip(r.gate)}</td>
   <td style="color:${aicsScoreColor(r.finalInvestmentScore)}">${r.finalInvestmentScore}</td><td>${r.bottleneckPowerScore}</td><td>${r.growthRealizationScore}</td><td>${r.profitQualityScore}</td><td>${r.industrialCapitalFlowScore}</td><td>${r.financialCapitalFlowScore}</td><td>${r.valuationScore}</td><td>${r.momentumScore}</td><td>${r.riskScore}</td><td>${r.scoreChange1W==null?'—':(r.scoreChange1W>=0?'+':'')+r.scoreChange1W}</td><td>${r.scoreChange1M==null?'—':(r.scoreChange1M>=0?'+':'')+r.scoreChange1M}</td><td>${(r.portfolio||{}).weightPct?((r.portfolio||{}).weightPct.toFixed(2)+'%'):'—'}</td><td class="l"><span class="note">${aicsReason(r)||'—'}</span></td>
  </tr>`).join('');
 }
 function aicsScoreboardCardsHtml(rows){
- return rows.slice(0,14).map(r=>`<div class="smc" onclick="aicsSelect('${r.companyId}')"><div class="smc-top"><b class="smc-sym">${r.ticker}</b><span class="smc-state" style="color:${aicsScoreColor(r.finalInvestmentScore)}">AICS ${r.finalInvestmentScore}</span><span class="smc-pnl" style="color:${aicsTone(r.gate)}">${r.gate}</span></div><div class="smc-mid">${r.valueChainRole} · bottleneck ${r.bottleneckPowerScore} · flow ${r.industrialCapitalFlowScore}/${r.financialCapitalFlowScore} · risk ${r.riskScore}</div><div class="smc-bias">${aicsReason(r)}</div></div>`).join('');
+ return rows.map(r=>`<div class="smc" role="button" tabindex="0" data-aics-id="${esc(r.companyId)}" onclick="aicsSelect(this.dataset.aicsId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();aicsSelect(this.dataset.aicsId);}"><div class="smc-top"><b class="smc-sym">${esc(r.ticker)}</b><span class="smc-state" style="color:${aicsScoreColor(r.finalInvestmentScore)}">AICS ${r.finalInvestmentScore}</span><span class="smc-pnl" style="color:${aicsTone(r.gate)}">${esc(r.gate)}</span></div><div class="smc-mid">${esc(r.valueChainRole)} · bottleneck ${r.bottleneckPowerScore} · flow ${r.industrialCapitalFlowScore}/${r.financialCapitalFlowScore} · risk ${r.riskScore}</div><div class="smc-bias">${aicsReason(r)}</div></div>`).join('');
 }
 function aicsScoreboardRender(){
  const D=DATA.aics||{},sel=document.getElementById('aics-score-sort'),key=sel?sel.value:'final',rows=aicsScoreboardSortRows(D.scores||[],key);
@@ -4504,9 +5685,9 @@ function aicsScenarioCompute(assumptions){
 function aicsScenarioRunHtml(run){
  const p=(run||{}).portfolioImpact||{},rows=(run||{}).rows||[],w=(run||{}).winners||[],l=(run||{}).losers||[];
  const badges=[['PF score',aicsSigned(p.scoreDelta,2),'current-weighted delta'],['PF revenue',pct(p.revenueImpactPct),'directional impact'],['PF EPS',pct(p.epsImpactPct),'directional impact'],['PF valuation',pct(p.valuationImpactPct),'multiple sensitivity']].map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('');
- const mini=(arr)=>arr.slice(0,5).map(x=>`<span class="chip" style="color:${x.scoreDelta>=0?C.green:C.red};border-color:${x.scoreDelta>=0?'var(--chip-bd-green)':'var(--chip-bd-red)'}">${x.ticker} ${aicsSigned(x.scoreDelta)} → ${x.scenarioScore}</span>`).join(' ');
- const detail=rows.slice().sort((a,b)=>Math.abs(b.scoreDelta)-Math.abs(a.scoreDelta)||a.ticker.localeCompare(b.ticker)).slice(0,12).map(r=>`<tr><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name||''}</span></td><td>${r.baseScore}</td><td style="color:${aicsScoreColor(r.scenarioScore)}">${r.scenarioScore}</td><td>${aicsSigned(r.scoreDelta)}</td><td>${pct(r.revenueImpactPct)}</td><td>${ppf(r.marginImpactPct)}</td><td>${pct(r.epsImpactPct)}</td><td>${pct(r.valuationImpactPct)}</td><td>${aicsGateChip(r.newGate)}</td></tr>`).join('');
- const held=(p.heldRows||[]).map(r=>`<tr><td class="l">${r.ticker}</td><td>${r.weightPct.toFixed(2)}%</td><td>${aicsSigned(r.scoreDelta)}</td><td>${aicsGateChip(r.newGate)}</td></tr>`).join('')||'<tr><td class="l">No matched AICS holdings</td><td>—</td><td>—</td><td>—</td></tr>';
+ const mini=(arr)=>arr.slice(0,5).map(x=>`<span class="chip" style="color:${x.scoreDelta>=0?C.green:C.red};border-color:${x.scoreDelta>=0?'var(--chip-bd-green)':'var(--chip-bd-red)'}">${esc(x.ticker)} ${aicsSigned(x.scoreDelta)} → ${x.scenarioScore}</span>`).join(' ');
+ const detail=rows.slice().sort((a,b)=>Math.abs(b.scoreDelta)-Math.abs(a.scoreDelta)||a.ticker.localeCompare(b.ticker)).slice(0,12).map(r=>`<tr><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name||'')}</span></td><td>${r.baseScore}</td><td style="color:${aicsScoreColor(r.scenarioScore)}">${r.scenarioScore}</td><td>${aicsSigned(r.scoreDelta)}</td><td>${pct(r.revenueImpactPct)}</td><td>${ppf(r.marginImpactPct)}</td><td>${pct(r.epsImpactPct)}</td><td>${pct(r.valuationImpactPct)}</td><td>${aicsGateChip(r.newGate)}</td></tr>`).join('');
+ const held=(p.heldRows||[]).map(r=>`<tr><td class="l">${esc(r.ticker)}</td><td>${r.weightPct.toFixed(2)}%</td><td>${aicsSigned(r.scoreDelta)}</td><td>${aicsGateChip(r.newGate)}</td></tr>`).join('')||'<tr><td class="l">No matched AICS holdings</td><td>—</td><td>—</td><td>—</td></tr>';
  return `<div class="badges">${badges}</div><div style="margin-top:10px"><span class="cap">Winners</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${mini(w)||'<span class="note">—</span>'}</div></div><div style="margin-top:10px"><span class="cap">Losers</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${mini(l)||'<span class="note">—</span>'}</div></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Company</th><th>Base</th><th>Scenario</th><th>Score Δ</th><th>Revenue</th><th>Margin</th><th>EPS</th><th>Valuation</th><th>New gate</th></tr></thead><tbody>${detail}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Held ticker</th><th>Weight</th><th>Score Δ</th><th>New gate</th></tr></thead><tbody>${held}</tbody></table></div>`;
 }
 function aicsScenarioApplyPreset(id){
@@ -4526,57 +5707,68 @@ function aicsScenarioRender(){
 function aicsScenarioControlHtml(){
  const M=aicsScenarioModel(),controls=M.controls||[];
  if(!controls.length)return'<div id="aics-scenario" class="note">Scenario model unavailable. Regenerate AICS data to enable controls.</div>';
- const controlsHtml=controls.map(c=>{const opts=(c.options||[]).map(o=>`<option value="${o.id}" ${(M.defaultAssumptions||{})[c.key]===o.id?'selected':''}>${o.label}</option>`).join('');return `<label class="badge" style="min-width:180px;display:block"><span class="l">${c.label}</span><select data-aics-scen="${c.key}" onchange="aicsScenarioRender()" style="width:100%;margin-top:6px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:600 12px/1.2 var(--f-ui)">${opts}</select></label>`;}).join('');
- const presets=((DATA.aics||{}).scenarioResults||[]).map(s=>`<button class="chip" type="button" onclick="aicsScenarioApplyPreset('${s.id}')" style="background:transparent;cursor:pointer;color:var(--mut);border-color:var(--line)">${s.name}</button>`).join('');
+ const controlsHtml=controls.map(c=>{const opts=(c.options||[]).map(o=>`<option value="${esc(o.id)}" ${(M.defaultAssumptions||{})[c.key]===o.id?'selected':''}>${esc(o.label)}</option>`).join('');return `<label class="badge" style="min-width:180px;display:block"><span class="l">${esc(c.label)}</span><select data-aics-scen="${esc(c.key)}" onchange="aicsScenarioRender()" style="width:100%;margin-top:6px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:600 12px/1.2 var(--f-ui)">${opts}</select></label>`;}).join('');
+ const presets=((DATA.aics||{}).scenarioResults||[]).map(s=>`<button class="chip" type="button" data-aics-preset="${esc(s.id)}" onclick="aicsScenarioApplyPreset(this.dataset.aicsPreset)" style="background:transparent;cursor:pointer;color:var(--mut);border-color:var(--line)">${esc(s.name)}</button>`).join('');
  return `<div id="aics-scenario"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">${presets}<button class="chip" type="button" onclick="aicsScenarioReset()" style="background:transparent;cursor:pointer;color:var(--mut);border-color:var(--line)">Reset</button></div><div class="badges">${controlsHtml}</div><div id="aics-scenario-live" style="margin-top:10px">${aicsScenarioRunHtml(M.defaultRun||aicsScenarioCompute(M.defaultAssumptions||{}))}</div><div class="note" style="margin-top:8px">情景是敏感度模型：假设冲击 × 公司系数，输出为方向性 revenue / margin / EPS / score / valuation proxy，不是盈利预测或下单信号。</div></div>`;
+}
+function aicsJump(id){
+ const target=document.getElementById(id);if(!target)return;
+ const details=target.closest&&target.closest('details');if(details)details.open=true;
+ requestAnimationFrame(()=>{target.setAttribute('tabindex','-1');target.focus({preventScroll:true});target.scrollIntoView({block:'start',behavior:PRM?'auto':'smooth'});});
 }
 function aicsToolTab(){
  const D=DATA.aics;
  if(!D||!Array.isArray(D.scores)||!D.scores.length){
   return `<div class="card t1"><div class="dh"><h2 class="t">AICS产业链<span class="t-en">AICS</span></h2><span class="nm">AI Semiconductor Capital Flow & Scoring System</span></div><div class="note" style="line-height:1.8">暂无 AICS 数据。<br>生成方式：运行 <b>python3 scripts/aics_tool.py</b> 写入 <b>output/aics.json</b> 和 <b>output/aics_report.md</b>，再跑 <b>python3 generate.py --no-fetch</b>。<b>研究框架，非投资建议。</b></div></div>`;
  }
- const rows=D.scores||[],overlay=D.portfolioOverlay||{},model=D.modelCard||{},alerts=D.alerts||[],top=rows.slice(0,5);
+ const rows=D.scores||[],overlay=D.portfolioOverlay||{},model=D.modelCard||{},alerts=D.alerts||[],top=rows.slice(0,5),back0=D.backtest||{},hist0=back0.historyValidation||{};
  const families=rows.reduce((a,r)=>{a[r.gateFamily||'OTHER']=(a[r.gateFamily||'OTHER']||0)+1;return a;},{});
- const chip=x=>`<span class="chip" style="color:${aicsScoreColor(x.finalInvestmentScore)};border-color:${chipBd(aicsScoreColor(x.finalInvestmentScore))}">${x.ticker} ${x.finalInvestmentScore} · ${x.gate}</span>`;
+ const chip=x=>`<span class="chip" style="color:${aicsScoreColor(x.finalInvestmentScore)};border-color:${chipBd(aicsScoreColor(x.finalInvestmentScore))}">${esc(x.ticker)} ${x.finalInvestmentScore} · ${esc(x.gate)}</span>`;
  const dVal=x=>x.scoreChange1W!=null?x.scoreChange1W:(x.scoreChange1M!=null?x.scoreChange1M:x.scoreChange1Run);
  const dLbl=x=>x.scoreChange1W!=null?'1W':(x.scoreChange1M!=null?'1M':'run');
- const deltaTop=(D.scoreDeltas||[]).filter(x=>dVal(x)!=null).sort((a,b)=>(dVal(b)||0)-(dVal(a)||0)).slice(0,4).map(x=>{const v=dVal(x),c=v>=0?C.green:C.red;return `<span class="chip" style="color:${c};border-color:${v>=0?'var(--chip-bd-green)':'var(--chip-bd-red)'}">${x.ticker} ${dLbl(x)} ${v>=0?'+':''}${v}</span>`;}).join('')||'<span class="note">no history window</span>';
+ const deltaTop=(D.scoreDeltas||[]).filter(x=>dVal(x)!=null).sort((a,b)=>(dVal(b)||0)-(dVal(a)||0)).slice(0,4).map(x=>{const v=dVal(x),c=v>=0?C.green:C.red;return `<span class="chip" style="color:${c};border-color:${v>=0?'var(--chip-bd-green)':'var(--chip-bd-red)'}">${esc(x.ticker)} ${dLbl(x)} ${v>=0?'+':''}${v}</span>`;}).join('')||'<span class="note">no history window</span>';
  const cockpit=[
   ['Model Date',D.marketDataAsOf||'structure-only','market data as of'],
   ['Gate Families',`${families.ALLOW||0} / ${families.WATCH||0} / ${families.BLOCK||0} / ${families.DATA_REVIEW||0}`,'ALLOW / WATCH / BLOCK / REVIEW'],
   ['Portfolio AICS',`${overlay.totalAicsWeightPct??0}%`,overlay.concentrationWarning?'concentration warning':'current overlap'],
   ['Graph Edges',(D.relationshipEdges||[]).length,'weighted supply-chain links'],
   ['Alerts',alerts.length,'score, risk, data-quality flags'],
- ].map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('');
+  ['History Validation',hist0.status||'not available',`${hist0.snapshotCount||0} snapshots · ${hist0.evaluatedPairs||0} pairs · ${hist0.historySpanDays||0} days`],
+  ['Decision Grade',D.decisionGrade===true?'YES':(D.decisionGrade===false?'NO':'not declared'),D.decisionGrade===false?(D.decisionGradeReason||'not decision grade'):'still not a trade instruction'],
+ ].map(x=>`<div class="badge"><div class="l">${esc(x[0])}</div><div class="v">${esc(x[1])}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${esc(x[2])}</div></div>`).join('');
+ const histNotice=hist0.status==='insufficient_history'?`<div role="status" class="note" style="margin:10px 0;padding:9px 11px;border-left:3px solid var(--accent);background:rgba(232,179,57,.07);line-height:1.65"><b>历史验证不足：${hist0.snapshotCount||0} 个快照 · ${hist0.evaluatedPairs||0} 个可评估区间 · ${hist0.historySpanDays||0} 天。</b> CAGR、回撤、Sharpe、Sortino 和命中率必须保持空值；当前静态横截面结果不构成样本外验证。</div>`:'';
+ const gradeNotice=D.decisionGrade===false?`<div role="alert" class="note" style="margin:10px 0;padding:9px 11px;border-left:3px solid var(--red);background:rgba(229,112,122,.07);line-height:1.65"><b>AICS 尚未达决策级。</b>${esc(D.decisionGradeReason||'当前只能用于研究队列和证据审计，不能当作买卖信号。')}</div>`:'';
 	 const sortedRows=aicsScoreboardSortRows(rows,'final');
 	 const tableRows=aicsScoreboardRowsHtml(sortedRows);
 	 const mobile=aicsScoreboardCardsHtml(sortedRows);
- const flowRows=(D.capitalFlow&&D.capitalFlow.industrial||[]).map(x=>`<tr><td class="l">${x.role}</td><td>${x.count}</td><td>${x.avgIndustrialFlow}</td><td>${x.avgFinancialFlow}</td><td class="l">${(x.leaders||[]).join(', ')}</td></tr>`).join('');
- const edgeRows=(D.relationshipEdges||[]).slice(0,18).map(e=>`<tr><td class="l">${e.sourceName} → ${e.targetName}</td><td class="l">${e.relationshipType}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td><td>${e.technicalDependency}</td><td>${e.capacityTightness}</td></tr>`).join('');
- const attrSum=D.returnAttributionSummary||{},attrAvg=attrSum.averageContribution||{};
+ const flowRows=(D.capitalFlow&&D.capitalFlow.industrial||[]).map(x=>`<tr><td class="l">${esc(x.role)}</td><td>${x.count}</td><td>${x.avgIndustrialFlow}</td><td>${x.avgFinancialFlow}</td><td class="l">${(x.leaders||[]).map(esc).join(', ')}</td></tr>`).join('');
+ const edgeRows=(D.relationshipEdges||[]).slice(0,18).map(e=>`<tr><td class="l">${esc(e.sourceName)} → ${esc(e.targetName)}</td><td class="l">${esc(e.relationshipType)}</td><td>${e.edgeWeight}</td><td>${e.sourceConfidence}%</td><td>${e.technicalDependency}</td><td>${e.capacityTightness}</td></tr>`).join('');
+ const attrSumRaw=D.returnAttributionSummary||{},attrSum=Object.assign({},attrSumRaw,{method:esc(attrSumRaw.method||'')}),attrAvg=attrSum.averageContribution||{};
  const attrBadge=[['Earnings',attrAvg.earningsRevisionContribution],['Multiple',attrAvg.valuationMultipleContribution],['Flow/Mom',attrAvg.capitalFlowMomentumContribution],['FX/Residual',attrAvg.fxDividendResidualContribution]].map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${pct(x[1])}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">avg ${attrSum.window||'3M'} contribution</div></div>`).join('');
- const attrRow=x=>`<tr><td class="l"><b>${x.ticker}</b><br><span class="note">${x.qualityFlag||'normal'}</span></td><td>${pct(x.totalReturn)}</td><td>${pct(x.earningsRevisionContribution)}</td><td>${pct(x.valuationMultipleContribution)}</td><td>${pct(x.capitalFlowMomentumContribution)}</td><td>${pct(x.fxDividendResidualContribution)}</td></tr>`;
+ const attrRow=x=>`<tr><td class="l"><b>${esc(x.ticker)}</b><br><span class="note">${esc(x.qualityFlag||'normal')}</span></td><td>${pct(x.totalReturn)}</td><td>${pct(x.earningsRevisionContribution)}</td><td>${pct(x.valuationMultipleContribution)}</td><td>${pct(x.capitalFlowMomentumContribution)}</td><td>${pct(x.fxDividendResidualContribution)}</td></tr>`;
  const attrTop=(attrSum.topTotalReturn||[]).slice(0,8).map(attrRow).join('');
  const attrWorst=(attrSum.worstTotalReturn||[]).slice(0,8).map(attrRow).join('');
  const attrResidual=(attrSum.largestResiduals||[]).slice(0,8).map(attrRow).join('');
- const attrLow=(attrSum.lowQualityRallies||[]).slice(0,8).map(x=>`<tr><td class="l">${x.ticker}</td><td>${pct(x.totalReturn)}</td><td>${pct(x.earningsRevisionContribution)}</td><td>${pct(x.valuationMultipleContribution)}</td><td>${pct(x.capitalFlowMomentumContribution)}</td></tr>`).join('')||'<tr><td class="l">None flagged</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>';
- const alertRows=alerts.map(a=>`<tr><td class="l">${a.type||'alert'}${a.subtype?'<br><span class="note">'+a.subtype+'</span>':''}</td><td class="l">${a.severity}</td><td class="l">${a.ticker||'portfolio'}</td><td class="l">${a.title}</td><td class="l"><span class="note">${a.detail}</span>${a.metric?`<br><span class="note">${a.metric}: ${a.value??'—'} / ${a.threshold??'—'}</span>`:''}</td></tr>`).join('')||'<tr><td class="l">clean</td><td class="l">—</td><td class="l">—</td><td class="l">No AICS alerts</td><td class="l"><span class="note">No score, risk, valuation, flow, edge, threshold, concentration, or data-quality alert on this run.</span></td></tr>';
+ const attrLow=(attrSum.lowQualityRallies||[]).slice(0,8).map(x=>`<tr><td class="l">${esc(x.ticker)}</td><td>${pct(x.totalReturn)}</td><td>${pct(x.earningsRevisionContribution)}</td><td>${pct(x.valuationMultipleContribution)}</td><td>${pct(x.capitalFlowMomentumContribution)}</td></tr>`).join('')||'<tr><td class="l">None flagged</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>';
+ const alertRows=alerts.map(a=>`<tr><td class="l">${esc(a.type||'alert')}${a.subtype?'<br><span class="note">'+esc(a.subtype)+'</span>':''}</td><td class="l">${esc(a.severity)}</td><td class="l">${esc(a.ticker||'portfolio')}</td><td class="l">${esc(a.title)}</td><td class="l"><span class="note">${esc(a.detail)}</span>${a.metric?`<br><span class="note">${esc(a.metric)}: ${esc(a.value??'—')} / ${esc(a.threshold??'—')}</span>`:''}</td></tr>`).join('')||'<tr><td class="l">clean</td><td class="l">—</td><td class="l">—</td><td class="l">No AICS alerts</td><td class="l"><span class="note">No score, risk, valuation, flow, edge, threshold, concentration, or data-quality alert on this run.</span></td></tr>';
  const back=D.backtest||{},req=model.requirements||{};
  const bw=(b,k)=>{const x=((b.windows||{})[k]||{}).returnPct;return x==null?'—':pct(x);};
  const be=(b,k)=>{const x=((b.windows||{})[k]||{}).excessVsSOXX;return x==null?'—':ppf(x);};
-	 const backRows=(back.baskets||[]).map(b=>`<tr><td class="l"><b>${b.name}</b><br><span class="note">${(b.members||[]).join(', ')}</span></td><td>${bw(b,'1M')}<br><span class="note">vs SOXX ${be(b,'1M')}</span></td><td>${bw(b,'3M')}<br><span class="note">vs SOXX ${be(b,'3M')}</span></td><td>${bw(b,'6M')}<br><span class="note">vs SOXX ${be(b,'6M')}</span></td><td>${bw(b,'1Y')}<br><span class="note">vs SOXX ${be(b,'1Y')}</span></td></tr>`).join('');
+	 const backRows=(back.baskets||[]).map(b=>`<tr><td class="l"><b>${esc(b.name)}</b><br><span class="note">${(b.members||[]).map(esc).join(', ')}</span></td><td>${bw(b,'1M')}<br><span class="note">vs SOXX ${be(b,'1M')}</span></td><td>${bw(b,'3M')}<br><span class="note">vs SOXX ${be(b,'3M')}</span></td><td>${bw(b,'6M')}<br><span class="note">vs SOXX ${be(b,'6M')}</span></td><td>${bw(b,'1Y')}<br><span class="note">vs SOXX ${be(b,'1Y')}</span></td></tr>`).join('');
 	 const hist=back.historyValidation||{};
-	 const histRows=(hist.baskets||[]).map(b=>`<tr><td class="l"><b>${b.name}</b><br><span class="note">${(b.latestMembers||[]).join(', ')||'no sample'}</span></td><td>${b.rebalanceCount??0}<br><span class="note">${b.observationCount??0} obs</span></td><td>${pct(b.avgNetReturnPct??b.avgReturnPct)}<br><span class="note">gross ${pct(b.avgGrossReturnPct)} · cost ${ppf(b.avgTransactionCostPct)}</span></td><td>${ppf(b.avgExcessVsUniversePct)}<br><span class="note">SOXX ${ppf(b.avgExcessVsSOXXPct)} · SMH ${ppf(b.avgExcessVsSMHPct)}</span></td><td>${pct(b.cagrPct)}<br><span class="note">DD ${pct(b.maxDrawdownPct)}</span></td><td>${b.sharpe??'—'} / ${b.sortino??'—'}<br><span class="note">hit ${b.hitRatePct==null?'—':b.hitRatePct.toFixed(1)+'%'} · turn ${b.turnoverPct==null?'—':b.turnoverPct.toFixed(1)+'%'}</span></td></tr>`).join('');
+	 const histRows=(hist.baskets||[]).map(b=>`<tr><td class="l"><b>${esc(b.name)}</b><br><span class="note">${(b.latestMembers||[]).map(esc).join(', ')||'no sample'}</span></td><td>${b.rebalanceCount??0}<br><span class="note">${b.observationCount??0} obs</span></td><td>${pct(b.avgNetReturnPct??b.avgReturnPct)}<br><span class="note">gross ${pct(b.avgGrossReturnPct)} · cost ${ppf(b.avgTransactionCostPct)}</span></td><td>${ppf(b.avgExcessVsUniversePct)}<br><span class="note">SOXX ${ppf(b.avgExcessVsSOXXPct)} · SMH ${ppf(b.avgExcessVsSMHPct)}</span></td><td>${pct(b.cagrPct)}<br><span class="note">DD ${pct(b.maxDrawdownPct)}</span></td><td>${b.sharpe??'—'} / ${b.sortino??'—'}<br><span class="note">hit ${b.hitRatePct==null?'—':b.hitRatePct.toFixed(1)+'%'} · turn ${b.turnoverPct==null?'—':b.turnoverPct.toFixed(1)+'%'}</span></td></tr>`).join('');
 	 const cal=hist.calendarValidation||{};
-	 const calRows=['monthly','quarterly'].map(k=>{const x=cal[k]||{},baskets=x.baskets||[],b=baskets.find(row=>(row.rebalanceCount||0)>0)||baskets[0]||{},periods=x.selectedPeriods||[];return `<tr><td class="l"><b>${k[0].toUpperCase()+k.slice(1)}</b><br><span class="note">${periods.slice(-4).join(', ')||'no periods'}</span></td><td>${x.status||'—'}<br><span class="note">${x.snapshotCount??0} snapshots · ${x.evaluatedPairs??0} pairs</span></td><td>${pct(b.avgNetReturnPct??b.avgReturnPct)}<br><span class="note">cost ${ppf(b.avgTransactionCostPct)}</span></td><td>${ppf(b.avgExcessVsUniversePct)}<br><span class="note">SOXX ${ppf(b.avgExcessVsSOXXPct)} · SMH ${ppf(b.avgExcessVsSMHPct)}</span></td><td>${pct(b.cagrPct)}<br><span class="note">DD ${pct(b.maxDrawdownPct)}</span></td></tr>`;}).join('');
-	 const modelRows=[['AICS version',model.aicsModelVersion],['Base version',model.baseAiSemiQuantVersion],['Universe',model.universeSize],['Missing price',model.missingPriceCount],['DATA_REVIEW',model.dataReviewCount],['Edges',model.edgeCount],['All rows have gate reasons',req.allRowsHaveGateReasons],['Edges weighted',req.allEdgesWeighted]].map(r=>`<tr><td class="l">${r[0]}</td><td>${r[1]??'—'}</td></tr>`).join('');
+	 const calRows=['monthly','quarterly'].map(k=>{const x=cal[k]||{},baskets=x.baskets||[],b=baskets.find(row=>(row.rebalanceCount||0)>0)||baskets[0]||{},periods=x.selectedPeriods||[];return `<tr><td class="l"><b>${esc(k[0].toUpperCase()+k.slice(1))}</b><br><span class="note">${esc(periods.slice(-4).join(', ')||'no periods')}</span></td><td>${esc(x.status||'—')}<br><span class="note">${x.snapshotCount??0} snapshots · ${x.evaluatedPairs??0} pairs</span></td><td>${pct(b.avgNetReturnPct??b.avgReturnPct)}<br><span class="note">cost ${ppf(b.avgTransactionCostPct)}</span></td><td>${ppf(b.avgExcessVsUniversePct)}<br><span class="note">SOXX ${ppf(b.avgExcessVsSOXXPct)} · SMH ${ppf(b.avgExcessVsSMHPct)}</span></td><td>${pct(b.cagrPct)}<br><span class="note">DD ${pct(b.maxDrawdownPct)}</span></td></tr>`;}).join('');
+	 const modelRows=[['AICS version',model.aicsModelVersion],['Base version',model.baseAiSemiQuantVersion],['Universe',model.universeSize],['Missing price',model.missingPriceCount],['DATA_REVIEW',model.dataReviewCount],['Edges',model.edgeCount],['All rows have gate reasons',req.allRowsHaveGateReasons],['Edges weighted',req.allEdgesWeighted]].map(r=>`<tr><td class="l">${esc(r[0])}</td><td>${esc(r[1]??'—')}</td></tr>`).join('');
  return `<div class="card t1">
-  <div class="dh"><h2 class="t">AICS产业链<span class="t-en">AICS</span></h2><span class="nm">${D.subtitle||''} · ${D.marketDataAsOf||'structure data'}</span></div>
+  <div class="dh"><h2 class="t">AICS产业链<span class="t-en">AICS</span></h2><span class="nm">${esc(D.subtitle||'')} · ${esc(D.marketDataAsOf||'structure data')}</span></div>
   <div class="note" style="line-height:1.7"><b>用途：</b>把 AI 半导体从故事投资拆成产业链权力、财务兑现、工业资金流、金融资金流、估值、动量和风险。研究框架，非投资建议。</div>
+  ${gradeNotice}
+  ${histNotice}
   <div class="badges">${cockpit}</div>
   <div style="margin-top:12px"><span class="cap">Top AICS</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${top.map(chip).join(' ')}</div></div>
   <div style="margin-top:12px"><span class="cap">Score Deltas</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${deltaTop}</div></div>
-  <div style="margin-top:12px;display:flex;gap:7px;flex-wrap:wrap"><a class="chip" href="#aics-map" style="color:var(--mut);border-color:var(--line)">Map</a><a class="chip" href="#aics-scoreboard" style="color:var(--mut);border-color:var(--line)">Scoreboard</a><a class="chip" href="#aics-flows" style="color:var(--mut);border-color:var(--line)">Flows</a><a class="chip" href="#aics-company-panel" style="color:var(--mut);border-color:var(--line)">Company</a><a class="chip" href="#aics-attribution" style="color:var(--mut);border-color:var(--line)">Attribution</a><a class="chip" href="#aics-scenario" style="color:var(--mut);border-color:var(--line)">Scenario</a><a class="chip" href="#aics-alerts" style="color:var(--mut);border-color:var(--line)">Alerts</a><a class="chip" href="#aics-backtest" style="color:var(--mut);border-color:var(--line)">Backtest</a></div>
+  <div style="margin-top:12px;display:flex;gap:7px;flex-wrap:wrap">${[['aics-map','Map'],['aics-scoreboard','Scoreboard'],['aics-flows','Flows'],['aics-company-panel','Company'],['aics-attribution','Attribution'],['aics-scenario','Scenario'],['aics-alerts','Alerts'],['aics-backtest','Backtest']].map(x=>`<button type="button" class="chip" onclick="aicsJump('${x[0]}')" style="background:transparent;cursor:pointer;color:var(--mut);border-color:var(--line)">${x[1]}</button>`).join('')}</div>
  </div>
  <div class="card"><div class="dh"><h2 class="t">Industry Map<span class="t-en">MAP</span></h2><span class="nm">node score · edge weight · source confidence</span></div>${aicsMapSvg(D)}<div class="note" style="margin-top:8px">节点大小约等于分数强弱，边线粗细为产业链依赖权重。点击公司节点可更新下方 tearsheet。</div></div>
 	 <div class="card" id="aics-scoreboard"><div class="dh"><h2 class="t">Scoreboard<span class="t-en">RANK</span></h2><span class="nm">公司质量和股票吸引力分开看</span></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><label class="note" for="aics-score-sort">Sort</label><select id="aics-score-sort" aria-label="AICS scoreboard sort" onchange="aicsScoreboardRender()" style="background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:600 12px/1.2 var(--f-ui)"><option value="final">Final score</option><option value="delta">1W / latest delta</option><option value="flow">Capital-flow score</option><option value="bottleneck">Bottleneck score</option><option value="risk">Risk score</option><option value="portfolio">Portfolio-adjusted score</option><option value="peer">Peer group</option></select></div><div class="scroll score-tablewrap"><table><thead><tr><th>Rank</th><th class="l">Ticker</th><th class="l">Role</th><th>Gate</th><th>Final</th><th>Bottle</th><th>Growth</th><th>Profit</th><th>Ind Flow</th><th>Mkt Flow</th><th>Value</th><th>Mom</th><th>Risk</th><th>Δ1W</th><th>Δ1M</th><th>PF</th><th class="l">Reason</th></tr></thead><tbody id="aics-scoreboard-body">${tableRows}</tbody></table></div><div id="aics-scoreboard-cards" class="score-cards" aria-label="AICS mobile cards">${mobile}</div></div>
@@ -4585,7 +5777,7 @@ function aicsToolTab(){
  ${foldCard('Return Attribution','3M proxy decomposition and rally quality',`<div id="aics-attribution" class="badges">${attrBadge}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Top return</th><th>Total</th><th>Earnings</th><th>Multiple</th><th>Flow/Mom</th><th>FX/Residual</th></tr></thead><tbody>${attrTop||'<tr><td class="l">No attribution rows</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Worst return</th><th>Total</th><th>Earnings</th><th>Multiple</th><th>Flow/Mom</th><th>FX/Residual</th></tr></thead><tbody>${attrWorst||'<tr><td class="l">No attribution rows</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Largest residual</th><th>Total</th><th>Earnings</th><th>Multiple</th><th>Flow/Mom</th><th>FX/Residual</th></tr></thead><tbody>${attrResidual||'<tr><td class="l">No attribution rows</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Low-quality rally</th><th>Total</th><th>Earnings</th><th>Multiple</th><th>Flow/Mom</th></tr></thead><tbody>${attrLow}</tbody></table></div><div class="note" style="margin-top:8px">${attrSum.method||''}</div>`,0,(attrSum.availableCount??0)+' names')}
  ${foldCard('Scenario Lab','custom assumptions + preset cases',aicsScenarioControlHtml(),0,(D.scenarioModel&&D.scenarioModel.controls||[]).length+' controls')}
  ${foldCard('Alert Center','score / risk / valuation / flow / edge / data',`<div class="scroll" id="aics-alerts"><table><thead><tr><th class="l">Type</th><th class="l">Severity</th><th class="l">Ticker</th><th class="l">Alert</th><th class="l">Detail</th></tr></thead><tbody>${alertRows}</tbody></table></div>`,0,alerts.length+' alerts')}
-	 ${foldCard('Backtest / Model Audit','static baskets + history-backed validation state',`<div id="aics-backtest" class="note" style="line-height:1.7"><b>Static status:</b> ${back.status||'—'} · ${(back.method||back.note||'')}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Static basket</th><th>1M</th><th>3M</th><th>6M</th><th>1Y</th></tr></thead><tbody>${backRows||'<tr><td class="l">No backtest rows</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="note" style="line-height:1.7;margin-top:10px"><b>History validation:</b> ${hist.status||'—'} · ${hist.snapshotCount??0} snapshots · ${hist.evaluatedPairs??0} evaluated pairs · cost ${(hist.rules||{}).transactionCostBps??0} bps. ${hist.method||''}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">History basket</th><th>Rebalances</th><th>Net return</th><th>Excess</th><th>CAGR / drawdown</th><th>Sharpe / Sortino</th></tr></thead><tbody>${histRows||'<tr><td class="l">Need at least two price-bearing AICS history snapshots</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Calendar mode</th><th>Status</th><th>Net return</th><th>Excess</th><th>CAGR / drawdown</th></tr></thead><tbody>${calRows||'<tr><td class="l">Monthly / quarterly</td><td>not enough snapshots</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Model item</th><th>Value</th></tr></thead><tbody>${modelRows}</tbody></table></div><div class="note" style="margin-top:8px">${back.note||''}</div>`,0,model.aicsModelVersion||'v—')}`;
+	 ${foldCard('Backtest / Model Audit','static baskets + history-backed validation state',`<div id="aics-backtest" class="note" style="line-height:1.7"><b>Static status:</b> ${esc(back.status||'—')} · ${esc(back.method||back.note||'')}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Static basket</th><th>1M</th><th>3M</th><th>6M</th><th>1Y</th></tr></thead><tbody>${backRows||'<tr><td class="l">No backtest rows</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="note" style="line-height:1.7;margin-top:10px"><b>History validation:</b> ${esc(hist.status||'—')} · ${hist.snapshotCount??0} snapshots · ${hist.evaluatedPairs??0} evaluated pairs · ${hist.historySpanDays??0} days · cost ${(hist.rules||{}).transactionCostBps??0} bps. ${esc(hist.method||'')}${hist.statisticsNote?'<br><b>Guardrail:</b> '+esc(hist.statisticsNote):''}</div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">History basket</th><th>Rebalances</th><th>Net return</th><th>Excess</th><th>CAGR / drawdown</th><th>Sharpe / Sortino</th></tr></thead><tbody>${histRows||'<tr><td class="l">Need at least two price-bearing AICS history snapshots</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Calendar mode</th><th>Status</th><th>Net return</th><th>Excess</th><th>CAGR / drawdown</th></tr></thead><tbody>${calRows||'<tr><td class="l">Monthly / quarterly</td><td>not enough snapshots</td><td>—</td><td>—</td><td>—</td></tr>'}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Model item</th><th>Value</th></tr></thead><tbody>${modelRows}</tbody></table></div><div class="note" style="margin-top:8px">${esc(back.note||'')}</div>`,0,esc(model.aicsModelVersion||'v—'))}`;
 }
 function aiwTone(g){return {BUILD_MODEL:'#4FB286',DEEP_DIVE:'#72C49B',WATCH_EVIDENCE:'#E8B339',TRACK_CATALYST:'#D6A64A',WATCH_RESET:'#D59C3D',SPECULATIVE:'#B98CE0',ACTION_READY:'#45B47E',ALLOW_REVIEW:'#4FB286',VERIFY_DATA:'#D6A64A',WAIT_RESET:'#D59C3D',WAIT_SETUP:'#E8B339',PORTFOLIO_BLOCK:'#C985E8',BLOCK_DATA:'#E5707A',BLOCK:'#E5707A',DATA_REVIEW:'#6FA8DC'}[g]||'#888D96';}
 function aiwScoreColor(v){return v>=82?'#4FB286':(v>=70?'#E8B339':'#E5707A');}
@@ -4598,14 +5790,14 @@ function aiWatchlistCard(){
  const researchRows=(queues.researchQueue&&queues.researchQueue.length?queues.researchQueue:allRows.filter(r=>!r.dataQuarantined));
  const entryRows=(queues.entryQueue&&queues.entryQueue.length?queues.entryQueue:researchRows.filter(r=>['ACTION_READY','ALLOW_REVIEW'].includes(r.entryGate)));
  const dataRows=(queues.dataReviewQueue&&queues.dataReviewQueue.length?queues.dataReviewQueue:allRows.filter(r=>r.dataQuarantined||r.dataQualitySeverity==='hard_review'));
- const gateChip=g=>`<span class="chip" style="color:${aiwTone(g)};border-color:${chipBd(aiwTone(g))}">${g||'—'}</span>`;
+ const gateChip=g=>`<span class="chip" style="color:${aiwTone(g)};border-color:${chipBd(aiwTone(g))}">${esc(g||'—')}</span>`;
  const capFmt=v=>{if(v==null)return'—';v=Number(v);if(!isFinite(v))return'—';if(v>=1e12)return'$'+(v/1e12).toFixed(2)+'T';if(v>=1e9)return'$'+(v/1e9).toFixed(1)+'B';if(v>=1e6)return'$'+(v/1e6).toFixed(0)+'M';return'$'+Math.round(v).toLocaleString('en-US');};
- const reasonTxt=r=>{const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return x.length>96?x.slice(0,93)+'...':x;};
+ const reasonTxt=r=>{const x=((r.gateReasons||[])[0]||{}).detail||r.gateNote||'';return esc(x.length>96?x.slice(0,93)+'...':x);};
  const scoreVal=v=>v==null?'—':v;
  const dirScore=r=>r.directionRelativeScore==null?'N/A':'D'+r.directionRelativeScore;
- const roleTxt=r=>`${r.clusterRole||'—'} · ${r.directionRankLabel||((r.directionRank||'—')+'/'+(r.directionSize||'—'))}`;
- const top=(sum.researchQueue||sum.leaders||researchRows.slice(0,8)).slice(0,10).map(x=>`<span class="chip" style="color:${aiwScoreColor(x.finalScore)};border-color:${chipBd(aiwScoreColor(x.finalScore))}">${x.ticker} ${x.finalScore} · ${dirScore(x)} · ${x.gate}</span>`).join(' ');
- const workChips=[...(sum.onePageModels||[]).slice(0,5),...(sum.supplyChainVerify||[]).slice(0,5),...(sum.evidenceUpgrade||[]).slice(0,5)].slice(0,12).map(x=>`<span class="chip" style="color:${aiwTone(x.gate)};border-color:${chipBd(aiwTone(x.gate))}">${x.ticker} · ${x.modelWorkstream||x.actionTier||'workstream'}</span>`).join(' ');
+ const roleTxt=r=>esc(`${r.clusterRole||'—'} · ${r.directionRankLabel||((r.directionRank||'—')+'/'+(r.directionSize||'—'))}`);
+ const top=(sum.researchQueue||sum.leaders||researchRows.slice(0,8)).slice(0,10).map(x=>`<span class="chip" style="color:${aiwScoreColor(x.finalScore)};border-color:${chipBd(aiwScoreColor(x.finalScore))}">${esc(x.ticker)} ${x.finalScore} · ${dirScore(x)} · ${esc(x.gate)}</span>`).join(' ');
+ const workChips=[...(sum.onePageModels||[]).slice(0,5),...(sum.supplyChainVerify||[]).slice(0,5),...(sum.evidenceUpgrade||[]).slice(0,5)].slice(0,12).map(x=>`<span class="chip" style="color:${aiwTone(x.gate)};border-color:${chipBd(aiwTone(x.gate))}">${esc(x.ticker)} · ${esc(x.modelWorkstream||x.actionTier||'workstream')}</span>`).join(' ');
  const cards=[
   ['数据日期',D.marketDataAsOf||'—','Yahoo adjusted close when available'],
   ['Research Queue',model.researchQueueCount??researchRows.length,'clean / soft-review names only'],
@@ -4618,53 +5810,80 @@ function aiWatchlistCard(){
  const tableRows=researchRows.slice(0,32).map((r,i)=>{const m=r.market||{},p=r.portfolio||{},c=aiwScoreColor(r.finalScore),cr=r.crowdingRisk||{};
   return `<tr>
    <td>${r.researchQueueRank||i+1}</td>
-   <td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td>
-   <td class="l">${r.actionTier||r.priorityTier||'—'}<br><span class="note">${r.modelWorkstream||'—'}</span></td>
-   <td class="l">${r.direction||r.bucket}<br><span class="note">${roleTxt(r)} · ${r.oldLabel||''}</span></td>
+   <td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td>
+   <td class="l">${esc(r.actionTier||r.priorityTier||'—')}<br><span class="note">${esc(r.modelWorkstream||'—')}</span></td>
+   <td class="l">${esc(r.direction||r.bucket)}<br><span class="note">${roleTxt(r)} · ${esc(r.oldLabel||'')}</span></td>
    <td>${gateChip(r.gate)}</td>
    <td>${gateChip(r.entryGate)}</td>
-   <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore}</span><br><span class="note">P${r.universePercentile??'—'} · ${r.scoreBand||''}</span></td>
-   <td>${dirScore(r)}<br><span class="note">${r.directionRankLabel||'—'}</span></td>
+   <td><span style="font-family:var(--f-mono);font-size:15px;color:${c}">${r.finalScore}</span><br><span class="note">P${r.universePercentile??'—'} · ${esc(r.scoreBand||'')}</span></td>
+   <td>${dirScore(r)}<br><span class="note">${esc(r.directionRankLabel||'—')}</span></td>
    <td>${scoreVal(r.entryScore)}<br><span class="note">setup ${scoreVal(r.setupScore)} / risk ${scoreVal(r.riskScore)}</span></td>
-   <td>${r.structuralScore}<br><span class="note">证 ${r.evidenceScore??'—'} · ${r.evidenceLevel||'—'}</span></td>
-   <td>${m.displayPrice||'—'}${m.priceUsd&&m.currency!=='USD'?`<br><span class="note">≈ ${fmt(m.priceUsd)}</span>`:''}</td>
+   <td>${r.structuralScore}<br><span class="note">证 ${r.evidenceScore??'—'} · ${esc(r.evidenceLevel||'—')}</span></td>
+   <td>${esc(m.displayPrice||'—')}${m.priceUsd&&m.currency!=='USD'?`<br><span class="note">≈ ${fmt(m.priceUsd)}</span>`:''}</td>
    <td class="${cls(m.ret3m)}">${pct(m.ret3m)}</td>
    <td class="${cls(m.vs50)}">${pct(m.vs50)}</td>
-   <td>${cr.priceExtension||'—'}<br><span class="note">${cr.narrativeHeat||'—'} heat</span></td>
-   <td>${capFmt(m.marketCapUsd)}<br><span class="note">${m.marketCapBucket||'—'}</span></td>
+   <td>${esc(cr.priceExtension||'—')}<br><span class="note">${esc(cr.narrativeHeat||'—')} heat</span></td>
+   <td>${capFmt(m.marketCapUsd)}<br><span class="note">${esc(m.marketCapBucket||'—')}</span></td>
    <td>${p.weightPct?`${p.weightPct.toFixed(2)}%`:'—'}${p.held?'<br><span class="note">持有中</span>':''}</td>
-   <td class="l"><span class="note">${r.researchAction||reasonTxt(r)||'—'}</span></td>
+   <td class="l"><span class="note">${r.researchAction?esc(r.researchAction):(reasonTxt(r)||'—')}</span></td>
   </tr>`;}).join('');
- const mobile=researchRows.slice(0,14).map(r=>{const m=r.market||{},c=aiwScoreColor(r.finalScore);return `<div class="smc"><div class="smc-top"><b class="smc-sym">${r.ticker}</b><span class="smc-state" style="color:${c}">Score ${r.finalScore} · ${dirScore(r)}</span><span class="smc-pnl" style="color:${aiwTone(r.gate)}">${r.gate}</span></div><div class="smc-mid">${r.modelWorkstream||r.bucket} · ${m.displayPrice||'—'} · 3M ${pct(m.ret3m)} · vs50 ${pct(m.vs50)}</div><div class="smc-bias">${reasonTxt(r)||r.thesis||''}</div></div>`;}).join('');
- const entryRowsHtml=entryRows.slice(0,18).map((r,i)=>{const d=r.entryDiagnostics||{};return `<tr><td>${r.entryQueueRank||i+1}</td><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td><td>${gateChip(r.entryGate)}</td><td>${r.entryScore??'—'}</td><td class="${cls(d.distanceTo50DMA)}">${pct(d.distanceTo50DMA)}</td><td class="${cls(d.distanceTo200DMA)}">${pct(d.distanceTo200DMA)}</td><td class="${cls(d.threeMonthReturn)}">${pct(d.threeMonthReturn)}</td><td class="${cls(d.relativeStrengthVsBenchmark3M)}">${pct(d.relativeStrengthVsBenchmark3M)}</td><td>${d.valuationBand||'—'}</td><td>${d.postEarningsGapRisk||'—'}</td></tr>`;}).join('')||'<tr><td class="l" colspan="10">No entry-review names after data and setup filters.</td></tr>';
- const quarantineRows=dataRows.slice(0,24).map((r,i)=>{const m=r.market||{},why=((r.dataQualityReasons||[])[0]||{});return `<tr><td>${r.dataReviewQueueRank||i+1}</td><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td><td>${gateChip(r.gate)}<br>${gateChip(r.entryGate)}</td><td>${r.finalScore}<br><span class="note">raw setup ${r.rawSetupScore??'—'}</span></td><td>${m.displayPrice||'—'}<br><span class="note">${m.currency||'—'}</span></td><td class="${cls(m.ret3m)}">${pct(m.ret3m)}</td><td class="l">${why.rule||'—'}<br><span class="note">${why.detail||r.entryGateNote||'—'}</span></td></tr>`;}).join('')||'<tr><td class="l" colspan="7">No hard data-review names.</td></tr>';
- const tierRows=(sum.byPriorityTier||[]).map(b=>`<tr><td class="l">${b.priorityTier}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).join(', ')}</td></tr>`).join('');
- const stageRows=(sum.byStage||[]).map(b=>`<tr><td class="l">${b.stage}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).join(', ')}</td></tr>`).join('');
- const directionRows=(sum.byDirection||[]).map(b=>`<tr><td class="l">${b.direction}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).join(', ')}</td></tr>`).join('');
+ const mobile=researchRows.map(r=>{const m=r.market||{},c=aiwScoreColor(r.finalScore);return `<div class="smc static"><div class="smc-top"><b class="smc-sym">${esc(r.ticker)}</b><span class="smc-state" style="color:${c}">Score ${r.finalScore} · ${dirScore(r)}</span><span class="smc-pnl" style="color:${aiwTone(r.gate)}">${esc(r.gate)}</span></div><div class="smc-mid">${esc(r.modelWorkstream||r.bucket)} · ${esc(m.displayPrice||'—')} · 3M ${pct(m.ret3m)} · vs50 ${pct(m.vs50)}</div><div class="smc-bias">${reasonTxt(r)||(r.thesis?esc(r.thesis):'')}</div></div>`;}).join('');
+ const entryRowsHtml=entryRows.slice(0,18).map((r,i)=>{const d=r.entryDiagnostics||{};return `<tr><td>${r.entryQueueRank||i+1}</td><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td><td>${gateChip(r.entryGate)}</td><td>${r.entryScore??'—'}</td><td class="${cls(d.distanceTo50DMA)}">${pct(d.distanceTo50DMA)}</td><td class="${cls(d.distanceTo200DMA)}">${pct(d.distanceTo200DMA)}</td><td class="${cls(d.threeMonthReturn)}">${pct(d.threeMonthReturn)}</td><td class="${cls(d.relativeStrengthVsBenchmark3M)}">${pct(d.relativeStrengthVsBenchmark3M)}</td><td>${esc(d.pricePositionBand||'—')}</td><td>${esc(d.priceVolatilityRisk||'—')}</td></tr>`;}).join('')||'<tr><td class="l" colspan="10">No entry-review names after data and setup filters.</td></tr>';
+ const quarantineRows=dataRows.slice(0,24).map((r,i)=>{const m=r.market||{},why=((r.dataQualityReasons||[])[0]||{});return `<tr><td>${r.dataReviewQueueRank||i+1}</td><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td><td>${gateChip(r.gate)}<br>${gateChip(r.entryGate)}</td><td>${r.finalScore}<br><span class="note">raw setup ${r.rawSetupScore??'—'}</span></td><td>${esc(m.displayPrice||'—')}<br><span class="note">${esc(m.currency||'—')}</span></td><td class="${cls(m.ret3m)}">${pct(m.ret3m)}</td><td class="l">${esc(why.rule||'—')}<br><span class="note">${esc(why.detail||r.entryGateNote||'—')}</span></td></tr>`;}).join('')||'<tr><td class="l" colspan="7">No hard data-review names.</td></tr>';
+ const tierRows=(sum.byPriorityTier||[]).map(b=>`<tr><td class="l">${esc(b.priorityTier)}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).map(esc).join(', ')}</td></tr>`).join('');
+ const stageRows=(sum.byStage||[]).map(b=>`<tr><td class="l">${esc(b.stage)}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).map(esc).join(', ')}</td></tr>`).join('');
+ const directionRows=(sum.byDirection||[]).map(b=>`<tr><td class="l">${esc(b.direction)}</td><td>${b.count}</td><td>${b.avgFinal}</td><td>${b.avgStructural}</td><td class="l">${(b.leaders||[]).map(esc).join(', ')}</td></tr>`).join('');
  const weights=D.factorWeights||{},labels=D.factorLabels||{};
- const factorRows=Object.keys(weights).map(k=>`<tr><td class="l">${labels[k]||k}</td><td>${Math.round(weights[k]*100)}%</td></tr>`).join('');
- const kpiRows=researchRows.slice(0,18).map(r=>`<tr><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td><td class="l">${(r.catalysts||r.watchKpis||[]).join(' · ')||'review earnings and revenue guide'}</td><td class="l">${(r.rebuttalChecks||[]).slice(0,2).join(' · ')||'—'}</td></tr>`).join('');
- const ledgerRows=researchRows.slice(0,18).map(r=>{const e=(r.evidenceLedger||[])[0]||{},a=r.evidenceAudit||{};return `<tr><td class="l"><b>${r.ticker}</b><br><span class="note">${r.name}</span></td><td class="l">${e.sourceType||'—'}</td><td>${e.sourceDate||'—'}</td><td>${e.rawConfidence||e.confidence||'—'} → ${e.confidence||'—'}${e.confidenceCapped?'<br><span class="note">URL cap</span>':''}</td><td>${e.sourceUrl?'attached':'missing'}</td><td>${a.sourceUrlCoverage??0}%</td><td class="l">${(e.claim||'').slice(0,120)}</td></tr>`;}).join('');
- const thesis=model.portfolioThesisExposure||{},thesisRows=(thesis.byBucket||[]).map(x=>`<tr><td class="l">${x.bucket}</td><td>${x.weightPct??0}%</td></tr>`).join('')||'<tr><td class="l">No mapped watchlist holdings</td><td>0%</td></tr>';
- const thesisHeld=(thesis.heldTickers||[]).map(x=>`<span class="chip" style="color:var(--mut);border-color:var(--line)">${x.ticker} · ${x.bucket} · ${x.weightPct}%</span>`).join(' ');
- const flags=(model.dataQualityFlags||[]).map(f=>`<tr><td class="l">${f.ticker}</td><td>${f.severity||'—'}</td><td class="l">${f.rule||'—'}</td><td class="l">${f.detail||'—'}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No data-quality flags.</td></tr>';
+ const factorRows=Object.keys(weights).map(k=>`<tr><td class="l">${esc(labels[k]||k)}</td><td>${Math.round(weights[k]*100)}%</td></tr>`).join('');
+ const kpiRows=researchRows.slice(0,18).map(r=>`<tr><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td><td class="l">${(r.catalysts||r.watchKpis||[]).map(esc).join(' · ')||'review earnings and revenue guide'}</td><td class="l">${(r.rebuttalChecks||[]).slice(0,2).map(esc).join(' · ')||'—'}</td></tr>`).join('');
+ const ledgerRows=researchRows.slice(0,18).map(r=>{const e=(r.evidenceLedger||[])[0]||{},a=r.evidenceAudit||{};return `<tr><td class="l"><b>${esc(r.ticker)}</b><br><span class="note">${esc(r.name)}</span></td><td class="l">${esc(e.sourceType||'—')}</td><td>${esc(e.sourceDate||'—')}</td><td>${esc(e.rawConfidence||e.confidence||'—')} → ${esc(e.confidence||'—')}${e.confidenceCapped?'<br><span class="note">URL cap</span>':''}</td><td>${e.sourceUrl?'attached':'missing'}</td><td>${a.sourceUrlCoverage??0}%</td><td class="l">${esc((e.claim||'').slice(0,120))}</td></tr>`;}).join('');
+ const thesis=model.portfolioThesisExposure||{},thesisRows=(thesis.byBucket||[]).map(x=>`<tr><td class="l">${esc(x.bucket)}</td><td>${x.weightPct??0}%</td></tr>`).join('')||'<tr><td class="l">No mapped watchlist holdings</td><td>0%</td></tr>';
+ const thesisHeld=(thesis.heldTickers||[]).map(x=>`<span class="chip" style="color:var(--mut);border-color:var(--line)">${esc(x.ticker)} · ${esc(x.bucket)} · ${x.weightPct}%</span>`).join(' ');
+ const flags=(model.dataQualityFlags||[]).map(f=>`<tr><td class="l">${esc(f.ticker)}</td><td>${esc(f.severity||'—')}</td><td class="l">${esc(f.rule||'—')}</td><td class="l">${esc(f.detail||'—')}</td></tr>`).join('')||'<tr><td class="l" colspan="4">No data-quality flags.</td></tr>';
  return `<div class="card t1">
-  <div class="dh"><h2 class="t">AI观察池<span class="t-en">WATCH</span></h2><span class="nm">${D.subtitle||'旧能力重估观察池'} · ${D.marketDataAsOf||'结构数据'}</span></div>
-  <div class="note" style="line-height:1.7;margin-bottom:10px"><b>核心用法：</b>Research Queue 按 tier first, score second 排旧能力错配；Entry Queue 只做人工估值/仓位讨论；Data Quarantine 先清洗再排名。${D.disclaimer||'研究框架，非投资建议。'}</div>
-  <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('')}</div>
+  <div class="dh"><h2 class="t">AI观察池<span class="t-en">WATCH</span></h2><span class="nm">${esc(D.subtitle||'旧能力重估观察池')} · ${esc(D.marketDataAsOf||'结构数据')}</span></div>
+  <div class="note" style="line-height:1.7;margin-bottom:10px"><b>核心用法：</b>Research Queue 按 tier first, score second 排旧能力错配；Entry Queue 只做人工估值/仓位讨论；Data Quarantine 先清洗再排名。${esc(D.disclaimer||'研究框架，非投资建议。')}</div>
+  <div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${esc(x[0])}</div><div class="v">${esc(x[1])}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${esc(x[2])}</div></div>`).join('')}</div>
   <div style="margin-top:12px"><span class="cap">Tier-Prioritized Research Queue</span><div class="note" style="margin-top:3px">Sorted by action tier first, then research priority.</div><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${top}</div></div>
   <div style="margin-top:12px"><span class="cap">Model Workstreams</span><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:7px">${workChips||'<span class="note">No active workstreams.</span>'}</div></div>
   <div class="scroll score-tablewrap" style="margin-top:12px"><table><thead><tr><th>Rank</th><th class="l">代码</th><th class="l">动作层 / 工作流</th><th class="l">方向 / 角色</th><th>研究闸门</th><th>入场闸门</th><th>研究分</th><th>方向分</th><th>Entry</th><th>结构/证据</th><th>价格</th><th>3M</th><th>vs50</th><th>Crowding</th><th>市值</th><th>组合</th><th class="l">下一步</th></tr></thead><tbody>${tableRows}</tbody></table></div>
   <div class="score-cards" aria-label="AI Watchlist 手机卡片">${mobile}</div>
  </div>
- ${foldCard('Entry Queue','只表示可以进入人工估值、仓位和失效条件讨论',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">代码</th><th>Gate</th><th>Entry</th><th>50DMA</th><th>200DMA</th><th>3M</th><th>vs SPY</th><th>Valuation</th><th>Gap risk</th></tr></thead><tbody>${entryRowsHtml}</tbody></table></div>`,0,entryRows.length+' names')}
+ ${foldCard('Entry Queue','只表示可以进入人工估值、仓位和失效条件讨论',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">代码</th><th>Gate</th><th>Entry</th><th>50DMA</th><th>200DMA</th><th>3M</th><th>vs SPY</th><th>Price vs trailing median</th><th>Price-volatility proxy</th></tr></thead><tbody>${entryRowsHtml}</tbody></table></div><div class="note" style="margin-top:8px">这两列只描述价格相对历史中位数的位置与已实现波动代理；没有基本面估值、财报日历或真实财报跳空数据时，不会把它们称为 valuation 或 earnings-gap risk。</div>`,0,entryRows.length+' names')}
  ${foldCard('Data Quarantine','hard review 熔断：价格 / FX / split / 市值未核验前不进主榜',`<div class="scroll"><table><thead><tr><th>Rank</th><th class="l">代码</th><th>Gate</th><th>Research</th><th>价格</th><th>3M</th><th class="l">需要核验</th></tr></thead><tbody>${quarantineRows}</tbody></table></div>`,0,dataRows.length+' names')}
  ${foldCard('优先级 Tiers','T1 先做财报模型；T2 盯估值和持续性；T3 看证据升级；T4 季度跟踪',`<div class="scroll"><table><thead><tr><th class="l">Tier</th><th>公司数</th><th>研究均分</th><th>结构均分</th><th class="l">代表</th></tr></thead><tbody>${tierRows}</tbody></table></div>`,0,(sum.byPriorityTier||[]).length+' tiers')}
  ${foldCard('阶段地图 Stages','第二阶段看 AI 工厂瓶颈；第三阶段看端侧 / physical AI / 应用变现',`<div class="scroll"><table><thead><tr><th class="l">Stage</th><th>公司数</th><th>研究均分</th><th>结构均分</th><th class="l">代表</th></tr></thead><tbody>${stageRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">Direction</th><th>公司数</th><th>研究均分</th><th>结构均分</th><th class="l">代表</th></tr></thead><tbody>${directionRows}</tbody></table></div>`,0,(sum.byDirection||[]).length+' directions')}
- ${foldCard('评分权重与验证清单','每个标的必须同时有催化剂和反证条件',`<div class="scroll"><table><thead><tr><th class="l">因子</th><th>权重</th></tr></thead><tbody>${factorRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th class="l">催化剂</th><th class="l">反证检查</th></tr></thead><tbody>${kpiRows}</tbody></table></div>`,0,model.modelVersion||'v—')}
+ ${foldCard('评分权重与验证清单','每个标的必须同时有催化剂和反证条件',`<div class="scroll"><table><thead><tr><th class="l">因子</th><th>权重</th></tr></thead><tbody>${factorRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th class="l">催化剂</th><th class="l">反证检查</th></tr></thead><tbody>${kpiRows}</tbody></table></div>`,0,esc(model.modelVersion||'v—'))}
  ${foldCard('Evidence Ledger','schema coverage vs citation coverage',`<div class="note" style="line-height:1.7;margin-bottom:8px">${model.ledgerSchemaCoverage??'—'}% evidence slots populated; ${model.sourceUrlCoverage??'—'}% source URLs attached (${model.sourceUrlAttachedCount??0}/${model.sourceUrlRequiredCount??0}). Missing URLs cap confidence at medium.</div><div class="scroll"><table><thead><tr><th class="l">代码</th><th class="l">Source</th><th>Date</th><th>Conf.</th><th>URL</th><th>Coverage</th><th class="l">Claim</th></tr></thead><tbody>${ledgerRows}</tbody></table></div>`,0,(model.sourceUrlCoverage??'—')+'% cited')}
  ${foldCard('Thesis Correlation','portfolio exposure by AI thesis bucket',`<div class="scroll"><table><thead><tr><th class="l">Bucket</th><th>Portfolio weight</th></tr></thead><tbody>${thesisRows}</tbody></table></div><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${thesisHeld||'<span class="note">No matching held watchlist names.</span>'}</div>`,0,(thesis.totalMappedWeightPct??0)+'% mapped')}
  ${foldCard('Data Quality','价格 / FX / 异常波动审计',`<div class="scroll"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flags}</tbody></table></div>`,0,(model.dataQualityFlags||[]).length+' flags')}`;
+}
+function mfNum(v,d=0){v=Number(v);return Number.isFinite(v)?v.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';}
+function mfSigned(v,d=0,s=''){v=Number(v);return Number.isFinite(v)?`${v>0?'+':''}${mfNum(v,d)}${s}`:'—';}
+function mfTone(v){return {SUPPORTED:'#4FB286',MIXED:'#E8B339',REJECTED:'#E5707A',UNKNOWN:'#888D96',ALLOW_REVIEW:'#4FB286',WATCH:'#E8B339',BLOCK:'#E5707A'}[v]||'#888D96';}
+function mfChip(v){return `<span class="chip" style="color:${mfTone(v)};border-color:${chipBd(mfTone(v))}">${esc(v||'—')}</span>`;}
+function memoryFlowCard(){
+ const D=DATA.memoryFlow;
+ if(!D||!D.symbols)return `<div class="card t1"><div class="dh"><h2 class="t">存储资金流<span class="t-en">FLOW</span></h2><span class="nm">observed flow · leverage · dealer scenarios</span></div><div class="note" style="line-height:1.8">暂无 memory-flow 数据。运行 <b>python3 scripts/memory_flow.py</b>，再运行 <b>python3 generate.py --no-fetch</b>。工具不会把价格形态伪装成做市商库存。</div></div>`;
+ const H=D.hypotheses||[],S=D.symbols||{},L=((D.groups||{}).skHynixLeverage||{}),M=L.marketMargin||{},P=((D.crossMarket||{}).skHynixAdrParity||{}),F=D.dataFreshness||{};
+ const hypotheses=H.map(h=>`<div class="badge"><div class="l">${esc(h.claim||h.id)}</div><div class="v" style="font-size:17px;color:${mfTone(h.verdict)}">${esc(h.verdict||'UNKNOWN')}</div><div class="note" style="font-size:var(--t-xs);line-height:1.55;margin-top:4px">支持：${esc((h.supportingEvidence||[])[0]||'暂无决定性支持')}<br>反证：${esc((h.counterEvidence||[])[0]||'暂无')}</div></div>`).join('');
+ const decisionRows=Object.values(S).filter(r=>r.decisionSymbol).map(r=>{const t=r.technical||{},sc=r.scores||{},fl=r.investorFlow||{},f5=fl['5d']||{},ks=r.krxShort||{},sl=r.securitiesLending||{},fr=r.finraShortVolume||{},si=r.shortInterest||{},rt=r.retailActivity||{},op=r.options||{},a=r.action||{};return `<tr>
+  <td class="l"><b>${esc(r.symbol)}</b><br><span class="note">${esc(r.subsector||'')}</span></td><td>${esc(r.regime||'—')}</td><td>${mfNum(t.close,2)}${t.livePrice!=null?`<br><span class="note">live ${mfNum(t.livePrice,2)}</span>`:''}</td><td class="${cls(t.ret5dPct)}">${mfSigned(t.ret5dPct,1,'%')}</td><td class="${cls(t.vsEma21Pct)}">${mfSigned(t.vsEma21Pct,1,'%')}</td><td>${mfSigned(t.latestGapPct,1,'%')}<br><span class="note">CLV ${mfNum(t.latestCloseLocation,2)}</span></td><td>${mfNum(t.cmf20,2)}</td><td>${sc.washoutPainScore??'—'}</td><td>${sc.absorptionScore??'—'}</td><td>${sc.distributionRiskScore??'—'}</td><td>${fl.asOf?`${mfSigned(f5.institutionNetShares,0)} / ${mfSigned(f5.foreignNetShares,0)}<br><span class="note">机构 / 外资 5D</span>`:'—'}</td><td>${rt.sentiment?`${esc(rt.sentiment)}<br><span class="note">${mfSigned(rt.activityPct,2,'%')} · Top5 only</span>`:'—'}</td><td>${ks.latestShortTransactionPct!=null?`${mfNum(ks.latestShortTransactionPct,2)}%<br><span class="note">KRX · 净空 ${mfNum(ks.reportedNetShortBalancePctOutstanding,4)}% · 借券 ${mfNum(sl.loanBalancePctOutstanding,3)}%</span>`:(fr.latestPct!=null?`${mfNum(fr.latestPct,1)}%<br><span class="note">FINRA · z ${mfSigned(fr.latestZ20,2)}</span>`:'—')}</td><td>${si.shortPercentOfFloat!=null?`${mfNum(si.shortPercentOfFloat,2)}%<br><span class="note">${esc(si.asOf||'—')}</span>`:'—'}</td><td>${op.dataQuality?`${esc(op.dataQuality)}<br><span class="note">P/C OI ${mfNum(op.putCallOpenInterestRatio,2)}</span>`:'—'}</td><td>${mfChip(a.label)}</td>
+ </tr>`;}).join('');
+ const hy=S['000660.KS']||{},hyShort=hy.krxShort||{},hyLoan=hy.securitiesLending||{},flow=hy.investorFlow||{},flowRows=['1d','5d','20d'].map(w=>{const x=flow[w]||{};return `<tr><td>${w.toUpperCase()}</td><td>${mfSigned(x.institutionNetShares,0)}</td><td>${mfSigned(x.foreignNetShares,0)}</td><td>${mfSigned(x.individualOtherResidualNetShares,0)}</td><td>${mfSigned(x.institutionNetNotionalKrw,0,' KRW')}</td><td>${mfSigned(x.foreignNetNotionalKrw,0,' KRW')}</td></tr>`;}).join('');
+ const levels=((hy.technical||{}).levels||{}),levelRows=[['失效 / 20D低点','invalidation20dLow'],['近端支撑 / 5D低点','support5d'],['第一修复 / EMA8','reclaimEma8'],['趋势确认 / EMA21','confirmEma21'],['第一供给 / 5D高点','firstSupply5dHigh'],['伸展供给 / 20D高点','stretchSupply20dHigh']].map(x=>`<tr><td class="l">${x[0]}</td><td>${mfNum(levels[x[1]],0)} KRW</td></tr>`).join('');
+ const ratioNote=`${mfNum(P.adsPerLocalShare,0)} ADS = 1 common share`;
+ const dilution=P.sharesIssuedDenominatorVerified?`<div class="v">${mfNum(P.newSharesPctPreOffering,2)}%</div><div class="note">相对核验发行前已发行股本；发行后占比 ${mfNum(P.newSharesPctPostOffering,2)}%</div>`:`<div class="v">—</div><div class="note">发行股本分母已过期或未核验；比例停算</div>`;
+ const parity=P.status==='available_non_synchronous_proxy'?`<div class="badges"><div class="badge"><div class="l">ADR</div><div class="v">${esc(P.adrSymbol)} $${mfNum(P.adrPriceUsd,2)}</div><div class="note">${esc(P.adrPriceAsOf||'')}</div></div><div class="badge"><div class="l">ADR隐含韩国原股</div><div class="v">₩${mfNum(P.adrImpliedLocalKrw,0)}</div><div class="note">${ratioNote}</div></div><div class="badge"><div class="l">非同步溢价</div><div class="v ${cls(P.premiumDiscountPct)}">${mfSigned(P.premiumDiscountPct,2,'%')}</div><div class="note">不是保证可套利价差</div></div></div>`:(P.offerPriceUsd!=null?`<div class="badges"><div class="badge"><div class="l">发行锚</div><div class="v">$${mfNum(P.offerPriceUsd,2)}</div><div class="note">SKHYV → SKHY · 二手来源临时锚，尚非二级成交价</div></div><div class="badge"><div class="l">发行锚隐含韩国原股</div><div class="v">₩${mfNum(P.offerImpliedLocalKrw,0)}</div><div class="note">${ratioNote} · FX ${mfNum(P.offerFxKrwPerUsd,1)}</div></div><div class="badge"><div class="l">对韩国收盘非同步溢价</div><div class="v ${cls(P.offerPremiumDiscountPct)}">${mfSigned(P.offerPremiumDiscountPct,2,'%')}</div><div class="note">订单意向 ${mfNum(P.bookIndicationsMultiple,1)}x ≠ 长期持仓</div></div><div class="badge"><div class="l">新增股份</div>${dilution}</div></div>`:`<div class="note">ADR price status: ${esc(P.status||'unavailable')} · ${esc(P.adrSymbol||'SKHYV')} → ${esc(P.regularSymbol||'SKHY')}。上市前/无成交时不计算假溢价。</div>`);
+ const gaps=(D.dataGaps||[]).map(g=>`<tr><td class="l"><b>${esc(g.id)}</b></td><td>${esc(g.severity||'')}</td><td class="l">${esc(g.gap||'')}</td><td class="l">${esc(g.upgradePath||'')}</td></tr>`).join('');
+ return `<div class="card t1"><div class="dh"><h2 class="t">存储资金流<span class="t-en">FLOW</span></h2><span class="nm">US ref ${esc(D.asOf||'—')} · Korea ${esc(((F.price||{}).koreaClosedAsOf)||'—')} · generated ${esc((D.generatedAt||'').replace('T',' ').slice(0,19))} · research-only</span></div><div class="note" style="line-height:1.7;margin-bottom:10px"><b>读法：</b>先看真实投资者分类，再看量价/卖空/期权代理，最后才允许行为推断。做市商净库存、客户方向和“意图”不在公开数据里。</div><div class="badges">${hypotheses}</div></div>
+ <div class="card"><div class="dh"><h2 class="t">杠杆清洗审计<span class="t-en">LEVERAGE</span></h2><span class="nm">KOFIA official market balances + 3 SK hynix 2x proxies</span></div><div class="badges"><div class="badge"><div class="l">2x产品距20D高点</div><div class="v neg">${mfSigned(L.averageDrawdownFrom20dHighPct,1,'%')}</div><div class="note">pain confirmed ≠ positions cleared</div></div><div class="badge"><div class="l">2x个人/其他残差 5D</div><div class="v ${cls(L.individualOtherResidual5dShares)}">${mfSigned(L.individualOtherResidual5dShares,0)}</div><div class="note">仍净买是“洗净”反证</div></div><div class="badge"><div class="l">全市场融资余额</div><div class="v">₩${mfNum(M.totalMarginCreditTrillionKrw,3)}tn</div><div class="note">距30-session峰 ${mfSigned(M.totalMarginCreditFrom30dPeakPct,2,'%')} · KOSPI ${mfSigned(M.kospiMarginCreditFrom30dPeakPct,2,'%')}</div></div><div class="badge"><div class="l">客户保证金 / 现金缓冲</div><div class="v">₩${mfNum(M.customerDepositsTrillionKrw,3)}tn</div><div class="note">融资/保证金 ${mfNum(M.marginCreditToCustomerDepositsPct,2)}% · 20D ${mfSigned(M.marginCreditToDeposits20dChangePp,2,'pp')}</div></div><div class="badge"><div class="l">最新实际反向买卖</div><div class="v">₩${mfNum(M.forcedLiquidationBillionKrw,3)}bn</div><div class="note">${M.forcedLiquidationDataStatus==='available'?`比率 ${mfNum(M.forcedLiquidationRatioPct,1)}%`:'最新值缺失，未按 0 处理'} · KOFIA ${esc(M.asOf||'—')}</div></div><div class="badge"><div class="l">出清确认</div><div class="v" style="color:${L.positionClearingConfirmed?'#4FB286':'#E5707A'}">${L.positionClearingConfirmed?'YES':'NO'}</div><div class="note">市场融资仍高；还缺ETF份额/申赎</div></div></div></div>
+ <div class="card"><div class="dh"><h2 class="t">海力士：成交卖空 ≠ 净空 ≠ 借券<span class="t-en">SHORT / LOAN</span></h2><span class="nm">KRX official + KSD SEIBRO</span></div><div class="badges"><div class="badge"><div class="l">最新卖空成交占比</div><div class="v">${mfNum(hyShort.latestShortTransactionPct,2)}%</div><div class="note">20D加权 ${mfNum(hyShort.weighted20dShortTransactionPct,2)}% · z ${mfSigned(hyShort.latestZ20,2)}</div></div><div class="badge"><div class="l">需申报净空余额</div><div class="v">${mfNum(hyShort.reportedNetShortBalanceShares,0)}</div><div class="note">${mfNum(hyShort.reportedNetShortBalancePctOutstanding,4)}% issued shares · T+2 / threshold</div></div><div class="badge"><div class="l">KSD借券余额</div><div class="v">${mfNum(hyLoan.loanBalanceShares,0)}</div><div class="note">${mfNum(hyLoan.loanBalancePctOutstanding,3)}% issued shares · 20D ${mfSigned(hyLoan.loanBalance20dChangePct,2,'%')}</div></div><div class="badge"><div class="l">方向结论</div><div class="v" style="color:#E8B339">UNKNOWN</div><div class="note">借券还可用于做市、套利、交割与套保，不能全算方向性空头</div></div></div></div>
+ <div class="card"><div class="dh"><h2 class="t">个股压力表<span class="t-en">TAPE</span></h2><span class="nm">latest closed bar only · live bars never confirm repair</span></div><div class="scroll"><table><thead><tr><th class="l">标的</th><th>Regime</th><th>Close</th><th>5D</th><th>vs EMA21</th><th>Gap / CLV</th><th>CMF20</th><th>Washout</th><th>Absorb</th><th>Distrib.</th><th>机构/外资</th><th>美散户</th><th>Short-volume</th><th>Short interest</th><th>Options</th><th>Gate</th></tr></thead><tbody>${decisionRows}</tbody></table></div><div class="note" style="margin-top:8px;line-height:1.6"><b>手机端可横滑查看全部列。</b> KRX/FINRA short-volume 都不是新增净空仓；KRX申报净空余额有门槛且 T+2。期权 OI 没有 dealer/customer 符号。WDC/STX 是 HDD 存储，不是 MU 式 HBM/DRAM。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">SK hynix 投资者分类<span class="t-en">KRX-DERIVED</span></h2><span class="nm">${esc(flow.asOf||'unavailable')} · secondary source</span></div><div class="scroll"><table><thead><tr><th>窗口</th><th>机构净股数</th><th>外资净股数</th><th>个人/其他残差</th><th>机构估算名义</th><th>外资估算名义</th></tr></thead><tbody>${flowRows}</tbody></table></div><div class="note" style="margin-top:8px"><b>手机端可横滑查看名义金额。</b> 外资持股 ${mfNum(flow.foreignOwnershipPct,2)}% · 20D ${mfSigned(flow.foreignOwnershipChange20dPp,2,'pp')}。残差不是券商标记的纯散户流。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">SKHYV / SKHY 跨市场锚<span class="t-en">ADR PARITY</span></h2><span class="nm">${P.ratioVerified?'ratio verified':'ratio unavailable'} · convertibility caveat</span></div>${parity}<div class="note" style="margin-top:8px;line-height:1.6">${esc(P.offerPriceCaveat||'')}<br>${esc(P.conversionCaveat||'')}<br>${esc(P.bookIndicationsCaveat||'')}<br>${esc(P.stabilizationCaveat||'')}</div></div>
+ <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px"><div class="card"><div class="dh"><h2 class="t">海力士价格阶梯</h2><span class="nm">levels by purpose, not top prediction</span></div><div class="scroll"><table><tbody>${levelRows}</tbody></table></div></div><div class="card"><div class="dh"><h2 class="t">数据新鲜度</h2><span class="nm">source-specific</span></div><div class="note" style="line-height:1.8">Price ${esc(((F.price||{}).asOf)||'—')} · Korea flow ${esc(((F.koreaInvestor||{}).asOf)||'—')} · KRX short ${esc(((F.krxShort||{}).asOf)||'—')} · KSD loan ${esc(((F.securitiesLending||{}).asOf)||'—')} · KOFIA leverage ${esc(((F.kofiaLeverage||{}).asOf)||'—')} · FINRA ${esc(((F.finra||{}).asOf)||'—')} · US retail ${esc(((F.usRetail||{}).asOf)||'—')} · Options usable ${((F.options||{}).usableSymbols)??0}/${((F.options||{}).totalSymbols)??4}</div></div></div>
+ ${foldCard('决定性数据缺口','缺口存在时，结论自动停在 MIXED / UNKNOWN / WATCH',`<div class="scroll"><table><thead><tr><th class="l">Feed</th><th>Severity</th><th class="l">Missing</th><th class="l">Upgrade path</th></tr></thead><tbody>${gaps}</tbody></table></div>`,0,(D.dataGaps||[]).length+' gaps')}`;
 }
 var MMSEL=null;
 function mmEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -4719,14 +5938,14 @@ function marketMassStockBadge(sym){
  const proxy=(item.fallbackVolTicker&&!item.volTicker)?' · proxy vol':'';
  const stale=item.stale?' · stale':'';
  const note=b&&b.lower_boundary!=null?`${mmPx(sym,b.lower_boundary)}–${mmPx(sym,b.upper_boundary)}`:`center ${mmPx(sym,c.center_price)}`;
- return `<div class="badge"><div class="l">重心边界</div><div class="v" style="font-size:var(--t-base);line-height:1.45"><span style="color:${hColor}">${mmHealthLabel(hLabel)}</span> · Q${q} · B${build} · ${dist}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px"><span style="color:${color}">${mmRegimeLabel(c.regime)}</span> · ${note} · <span style="color:${confColor}">${confLabel}</span>${proxy}${stale}</div></div>`;
+ return `<div class="badge"><div class="l">重心边界</div><div class="v" style="font-size:var(--t-base);line-height:1.45"><span style="color:${hColor}">${mmEsc(mmHealthLabel(hLabel))}</span> · Q${q} · B${build} · ${dist}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px"><span style="color:${color}">${mmEsc(mmRegimeLabel(c.regime))}</span> · ${note} · <span style="color:${confColor}">${mmEsc(confLabel)}</span>${proxy}${stale}</div></div>`;
 }
 function marketMassLane(sym){
  const item=mmItem(sym),c=mmCurrent(item);
  if(!item||!c)return `<div class="mm-lane"><div class="k">${mmEsc(sym)}</div><div class="m">No market-mass snapshot.</div></div>`;
  const color=mmRegimeColor(c.regime),b=mmBoundary(item),conf=mmConfidence(item),confLabel=conf.label||'—';
  const h=mmMassHealth(item),hLabel=h.label||'—',fr=h.frictionLabel||'—';
- return `<div class="mm-lane"><div class="k">${mmEsc(sym)} <span style="color:${color}">●</span> <span style="color:${mmHealthColor(hLabel)};font-size:var(--t-xs)">${mmHealthLabel(hLabel)}</span></div><div class="m">price ${mmPx(sym,c.current_price)} · center ${mmPx(sym,c.center_price)}<br>Q${c.quality_score==null?'—':c.quality_score.toFixed(0)} / build ${c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(0)} / ${mmSigned(c.distance_z,2)}σ<br><span style="color:${mmFrictionColor(fr)}">${mmFrictionLabel(fr)}</span> · ${confLabel} confidence<br>${b.lower_boundary!=null?`5d ${mmPx(sym,b.lower_boundary)}–${mmPx(sym,b.upper_boundary)}`:'boundary —'}<br>${mmEsc(item.stale?'stale':('as of '+(item.priceAsOf||'—')))}</div></div>`;
+ return `<div class="mm-lane"><div class="k">${mmEsc(sym)} <span style="color:${color}">●</span> <span style="color:${mmHealthColor(hLabel)};font-size:var(--t-xs)">${mmEsc(mmHealthLabel(hLabel))}</span></div><div class="m">price ${mmPx(sym,c.current_price)} · center ${mmPx(sym,c.center_price)}<br>Q${c.quality_score==null?'—':c.quality_score.toFixed(0)} / build ${c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(0)} / ${mmSigned(c.distance_z,2)}σ<br><span style="color:${mmFrictionColor(fr)}">${mmEsc(mmFrictionLabel(fr))}</span> · ${mmEsc(confLabel)} confidence<br>${b.lower_boundary!=null?`5d ${mmPx(sym,b.lower_boundary)}–${mmPx(sym,b.upper_boundary)}`:'boundary —'}<br>${mmEsc(item.stale?'stale':('as of '+(item.priceAsOf||'—')))}</div></div>`;
 }
 function marketMassChart(sym,item){
  const rows=((item&&item.history)||[]).filter(r=>r&&r.date&&r.close!=null);
@@ -4749,7 +5968,7 @@ function marketMassChart(sym,item){
  rows.forEach(r=>{const x=xs(r.date)-bw/2;el+=`<rect x="${x.toFixed(1)}" y="${H-mB+3}" width="${bw.toFixed(1)}" height="5" fill="${mmRegimeColor(r.regime)}" fill-opacity=".75"/>`;});
  el+=`<rect x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="none" stroke="${C.line}"/>`+regMarks(mL,mT,W-mL-mR,H-mT-mB);
  const cid='c'+(++CHARTID),MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();
- CHARTREG[cid]={dates:rows.map(r=>+new Date(r.date)),ys:rows.map(r=>yc(r.close)),rows:rows.map(r=>{const dt=new Date(r.date);return `<b>${mmEsc(sym)} ${fd(dt,MY)}</b><br><span class="xr"><i style="background:${C.price}"></i>price ${mmPx(sym,r.close)}</span><span class="xr"><i style="background:${C.ref}"></i>center ${mmPx(sym,r.center)}</span><span class="xr"><i style="background:${C.green}"></i>lower ${mmPx(sym,r.lower_boundary)}</span><span class="xr"><i style="background:${C.red}"></i>upper ${mmPx(sym,r.upper_boundary)}</span><span class="xr" style="color:${mmRegimeColor(r.regime)}">${mmRegimeLabel(r.regime)} · Q${r.quality==null?'—':r.quality.toFixed(0)} · build ${r.buildUp==null?'—':r.buildUp.toFixed(0)} · ${mmSigned(r.distanceZ,2)}σ</span>`;})};
+ CHARTREG[cid]={dates:rows.map(r=>+new Date(r.date)),ys:rows.map(r=>yc(r.close)),rows:rows.map(r=>{const dt=new Date(r.date);return `<b>${mmEsc(sym)} ${fd(dt,MY)}</b><br><span class="xr"><i style="background:${C.price}"></i>price ${mmPx(sym,r.close)}</span><span class="xr"><i style="background:${C.ref}"></i>center ${mmPx(sym,r.center)}</span><span class="xr"><i style="background:${C.green}"></i>lower ${mmPx(sym,r.lower_boundary)}</span><span class="xr"><i style="background:${C.red}"></i>upper ${mmPx(sym,r.upper_boundary)}</span><span class="xr" style="color:${mmRegimeColor(r.regime)}">${mmEsc(mmRegimeLabel(r.regime))} · Q${r.quality==null?'—':r.quality.toFixed(0)} · build ${r.buildUp==null?'—':r.buildUp.toFixed(0)} · ${mmSigned(r.distanceZ,2)}σ</span>`;})};
  el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
  return `<svg id="${cid}" class="xh" role="img" aria-label="${mmEsc(sym)} market-mass boundary chart" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
 }
@@ -4758,7 +5977,7 @@ function marketMassPyramidTable(sym,item){
  if(!profiles.length)return '';
  const rows=profiles.map(p=>{
   const reg=p.regime||'—',rel=p.reliability==null?'—':Math.round(p.reliability*100);
-  return `<tr><td class="l"><b>${mmEsc(p.profile||'—')}</b><br><span class="note">${p.lookback||'—'} bars · half-life ${p.halfLife||'—'}</span></td><td>${mmPx(sym,p.center_price)}</td><td>${p.quality_score==null?'—':p.quality_score.toFixed(0)}</td><td>${p.stability_score==null?'—':p.stability_score.toFixed(0)}</td><td>${p.volatility_build_up_score==null?'—':p.volatility_build_up_score.toFixed(0)}</td><td>${mmSigned(p.distance_z,2)}σ</td><td>${p.gravity_score==null?'—':p.gravity_score.toFixed(0)}</td><td>${p.levitation_score==null?'—':p.levitation_score.toFixed(0)}</td><td>${rel}</td><td style="color:${mmRegimeColor(reg)}">${mmRegimeLabel(reg)}</td></tr>`;
+  return `<tr><td class="l"><b>${mmEsc(p.profile||'—')}</b><br><span class="note">${p.lookback||'—'} bars · half-life ${p.halfLife||'—'}</span></td><td>${mmPx(sym,p.center_price)}</td><td>${p.quality_score==null?'—':p.quality_score.toFixed(0)}</td><td>${p.stability_score==null?'—':p.stability_score.toFixed(0)}</td><td>${p.volatility_build_up_score==null?'—':p.volatility_build_up_score.toFixed(0)}</td><td>${mmSigned(p.distance_z,2)}σ</td><td>${p.gravity_score==null?'—':p.gravity_score.toFixed(0)}</td><td>${p.levitation_score==null?'—':p.levitation_score.toFixed(0)}</td><td>${rel}</td><td style="color:${mmRegimeColor(reg)}">${mmEsc(mmRegimeLabel(reg))}</td></tr>`;
  }).join('');
  const spread=agreement.centerSpreadPct==null?'—':agreement.centerSpreadPct.toFixed(2)+'%';
  const dz=agreement.centerDisagreementZ==null?'—':agreement.centerDisagreementZ.toFixed(2)+'σ';
@@ -4769,7 +5988,7 @@ function marketMassDetail(sym){
  const item=mmItem(sym),c=mmCurrent(item);
  if(!item||!c)return `<div class="card"><div class="dh"><h2 class="t">${mmEsc(sym||'Market Mass')}</h2><span class="nm">no usable artifact</span></div><div class="note">No market-mass data for this symbol.</div></div>`;
  const b=mmBoundary(item),color=mmRegimeColor(c.regime),vol=c.volatility||{},roles=(item.role||[]).join(' · '),conf=mmConfidence(item),confLabel=conf.label||'—',h=mmMassHealth(item),hLabel=h.label||'—',fr=h.frictionLabel||'—',agree=mmAgreement(item);
- const cards=[['Price',mmPx(sym,c.current_price),'latest close used by the model'],['Center',mmPx(sym,c.center_price),'weighted price-volume gravity point'],['Mass health',`<span style="color:${mmHealthColor(hLabel)}">${mmHealthLabel(hLabel)}</span> ${h.score==null?'':h.score.toFixed(0)+'/100'}`,'multi-timescale center agreement'],['Friction',`<span style="color:${mmFrictionColor(fr)}">${mmFrictionLabel(fr)}</span>`,'mean-reversion resistance state'],['Distance',mmSigned(c.distance_z,2)+'σ','log-price distance from center'],['Quality',c.quality_score==null?'—':c.quality_score.toFixed(1),'single swing-profile mass quality'],['Build-up',c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(1),'stored volatility pressure'],['Regime',`<span style="color:${color}">${mmRegimeLabel(c.regime)}</span>`,roles||'universe'],['Pyramid agreement',agree.agreementScore==null?'—':agree.agreementScore.toFixed(0)+'/100',`spread ${agree.centerSpreadPct==null?'—':agree.centerSpreadPct.toFixed(2)+'%'}`],['Dashboard confidence',`<span style="color:${mmConfidenceColor(confLabel)}">${confLabel}</span> ${conf.score==null?'':Math.round(conf.score*100)+'/100'}`,'practical trust score'],['Freshness',item.stale?'<span class="neg">stale</span>':'<span class="pos">fresh</span>',`price ${item.priceAsOf||'—'} · generated ${((item.freshness||{}).generatedAt||'').slice(0,10)||'—'}`],['5d lower',b.lower_boundary==null?'—':`${mmPx(sym,b.lower_zone_low)}–${mmPx(sym,b.lower_zone_high)}`,'probabilistic lower zone'],['5d upper',b.upper_boundary==null?'—':`${mmPx(sym,b.upper_zone_low)}–${mmPx(sym,b.upper_zone_high)}`,'probabilistic upper zone']];
+ const cards=[['Price',mmPx(sym,c.current_price),'latest close used by the model'],['Center',mmPx(sym,c.center_price),'weighted price-volume gravity point'],['Mass health',`<span style="color:${mmHealthColor(hLabel)}">${mmEsc(mmHealthLabel(hLabel))}</span> ${h.score==null?'':h.score.toFixed(0)+'/100'}`,'multi-timescale center agreement'],['Friction',`<span style="color:${mmFrictionColor(fr)}">${mmEsc(mmFrictionLabel(fr))}</span>`,'mean-reversion resistance state'],['Distance',mmSigned(c.distance_z,2)+'σ','log-price distance from center'],['Quality',c.quality_score==null?'—':c.quality_score.toFixed(1),'single swing-profile mass quality'],['Build-up',c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(1),'stored volatility pressure'],['Regime',`<span style="color:${color}">${mmEsc(mmRegimeLabel(c.regime))}</span>`,mmEsc(roles||'universe')],['Pyramid agreement',agree.agreementScore==null?'—':agree.agreementScore.toFixed(0)+'/100',`spread ${agree.centerSpreadPct==null?'—':agree.centerSpreadPct.toFixed(2)+'%'}`],['Dashboard confidence',`<span style="color:${mmConfidenceColor(confLabel)}">${mmEsc(confLabel)}</span> ${conf.score==null?'':Math.round(conf.score*100)+'/100'}`,'practical trust score'],['Freshness',item.stale?'<span class="neg">stale</span>':'<span class="pos">fresh</span>',`price ${mmEsc(item.priceAsOf||'—')} · generated ${mmEsc(((item.freshness||{}).generatedAt||'').slice(0,10)||'—')}`],['5d lower',b.lower_boundary==null?'—':`${mmPx(sym,b.lower_zone_low)}–${mmPx(sym,b.lower_zone_high)}`,'probabilistic lower zone'],['5d upper',b.upper_boundary==null?'—':`${mmPx(sym,b.upper_zone_low)}–${mmPx(sym,b.upper_zone_high)}`,'probabilistic upper zone']];
  const warns=mmWarns(item).map(w=>`<span class="chip" style="color:var(--amber-line);border-color:var(--chip-bd-amber)">${mmEsc(w)}</span>`).join(' ');
  return `<div class="card t1"><div class="dh"><h2 class="t">${mmEsc(sym)}<span class="t-en">MASS</span></h2><span class="nm">mass ${mmEsc(item.massAsOf||c.as_of||'—')} · price ${mmEsc(item.priceAsOf||'—')} · ${mmEsc(item.priceTicker||sym)} ${item.volumeTicker?`· volume ${mmEsc(item.volumeTicker)}`:''}</span></div><div class="badges">${cards.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:2px">${x[2]}</div></div>`).join('')}</div><div class="legend"><span><i class="ln" style="color:#8A8F98"></i>close</span><span><i class="lnd" style="color:#B89030"></i>center of mass</span><span><i style="background:#4FB286"></i>lower boundary zone</span><span><i style="background:#E5707A"></i>upper boundary zone</span><span>bottom ticks = regime</span></div><div class="chartbox">${marketMassChart(sym,item)}</div>${marketMassPyramidTable(sym,item)}<div class="note" style="margin-top:8px;line-height:1.65">Vol proxy: ${mmEsc(item.volTicker||item.fallbackVolTicker||'realized only')} · annual vol used ${vol.annual_vol_used==null?'—':(vol.annual_vol_used*100).toFixed(1)+'%'} · implied source ${mmEsc(vol.implied_vol_source||'—')}. Boundary zones are probabilistic ranges, not guaranteed support/resistance.</div>${mmReliabilityNotes(item)}${warns?`<div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${warns}</div>`:''}</div>`;
 }
@@ -4779,11 +5998,12 @@ function marketMassComparisonTable(){
    if(!c)return `<tr><td class="l">${mmEsc(sym)}</td><td colspan="14" class="l">${warn.map(mmEsc).join(' · ')||'No data'}</td></tr>`;
    const conf=mmConfidence(item),cl=conf.label||'—';
    const h=mmMassHealth(item),hl=h.label||'—',fr=h.frictionLabel||'—',agree=mmAgreement(item);
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="MMSEL='${mmEsc(sym)}';var s=document.getElementById('mm-symbol');if(s)s.value='${mmEsc(sym)}';marketMassRenderSelected()"><td class="l"><b>${mmEsc(sym)}</b><br><span class="note">${(item.role||[]).join(' · ')}</span></td><td>${mmPx(sym,c.current_price)}</td><td>${mmPx(sym,c.center_price)}</td><td style="color:${mmHealthColor(hl)}">${mmHealthLabel(hl)}${h.score==null?'':' '+h.score.toFixed(0)}</td><td style="color:${mmFrictionColor(fr)}">${mmFrictionLabel(fr)}</td><td>${agree.agreementScore==null?'—':agree.agreementScore.toFixed(0)}</td><td>${c.quality_score==null?'—':c.quality_score.toFixed(0)}</td><td>${c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(0)}</td><td>${mmSigned(c.distance_z,2)}σ</td><td style="color:${mmRegimeColor(c.regime)}">${mmRegimeLabel(c.regime)}</td><td style="color:${mmConfidenceColor(cl)}">${cl}</td><td>${item.stale?'<span class="neg">stale</span>':'fresh'}</td><td>${b.lower_boundary==null?'—':mmPx(sym,b.lower_boundary)}</td><td>${b.upper_boundary==null?'—':mmPx(sym,b.upper_boundary)}</td><td class="l"><span class="note">${warn.length?mmEsc(warn[0]):'—'}</span></td></tr>`;
+   return `<tr style="cursor:pointer" tabindex="0" data-mm-sym="${mmEsc(sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="marketMassSelect(this.dataset.mmSym)"><td class="l"><b>${mmEsc(sym)}</b><br><span class="note">${mmEsc((item.role||[]).join(' · '))}</span></td><td>${mmPx(sym,c.current_price)}</td><td>${mmPx(sym,c.center_price)}</td><td style="color:${mmHealthColor(hl)}">${mmEsc(mmHealthLabel(hl))}${h.score==null?'':' '+h.score.toFixed(0)}</td><td style="color:${mmFrictionColor(fr)}">${mmEsc(mmFrictionLabel(fr))}</td><td>${agree.agreementScore==null?'—':agree.agreementScore.toFixed(0)}</td><td>${c.quality_score==null?'—':c.quality_score.toFixed(0)}</td><td>${c.volatility_build_up_score==null?'—':c.volatility_build_up_score.toFixed(0)}</td><td>${mmSigned(c.distance_z,2)}σ</td><td style="color:${mmRegimeColor(c.regime)}">${mmEsc(mmRegimeLabel(c.regime))}</td><td style="color:${mmConfidenceColor(cl)}">${mmEsc(cl)}</td><td>${item.stale?'<span class="neg">stale</span>':'fresh'}</td><td>${b.lower_boundary==null?'—':mmPx(sym,b.lower_boundary)}</td><td>${b.upper_boundary==null?'—':mmPx(sym,b.upper_boundary)}</td><td class="l"><span class="note">${warn.length?mmEsc(warn[0]):'—'}</span></td></tr>`;
  }).join('');
  return `<div class="card"><div class="dh"><h2 class="t">Boundary Table</h2><span class="nm">5d / 80% default lens</span></div><div class="scroll"><table><thead><tr><th class="l">Ticker</th><th>Price</th><th>Center</th><th>Mass health</th><th>Friction</th><th>Agree</th><th>Quality</th><th>Build</th><th>Dist</th><th>Regime</th><th>Conf.</th><th>Fresh</th><th>Lower</th><th>Upper</th><th class="l">Flags</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
 function marketMassRenderSelected(){const selEl=document.getElementById('mm-symbol'),host=document.getElementById('mm-detail');if(!host)return;MMSEL=(selEl&&selEl.value)||MMSEL||mmSymbols()[0];host.innerHTML=marketMassDetail(MMSEL);fixThScope(host);armDraw(host);}
+function marketMassSelect(sym){if(!mmSymbols().includes(sym))return;MMSEL=sym;const s=document.getElementById('mm-symbol');if(s)s.value=sym;marketMassRenderSelected();}
 function marketMassTab(){
  const M=mmData(),syms=mmSymbols();
  if(!M||!M.symbols||!syms.length)return `<div class="card t1"><div class="dh"><h2 class="t">重心边界<span class="t-en">MASS</span></h2><span class="nm">market-mass artifact missing</span></div><div class="note" style="line-height:1.8">暂无 market-mass 可视化数据。生成方式：运行 <b>python3 scripts/market_mass_dashboard.py --anchor-only</b> 写入 <b>output/market_mass_dashboard.json</b>，再运行 <b>python3 generate.py --no-fetch</b>。边界是概率区间，不是保证支撑/阻力。</div></div>`;
@@ -4791,7 +6011,7 @@ function marketMassTab(){
  const opts=syms.map(s=>`<option value="${mmEsc(s)}" ${s===MMSEL?'selected':''}>${mmEsc(s)}</option>`).join('');
  const anchor=['QQQ','^NDX','VOO','^GSPC'].filter(s=>M.symbols[s]).map(marketMassLane).join('');
  const warn=(M.warnings||[]).map(w=>`<span class="chip" style="color:var(--amber-line);border-color:var(--chip-bd-amber)">${mmEsc(w)}</span>`).join(' ');
- return `<div class="card t1"><div class="dh"><h2 class="t">重心边界<span class="t-en">MASS</span></h2><span class="nm">${mmEsc(M.universeMode||'universe')} · ${mmEsc(p.gravityProfile||'swing')} · lookback ${p.lookback||84} · half-life ${p.halfLife||21} · pyramid ${(p.pyramidProfiles||[]).join('/')||'tactical/swing/structural'} · ${p.defaultHorizonDays||5}d ${((p.defaultConfidence||.8)*100).toFixed(0)}% · generated ${(M.generatedAt||'').slice(0,10)||'—'}</span></div><div class="note" style="line-height:1.7">Use this panel to check whether price is orbiting an accepted participation center or losing its anchor. Mass health now compares tactical, swing, and structural centers; weak agreement or high levitation means price may be moving with less mean-reversion friction. Boundary zones are probabilistic ranges, not guaranteed support/resistance.</div>${anchor?`<div class="mm-lanes">${anchor}</div>`:''}${warn?`<div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${warn}</div>`:''}</div><div class="mm-grid"><div><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px"><span class="cap" style="border-bottom:0;padding-bottom:0">Selected Symbol</span><select id="mm-symbol" class="mm-select" onchange="marketMassRenderSelected()">${opts}</select></div><div id="mm-detail">${marketMassDetail(MMSEL)}</div></div><div>${marketMassComparisonTable()}</div></div>`;
+ return `<div class="card t1"><div class="dh"><h2 class="t">重心边界<span class="t-en">MASS</span></h2><span class="nm">${mmEsc(M.universeMode||'universe')} · ${mmEsc(p.gravityProfile||'swing')} · lookback ${p.lookback||84} · half-life ${p.halfLife||21} · pyramid ${mmEsc((p.pyramidProfiles||[]).join('/')||'tactical/swing/structural')} · ${p.defaultHorizonDays||5}d ${((p.defaultConfidence||.8)*100).toFixed(0)}% · generated ${mmEsc((M.generatedAt||'').slice(0,10)||'—')}</span></div><div class="note" style="line-height:1.7">Use this panel to check whether price is orbiting an accepted participation center or losing its anchor. Mass health now compares tactical, swing, and structural centers; weak agreement or high levitation means price may be moving with less mean-reversion friction. Boundary zones are probabilistic ranges, not guaranteed support/resistance.</div>${anchor?`<div class="mm-lanes">${anchor}</div>`:''}${warn?`<div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${warn}</div>`:''}</div><div class="mm-grid"><div><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px"><span class="cap" style="border-bottom:0;padding-bottom:0">Selected Symbol</span><select id="mm-symbol" class="mm-select" onchange="marketMassRenderSelected()">${opts}</select></div><div id="mm-detail">${marketMassDetail(MMSEL)}</div></div><div>${marketMassComparisonTable()}</div></div>`;
 }
 function mtEsc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function mtNum(x,d=1){if(x==null||!isFinite(Number(x)))return'—';return Number(x).toFixed(d).replace(/\.0$/,'');}
@@ -4820,7 +6040,7 @@ function mtEquityChart(D){
  for(let y=new Date(xmin).getFullYear()+1;y<=new Date(xmax).getFullYear();y++){const xx=X(y+'-01-01');grid+=`<line x1="${xx}" x2="${xx}" y1="${P.t}" y2="${H-P.b}" stroke="var(--hair)"/><text x="${xx-14}" y="${H-7}" fill="var(--mut)">${y}</text>`;}
  const paths=S.map(s=>{const d=s.pts.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+','+Y(Number(p[1])).toFixed(1)).join('');return `<path d="${d}" fill="none" stroke="${MT_COL[s.id]||'#8A8F98'}" stroke-width="${s.kind==='benchmark'?1.4:2.4}" stroke-dasharray="${s.kind==='benchmark'?'5 4':''}" opacity="${s.kind==='benchmark'?.8:1}"/>`;}).join('');
  const legend=S.map(s=>`<span><i class="${s.kind==='benchmark'?'lnd':'ln'}" style="color:${MT_COL[s.id]||'#8A8F98'}"></i>${mtEsc(s.label)} · ${mtMult(s.pts[s.pts.length-1][1])}</span>`).join('');
- return `<div class="card t1"><div class="dh"><h2 class="t">8年净值曲线<span class="t-en">LOG SCALE</span></h2><span class="nm">monthly signal · next-session hold · transaction-cost adjusted</span></div><div class="legend">${legend}</div><div class="chartbox"><svg role="img" aria-label="Momentum Top-3 log-scale equity curve" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${grid}${paths}</svg></div><div class="note" style="margin-top:8px">Log scale keeps drawdowns and compounding comparable across high-return and benchmark lines. Universe uses current index membership, so absolute backtest returns are upper-bound research numbers.</div></div>`;
+ return `<div class="card t1"><div class="dh"><h2 class="t">8年净值曲线<span class="t-en">LOG SCALE</span></h2><span class="nm">monthly signal · next-session hold · transaction-cost adjusted</span></div><div class="legend">${legend}</div><div class="chartbox"><svg class="mt-chart" role="img" aria-label="Momentum Top-3 log-scale equity curve" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${grid}${paths}</svg></div><div class="note" style="margin-top:8px">Log scale keeps drawdowns and compounding comparable across high-return and benchmark lines. Universe uses current index membership, so absolute backtest returns are upper-bound research numbers.</div></div>`;
 }
 function mtCycleHtml(c){
  if(!c)return'';
@@ -4854,6 +6074,9 @@ function momentumTop3Tab(){
  const disc=D.disclaimer||"Survivorship bias: universe is today's index membership; decision support only.";
  return `<div class="card t1"><div class="dh"><h2 class="t">动量 Top-3 策略舱<span class="t-en">MOMENTUM</span></h2><span class="nm">window ${mtEsc(w.start||'—')} → ${mtEsc(w.end||'—')} · universe ${D.universe_size??'—'} · cost ${cost} · generated ${(D.generated_at||'').replace('T',' ')}</span></div><div class="note" style="line-height:1.7">${mtEsc(disc)} This page is embedded from the same artifact as the standalone Momentum Top-3 view and updates when <b>scripts/momentum_top3.py</b> refreshes prices and signals.</div></div>${mtEquityChart(D)}${mtLivePlanCard(D)}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">${cards}</div>${mtCompareTable(D)}`;
 }
+function curveUnavailableCard(title){
+ return `<div class="card"><div class="dh"><h2 class="t">${title}</h2><span class="chip" style="color:var(--accent);border-color:var(--chip-bd-amber)">时序不足</span></div><div class="note" style="line-height:1.7">组合时序少于 2 个可用点，因此不绘制曲线，也不会伪造收益/对比线。账户快照、持仓、现金、期权与研究面板仍可使用。请核对历史 CSV 后重跑 <b>python3 sync.py</b>。</div></div>`;
+}
 const PANEL_RENDERERS_OV={
  score: ()=>scorecardCard(),
  decide:()=>decisionLabCard(),
@@ -4861,6 +6084,7 @@ const PANEL_RENDERERS_OV={
  aisemi:()=>aiSemiQuantCard(),
  aics:()=>aicsToolTab(),
  aiwatch:()=>aiWatchlistCard(),
+ memflow:()=>memoryFlowCard(),
  qt:    ()=>qqqTqqqTab(),
  mass:  ()=>marketMassTab(),
  mom:   ()=>momentumTop3Tab(),
@@ -4868,21 +6092,21 @@ const PANEL_RENDERERS_OV={
    return wholeAccountCard()+
      `<div class="card"><div class="dh"><h2 class="t">组合总览</h2><span class="nm">股票口径收益率（现金 / 期权按市价见本页顶部"全账户"卡片）</span></div>`+
      `<div class="badges">${e.cards.map(c=>`<div class="badge"><div class="l">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('')}</div></div>`+
-     `<div class="card"><div class="cap" style="margin-bottom:4px">持仓总市值（$） · 叠加组合斐波那契动能</div>`+
+     (e.ser.length>=2?`<div class="card"><div class="cap" style="margin-bottom:4px">股票价值路径（调整价标尺） · 叠加组合斐波那契动能</div>`+
      `<div class="legend"><span>底部色带 = 组合加权动能：<span style="color:#E8B339">琥珀=强(&gt;15)</span> / <span style="color:#9A8A4A">浅琥珀=中性</span> / <span style="color:#6B7079">灰=弱(&lt;-15)</span>，用来对照净值看择时节奏</span></div>`+
      nwChart(e.ser)+
-     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这条是<b>持仓总市值（$，含入金）</b>——净值上升可能来自<b>入金而非盈利</b>。要看真金白银的回报，去"指数对比"的 ${gl('TWR','TWR')} 与本卡下方"真金白银桥"的 ${gl('MWR','MWR')}。底部色带 = 组合加权动能，仅供对照择时节奏。<b>非投资建议。</b></div></div>`+
+     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这条用 Yahoo <b>拆分/分红调整收盘价</b>与当日持股构造股票价值路径；它适合计算 TWR 与趋势，但历史美元点<b>不是券商账户 NAV</b>。当前持仓市值以上方券商卡片为准。要看回报，去"指数对比"的 ${gl('TWR','TWR')} 与本卡下方"真金白银桥"的 ${gl('MWR','MWR')}。底部色带仅供对照节奏。<b>非投资建议。</b></div></div>`:curveUnavailableCard('股票价值路径'))+
      counterfactualCard()+
      bridgeCard()+
      `<div class="ref-divider" role="presentation">以下为参考资料 · 点开查看</div>`+
-     optionsExposureCard()+optionsSpreadLedgerCard()+renderOptions()+diagnosticsCard();
+     optionsExposureCard()+optionsSpreadLedgerCard()+optionResidualRiskCard()+renderOptions()+diagnosticsCard();
  },
- pfib:  ()=>portfolioFibCard(),
+ pfib:  ()=>closeVsIntradayCard()+portfolioFibCard(),
  cmp:   ()=>{const e=_ovPanelEnv();
-   return `<div class="card"><div class="cap" style="margin-bottom:4px">累计收益率对比（%，时间加权）</div>`+
+   return (e.ser.length>=2?`<div class="card"><div class="cap" style="margin-bottom:4px">累计收益率对比（%，时间加权）</div>`+
      `<div class="legend"><span><i class="ln" style="color:#E8B339"></i>我的组合</span><span><i class="lnd" style="color:#888D96"></i>S&amp;P 500</span><span><i class="lnt" style="color:#B6BAC1"></i>纳斯达克综合</span></div>`+
      svgLines(e.ser,[{key:'ret',color:'#E8B339',width:2.3,draw:1,label:'我的组合'},{key:'sp500',color:'#888D96',width:1.5,dash:'5 3',label:'S&P'},{key:'nasdaq',color:'#B6BAC1',width:1.5,dash:'1.5 3',label:'纳斯达克'}],{zero:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'ret',b:'sp500',label:'超额 vs S&P'}})+
-     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这三条都是<b>时间加权(TWR)</b>——只评判选股 / 策略本身，<b>剔除了你出入金的时点</b>，所以 ≠ 你的钱实际赚到的回报（你的钱真实经历看"净值"里的 <b>MWR</b>）。虚线为基准，<b>悬停看超额(pp)</b>，即我的组合(琥珀)与 S&amp;P(灰虚线)之间的差距。<b>非投资建议。</b></div></div>`+
+     `<div class="note" style="margin-top:10px;line-height:1.6"><b>怎么读：</b>这三条都是<b>时间加权(TWR)</b>——只评判选股 / 策略本身，<b>剔除了你出入金的时点</b>，所以 ≠ 你的钱实际赚到的回报（你的钱真实经历看"净值"里的 <b>MWR</b>）。虚线为基准，<b>悬停看超额(pp)</b>，即我的组合(琥珀)与 S&amp;P(灰虚线)之间的差距。<b>非投资建议。</b></div></div>`:curveUnavailableCard('累计收益率对比'))+
      contributionCard();
  },
  sig:   ()=>positionSignalsCard()+`<div class="ref-divider" role="presentation">以下为参考分析</div>`+resonanceCard()+fibRanking(),
@@ -4904,7 +6128,7 @@ function ensureOvPanel(seg){
  const panel=document.querySelector('#right .seg[data-seg="'+seg+'"]');
  if(!panel||panel.innerHTML.trim()!=='')return;
  const rdr=PANEL_RENDERERS_OV[seg];if(!rdr)return;
- try{panel.innerHTML=rdr();}catch(e){console.warn('panel render failed',seg,e);panel.innerHTML='<div class="note">面板渲染失败</div>';return;}
+ try{panel.innerHTML=rdr();}catch(e){console.warn('panel render failed',seg,e);panel.innerHTML=`<div class="card"><div class="dh"><h2 class="t">${esc(segLabel(seg,'ov'))} 面板无法渲染</h2><span class="chip" style="color:var(--red);border-color:var(--chip-bd-red)">错误</span></div><div class="note">请重新生成数据并刷新页面：<b>python3 sync.py</b>。其他面板仍可使用。</div></div>`;return;}
  fixThScope(panel);armDraw(panel);
  const after=PANEL_AFTER_RENDER_OV[seg];if(after)after();
 }
@@ -4914,18 +6138,17 @@ function fixThScope(root){(root||document).querySelectorAll('thead th:not([scope
 function renderOverview(){
  CHARTREG={};
  const ser=DATA.series||[],right=document.getElementById('right');
- if(ser.length<2){const _ins0=document.getElementById('insight');if(_ins0)_ins0.innerHTML='';const _ob0=document.getElementById('onboard-slot');if(_ob0)_ob0.innerHTML=onboardStrip();right.innerHTML='<div class="card">数据不足，无法生成组合曲线。</div>';return;}
  const _ins=document.getElementById('insight');if(_ins)_ins.innerHTML=insightBanner();   // verdict + KPI ledger sit adjacent
  const _ob=document.getElementById('onboard-slot');if(_ob)_ob.innerHTML=onboardStrip();   // onboarding lives below the ledger, out of the hero zone
  // Render skeleton: viewbar + seg-rail + empty seg panels. ensureOvPanel() populates each on first activate.
  // activeSeg from URL is rendered eagerly so the initial paint has actual content.
- const segs=['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
+ const segs=['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
  const _ls=lastSeg('ov');const initialSeg=segs.indexOf(_ls)>=0?_ls:DEFAULT_SEG.ov;   // validate stale/invalid localStorage seg so .on/syncWs/panelMarkup all agree
  const _segin=document.body.classList.contains('done')?' segin':'';   // post-load renders settle; initial load keeps the stagger
  const panelMarkup=segs.map(s=>`<div class="seg${s===initialSeg?_segin:''}" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
  <nav aria-label="工作区" class="ws-rail-wrap"><div class="ws-rail"><span class="rail-here">组合总览</span>${WS_MAP.map(w=>`<button data-ws="${w.id}" title="${w.segs.map(s=>segLabel(s,'ov')).join(' · ')}" onclick="wsGo('${w.id}')">${w.label}</button>`).join('')}</div></nav>
- <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
+ <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="memflow" title="韩国与美国存储股的投资者流向、杠杆清洗和做市商情景">存储资金流</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
  ${panelMarkup}`;
  // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
  ensureOvPanel(initialSeg);
@@ -4942,7 +6165,7 @@ function renderOverview(){
 function resonanceCard(){
  const bull=stocks.filter(x=>x.held&&x.fib&&x.fib.now&&x.fib.now.res==='bull').sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
  const bear=stocks.filter(x=>x.held&&x.fib&&x.fib.now&&x.fib.now.res==='bear');
- const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">${x.sym} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
+ const chip=(x,c)=>`<span class="chip" style="cursor:pointer;color:${c};border-color:${c}55" tabindex="0" role="button" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">${esc(x.sym)} <span style="color:${c};opacity:.8">${x.fib.now.mom>0?'+':''}${x.fib.now.mom}</span></span>`;
  return `<div class="card"><div class="dh"><h2 class="t">今日多指标共振</h2><span class="nm">趋势排列 + 3日内金/死叉 + RSI 未极端 → 高确信度</span></div>
    <div style="margin-top:10px"><div class="l" style="color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:var(--ls-label);margin-bottom:7px;font-weight:600">多头共振 · ${bull.length}</div>
    <div style="display:flex;gap:8px;flex-wrap:wrap">${bull.map(x=>chip(x,'#4FB286')).join('')||'<span class="note">无</span>'}</div></div>
@@ -4954,11 +6177,11 @@ function fibRanking(){
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).sort((a,b)=>b.fib.now.mom-a.fib.now.mom);
  if(!held.length)return'';
  const rows=held.map(x=>{const m=x.fib.now.mom,c=momColor(m),w=Math.abs(m)/100*50,left=m>=0?50:50-w;
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
-     <span class="fsym"><span style="color:${FIBCOL[x.fib.now.state]}">●</span> ${x.sym}</span>
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <span class="fsym"><span style="color:${FIBCOL[x.fib.now.state]}">●</span> ${esc(x.sym)}</span>
      <div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${m>0?'+':''}${m}</span>
-     <span class="fst">${x.fib.now.label}</span></div>`;}).join('');
+     <span class="fst">${esc(x.fib.now.label)}</span></div>`;}).join('');
  return `<div class="card"><div class="dh"><h2 class="t">斐波那契动能排行</h2><span class="nm">持仓按 EMA5/8/13/21 动能强弱排序（点击查看个股）</span></div>
    <div style="margin-top:6px">${rows}</div>
    <div class="note" style="margin-top:10px">动能 = EMA5 相对 EMA21 偏离度（±100 封顶），正=多头、负=空头；颜色点为斐波那契状态。技术参考，非投资建议。</div></div>`;
@@ -4966,26 +6189,62 @@ function fibRanking(){
 const FIBCOL={up:'#4FB286',down:'#E5707A',range:'#888D96',mixed:'#B89030'};   // mixed = muted reference amber — pure amber stays reserved for live/active cues
 const FIBLBL={up:'多头趋势',down:'空头趋势',range:'盘整纠缠',mixed:'转换中'};
 function momColor(m){return m>15?'#4FB286':(m<-15?'#E5707A':'#B89030');}   // neutral band = muted reference amber, not the live accent
+function closeVsIntradayCard(){
+ const D=DATA.closeVsIntraday;
+ if(!D)return `<div class="card"><div class="dh"><h2 class="t">收盘位置检验<span class="t-en">CLOSE vs INTRADAY</span></h2><span class="nm">1M / 2M / 3M</span></div><div class="note">暂无收盘位置数据。运行 <b>python3 scripts/close_vs_intraday.py</b> 后重新生成页面。</div></div>`;
+ const W=D.windows||{};
+ const labels={"1M":"1个月","2M":"2个月","3M":"3个月"};
+ const n=(v,d=1)=>v==null?'—':Number(v).toFixed(d)+'%';
+ const sn=(v,d=3)=>v==null?'—':`<span class="${Number(v)>0?'pos':(Number(v)<0?'neg':'')}">${Number(v)>0?'+':''}${Number(v).toFixed(d)}%</span>`;
+ const cell=(o,k,d=1)=>n(o&&o[k],d);
+ const qualityOk=m=>m&&m.dataQualityStatus==='PASS'&&m.verdict!=='DATA_INSUFFICIENT';
+ const windowRow=(label,m)=>{m=m||{};if(!qualityOk(m)){const why=(m.dataQualityReasons||[]).join(' · ')||'VWAP sample quality did not pass';return `<tr><td class="l"><b>${labels[label]}</b><br><span class="note">${m.intradaySessions||0} 日 · BLOCK</span></td><td class="l" colspan="6"><span class="neg">DATA INSUFFICIENT</span><br><span class="note">${esc(why)}</span></td></tr>`;}const vwapDays=m.compositeCloseBelowVwapPct==null?m.closeBelowVwapPct:m.compositeCloseBelowVwapPct;
+   return `<tr><td class="l"><b>${labels[label]}</b><br><span class="note">${m.sessions||m.intradaySessions||0} 日</span></td><td>${cell(m,'closeBelowOpenPct')}</td><td>${cell(m,'closeBelowRangeMidPct')}</td><td>${n(vwapDays)}</td><td>${sn(m.avgCloseVsVwapPct)}</td><td>${n(m.closingBarRedPct)} / ${sn(m.avgClosingBarReturnPct)}</td><td>${n(m.avgHighToCloseGivebackPct)}</td></tr>`;};
+ const pRows=['1M','2M','3M'].map(k=>windowRow(k,(W[k]||{}).portfolio)).join('');
+ const qRows=['1M','2M','3M'].map(k=>windowRow(k,(W[k]||{}).qqq)).join('');
+ const portfolioWindows=['1M','2M','3M'].map(k=>(W[k]||{}).portfolio||{});
+ const allPortfolioWindowsPass=portfolioWindows.every(qualityOk);
+ const pVerdicts=portfolioWindows.map(m=>m.verdict);
+ const verdict=!allPortfolioWindowsPass
+   ? '<span class="neg">数据不足</span>：至少一个窗口未通过样本、覆盖率或时效闸门；不发布方向结论。'
+   : (pVerdicts.filter(v=>v==='SUPPORTS_LOWER_CLOSE').length>=2
+      ? '<span class="neg">有一定支持</span>：至少两个合格窗口支持平均收盘偏低。'
+      : (pVerdicts.filter(v=>v==='REJECTS_LOWER_CLOSE').length>=2
+         ? '<span class="pos">不支持</span>：至少两个合格窗口拒绝平均收盘偏低。'
+         : '<span style="color:var(--accent)">证据混合</span>：三个合格窗口的方向不一致。'));
+ const oneMonthStocks=Object.entries(((W['1M']||{}).symbols)||{}).map(([s,w])=>({s,v:w.avgCloseVsVwapPct,f:w.compositeCloseBelowVwapPct==null?w.closeBelowVwapPct:w.compositeCloseBelowVwapPct,n:w.intradaySessions||0,ok:qualityOk(w)})).filter(x=>x.ok&&x.v!=null&&x.n>=15).sort((a,b)=>Number(a.v)-Number(b.v));
+ const weak=oneMonthStocks.slice(0,5),strong=oneMonthStocks.slice(-5).reverse();
+ const names=arr=>arr.length?arr.map(x=>`<span class="chip" title="1M 收盘低于VWAP ${n(x.f)}">${esc(x.s)} ${sn(x.v,2)}</span>`).join(' '):'—';
+ const missing=(((D.universe||{}).missingIntraday60m)||[]);
+ return `<div class="card t1"><div class="dh"><h2 class="t">收盘真的比盘中低吗？<span class="t-en">CLOSE vs INTRADAY</span></h2><span class="nm">Yahoo regular session · through ${esc(D.asOf||'—')}</span></div>
+   <div class="note" style="font-size:var(--t-sm);line-height:1.7;margin-bottom:10px"><b>结论：</b>${verdict} “低于盘中最高价”天然常见，因此主要看开盘、日内高低中点与 60 分钟成交量加权 VWAP 代理。</div>
+   <div class="cap" style="margin-bottom:4px">当前持仓 · 按 ${esc(D.asOf||'当前')} 市值权重（每日按可用标的重新归一）</div>
+   <div class="scroll"><table><thead><tr><th class="l">窗口</th><th>持仓权重&lt;开盘*</th><th>持仓权重&lt;区间中点*</th><th>组合日&lt;VWAP</th><th>平均 vs VWAP</th><th>收盘段阴线 / 收益</th><th>高点回吐</th></tr></thead><tbody>${pRows}</tbody></table></div>
+   <details style="margin-top:10px"><summary>展开 QQQ 对照</summary><div class="scroll" style="margin-top:8px"><table><thead><tr><th class="l">窗口</th><th>收盘&lt;开盘</th><th>收盘&lt;区间中点</th><th>交易日&lt;VWAP</th><th>平均 vs VWAP</th><th>收盘段阴线 / 收益</th><th>高点回吐</th></tr></thead><tbody>${qRows}</tbody></table></div></details>
+   <div class="note" style="margin-top:10px;line-height:1.8"><b>最近1个月相对 VWAP 较弱：</b>${names(weak)}<br><b>相对较强：</b>${names(strong)}</div>
+   <div class="note" style="margin-top:8px;line-height:1.7"><b>口径：</b>*开盘/区间中点频率 = 每天按当前持仓权重加权的股票日比例；“组合日&lt;VWAP”先合成每日组合差，再统计为负的天数。平均差才显示方向与幅度。VWAP 用 60 分钟典型价×成交量近似；“收盘段”是 Yahoo 最后一根常规时段 bucket，并不保证完整一小时。当前持仓/当前权重存在幸存者偏差。${missing.length?` 盘中数据缺失：${esc(missing.join(', '))}。`:''}<b>描述统计，非投资建议。</b></div>
+ </div>`;
+}
 function fibBadges(n,signals,curLabel){
  const sc=momColor(n.mom),rsiCol=n.rsi>70?'#E5707A':(n.rsi<30?'#4FB286':'var(--txt)');
  const lastSig=(signals||[]).slice(-1)[0];
  return [
-  [curLabel||'斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
+  [esc(curLabel||'斐波那契状态'),`<span style="color:${FIBCOL[n.state]}">●</span> ${esc(n.label)}`],
   [gl('mom','动能强弱'),`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
   [gl('rsi','RSI(14)'),`<span style="color:${rsiCol}">${n.rsi}</span>`],
-  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
+  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${esc(lastSig.date)}</span>`:`<span class="neg">死叉 ${esc(lastSig.date)}</span>`):'—'],
   [gl('res','多指标共振'),n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
  ];
 }
 function portfolioFibCard(){
  const pf=DATA.portfolioFib,ser=DATA.series||[];
  if(!pf||ser.length<2)return `<div class="card"><div class="dh"><h2 class="t">组合斐波那契</h2></div><div class="note">组合净值样本不足（需 ≥21 个交易日）。</div></div>`;
- const pseudo={sym:'组合净值',prices:ser.map(p=>[p.date,p.value]),fib:pf,curPrice:ser[ser.length-1].value,held:true};
+ const pseudo={sym:'组合调整价路径',prices:ser.map(p=>[p.date,p.value]),fib:pf,curPrice:ser[ser.length-1].value,held:true};
  const n=pf.now,fmtK=v=>'$'+(v/1000).toFixed(0)+'k';
  const sser=ser.map((p,i)=>({date:p.date,mom:pf.mom[i],rsi:pf.rsi[i]}));
  const badges=fibBadges(n,pf.signals,'组合趋势状态');
  return `<div class="card">
-   <div class="dh"><h2 class="t">组合斐波那契 · 技术参考<span class="t-en">Momentum</span></h2><span class="nm">EMA 5/8/13/21 缎带 · 金叉/死叉 · RSI —— 直接计算在组合净值曲线上（非投资建议）</span></div>
+   <div class="dh"><h2 class="t">组合斐波那契 · 技术参考<span class="t-en">Momentum</span></h2><span class="nm">EMA 5/8/13/21 缎带 · 金叉/死叉 · RSI —— 计算在 TWR 同口径的调整价价值路径上（非投资建议）</span></div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>
    <div class="legend">
      <span><i class="ln" style="color:#C99A3A"></i>EMA5</span><span><i class="ln" style="color:#B89030"></i>EMA8</span>
@@ -4998,7 +6257,7 @@ function portfolioFibCard(){
    ${svgLines(sser,[{key:'mom',color:'#C99A3A',draw:1,label:'动能'}],{zero:true,h:200,fixed:[-100,100],fmt:v=>v.toFixed(0),guides:[{v:15,color:'#2f6b4f',labelColor:'#4FB286',label:'强多'},{v:-15,color:'#6b2f2f',labelColor:'#E5707A',label:'强空'}],marks:pf.signals})}
    <div class="cap" style="margin:12px 0 2px">组合 RSI(14)</div>
    ${svgLines(sser,[{key:'rsi',color:'#888D96',label:'RSI'}],{h:180,fixed:[0,100],fmt:v=>v.toFixed(0),guides:[{v:70,color:'#6b2f2f',labelColor:'#E5707A',label:'超买70'},{v:30,color:'#2f6b4f',labelColor:'#4FB286',label:'超卖30'}],marks:pf.signals})}
-   <div class="note" style="margin-top:10px"><b>怎么读：</b>把整支组合当成一只“基金”，在净值曲线上算 EMA 缎带与金叉/死叉，用来看组合整体的趋势结构与择时节奏。<b>金叉/死叉为快线 EMA5×EMA13 交叉</b>（非传统 50/200 日均线，更快也更灵敏）。竖虚线标出交叉日期。<b>技术参考，非投资建议。</b></div>
+   <div class="note" style="margin-top:10px"><b>怎么读：</b>把整支组合当成一只技术指数，在拆分/分红调整价路径上算 EMA 缎带与金叉/死叉，用来看整体趋势；历史美元点不是券商 NAV。<b>金叉/死叉为快线 EMA5×EMA13 交叉</b>（非传统 50/200 日均线，更快也更灵敏）。竖虚线标出交叉日期。<b>技术参考，非投资建议。</b></div>
  </div>`;
 }
 function postureOf(n){
@@ -5012,15 +6271,15 @@ function positionSignalsCard(){
  const held=stocks.filter(x=>x.held&&x.fib&&x.fib.now).map(x=>({x,w:x.value/mv*100})).sort((a,b)=>b.w-a.w);
  if(!held.length)return'';
  const rows=held.map(({x,w})=>{const n=x.fib.now,sig=(x.fib.signals||[]).slice(-1)[0];
-   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${sig.date.slice(5)}</span>`:`<span class="neg">死叉 ${sig.date.slice(5)}</span>`):'—';
+   const sigTxt=sig?(sig.type==='golden'?`<span class="pos">金叉 ${esc(sig.date.slice(5))}</span>`:`<span class="neg">死叉 ${esc(sig.date.slice(5))}</span>`):'—';
    const res=n.res==='bull'?'<span class="pos">多</span>':(n.res==='bear'?'<span class="neg">空</span>':'—');
    const rc=n.rsi>70?'neg':(n.rsi<30?'pos':'');
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}')">
-     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${x.sym}</td>
-     <td>${w.toFixed(1)}%</td><td style="color:${FIBCOL[n.state]}">${n.label}</td>
+   return `<tr style="cursor:pointer" tabindex="0" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <td class="l"><span style="color:${FIBCOL[n.state]}">●</span> ${esc(x.sym)}</td>
+     <td>${w.toFixed(1)}%</td><td style="color:${FIBCOL[n.state]}">${esc(n.label)}</td>
      <td style="color:${momColor(n.mom)}">${n.mom>0?'+':''}${n.mom}</td>
      <td class="${rc}">${n.rsi}</td><td>${sigTxt}</td><td>${res}</td>
-     <td class="l">${postureOf(n)}</td></tr>`;}).join('');
+     <td class="l">${esc(postureOf(n))}</td></tr>`;}).join('');
  return `<div class="card t1"><div class="dh"><h2 class="t">持仓信号一览<span class="t-en">Position Signals</span></h2><span class="nm">按权重排序 · 趋势 / 动能 / RSI / 最近金死叉 / 共振（点击看个股）</span></div>
    <div class="scroll"><table><thead><tr><th class="l">代码</th><th>权重</th><th>状态</th><th>${gl('mom','动能')}</th><th>${gl('rsi','RSI')}</th><th>${gl('cross','最近信号')}</th><th>${gl('res','共振')}</th><th class="l">技术姿态</th></tr></thead>
    <tbody>${rows}</tbody></table></div>
@@ -5030,53 +6289,67 @@ function behaviorCard(){
  const b=DATA.behavior;if(!b||!b.flags||!b.flags.length)return'<div class="card"><div class="note">行为分析数据不足。</div></div>';
  const LV={alert:['#E5707A','⚠ 需注意'],watch:['#E8B339','留意'],good:['#4FB286','✓ 良好'],info:['#888D96','提示']};
  const cards=b.flags.map(f=>{const c=LV[f.level]||LV.info;
-   const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip">${e}</span>`).join('')}</div>`:'';
+   const ex=(f.examples&&f.examples.length)?`<div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">${f.examples.map(e=>`<span class="chip">${esc(e)}</span>`).join('')}</div>`:'';
    return `<div class="card" style="border-left:3px solid ${c[0]}">
-     <div class="dh"><h2 class="t">${f.title}</h2><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
-     <div class="flag-head" style="margin:3px 0 6px">${f.headline}</div>
-     <div class="note" style="color:var(--txt);line-height:1.55">${f.detail}</div>${ex}
-     <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.55"><b>💡 Nudge：</b>${f.nudge}</div>
-     <div class="note" style="margin-top:6px">${f.ref}</div></div>`;}).join('');
+     <div class="dh"><h2 class="t">${esc(f.title)}</h2><span class="chip" style="color:${c[0]};border-color:${c[0]}66">${c[1]}</span></div>
+     <div class="flag-head" style="margin:3px 0 6px">${esc(f.headline)}</div>
+     <div class="note" style="color:var(--txt);line-height:1.55">${esc(f.detail)}</div>${ex}
+     <div style="margin-top:9px;padding:9px 11px;background:rgba(232,179,57,.07);border-radius:var(--r-card);line-height:1.55"><b>💡 Nudge：</b>${esc(f.nudge)}</div>
+     <div class="note" style="margin-top:6px">${esc(f.ref)}</div></div>`;}).join('');
  return `<div class="card"><div class="dh"><h2 class="t">行为决策辅助</h2><span class="nm">基于 Thaler《行为经济学：过去、现在与未来》(2016)</span></div>
    <div class="note" style="margin-top:6px;line-height:1.6">以下信号由<b>你自己的真实买卖与持仓</b>计算而来，用于发现常见的行为偏差。它们是<b>“提醒”而非投资建议</b>——目的是帮你按既定逻辑决策、少受“红/绿盘”情绪左右。</div></div>${cards}`;
 }
 function riskCard(){
  const R=DATA.risk;
  if(!R)return'<div class="card"><div class="dh"><h2 class="t">风险</h2></div><div class="note">风险数据不足（需 ≥25 个交易日）。</div></div>';
- const volCls=R.annVol>R.spAnnVol?'neg':'pos';
+ const volCls=R.spAnnVol==null?'':(R.annVol>R.spAnnVol?'neg':'pos');
  const badges=[
-  [gl('vol','年化波动率'),`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol.toFixed(1)}%</span>`],
+  [gl('vol','年化波动率'),`<span class="${volCls}">${R.annVol.toFixed(1)}%</span> <span class="note">S&P ${R.spAnnVol==null?'—':R.spAnnVol.toFixed(1)+'%'}</span>`],
   [gl('beta','Beta β (vs S&P)'),R.beta==null?'—':`<span class="${R.beta>1?'neg':'pos'}">${R.beta.toFixed(2)}</span>`],
   [gl('dd','最大回撤'),`<span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>`],
   ['当前回撤',`<span class="${cls(R.currentUnderwater)}">${R.currentUnderwater.toFixed(1)}%</span>`],
   ['收益/波动比',`${R.retVolRatio.toFixed(2)} <span class="note">(rf=0)</span>`],
  ];
+ const benchmarkNote=R.benchmarkQuality==='unavailable'?'<div role="status" class="note" style="margin-top:8px;color:var(--accent)">S&amp;P 序列不完整；本页仍显示组合波动/回撤，但 S&amp;P 波动、Beta 和对照线留空，不会用 0% 代替。</div>':'';
+ const cq=R.contribQuality||{};
  const rows=(R.contrib||[]).map(c=>{const g=c.gap,gc=g>0?'#E5707A':(g<0?'#4FB286':'var(--mut)'),w=Math.min(Math.abs(g),20)/20*50,left=g>=0?50:50-w;
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${c.sym}')">
-     <td class="l">${c.sym}</td><td>${c.weightPct.toFixed(1)}%</td><td>${c.riskPct.toFixed(1)}%</td>
+   return `<tr style="cursor:pointer" tabindex="0" data-sym="${esc(c.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <td class="l">${esc(c.sym)}</td><td>${(c.portfolioWeightPct??c.weightPct).toFixed(1)}%</td><td>${c.weightPct.toFixed(1)}%</td><td>${c.riskPct.toFixed(1)}%</td>
      <td><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${w}%;background:${gc}"></div></div></td>
      <td style="color:${gc}">${g>0?'+':''}${g.toFixed(1)}pp</td></tr>`;}).join('');
- const exNote=(R.excluded&&R.excluded.length)?`<div class="note" style="margin-top:8px">以下标的价格重叠不足 30 日，未计入风险分解：${R.excluded.join('、')}</div>`:'';
+ const exNote=(cq.status&&cq.status!=='complete')?`<div role="status" class="note" style="margin-top:8px;color:var(--accent)">风险贡献覆盖 ${cq.coverageWeightPct??0}% 股票市值，使用 ${cq.commonReturnPairs??0} 个精确共同日收益（最低 ${cq.minimumReturnPairs??29}）；低于 ${cq.minimumCoverageWeightPct??80}% 会整块停用，不会以小切片冒充全组合。${R.excluded&&R.excluded.length?` 未纳入：${esc(R.excluded.join('、'))}。`:''}</div>`:'';
  return `<div class="card">
    <div class="dh"><h2 class="t">风险<span class="t-en">Risk Ledger</span></h2><span class="nm">回撤 · 波动率 · Beta · 风险贡献（股票部分，不含现金/保证金/期权）</span></div>
-   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div></div>
+   <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}</div>${benchmarkNote}</div>
  <div class="card"><div class="cap" style="margin-bottom:4px">水下回撤曲线（相对历史高点回撤 %）</div>
    <div class="legend"><span><i class="ln" style="color:#E5707A"></i>我的组合</span><span><i class="lnd" style="color:#888D96"></i>S&P 500</span><span>0 = 创新高；越深 = 离高点越远（你真正“感受到”的亏损维度）</span></div>
    ${svgLines(R.uwSeries,[{key:'uw',color:'#E5707A',draw:1,label:'我的回撤'},{key:'spuw',color:'#888D96',dash:1,label:'S&P回撤'}],{zero:true,area:true,fmt:v=>v.toFixed(0)+'%',delta:{a:'uw',b:'spuw',label:'相对 S&P'}})}
-   <div class="note" style="margin-top:6px">最大回撤 <span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>（${R.maxDDpeak} 高点 → ${R.maxDDtrough} 低点）。</div></div>
+   <div class="note" style="margin-top:6px">最大回撤 <span class="${cls(R.maxDrawdown)}">${R.maxDrawdown.toFixed(1)}%</span>（${esc(R.maxDDpeak)} 高点 → ${esc(R.maxDDtrough)} 低点）。</div></div>
  <div class="card"><div class="cap" style="margin-bottom:4px">21 日滚动年化波动率</div>
    <div class="legend"><span><i class="ln" style="color:#E8B339"></i>我的组合</span><span><i class="lnd" style="color:#888D96"></i>S&P 500</span></div>
    ${svgLines(R.volSeries,[{key:'vol',color:'#E8B339',draw:1,label:'我的波动'},{key:'spvol',color:'#888D96',dash:1,label:'S&P波动'}],{fmt:v=>v.toFixed(0)+'%'})}
    <div class="note" style="margin-top:6px"><b>怎么读：</b>波动率衡量“颠簸幅度”，<b>不是盈亏</b>——线在 S&P 之上 = 近期比大盘更颠簸，未必是亏损。21 日滚动、窗口内小样本，<b>描述性、非预测</b>。</div></div>
  <div class="card"><div class="dh"><h2 class="t">风险贡献分解</h2><span class="nm">谁在制造组合波动 · 权重 ≠ 风险（点击看个股）</span></div>
-   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>资金权重</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该标的风险占比减资金占比；正(红)=波动放大器、负(绿)=分散器">风险−资金</th></tr></thead>
+   <div class="scroll"><table><thead><tr><th class="l">代码</th><th>全组合资金</th><th>覆盖切片资金</th><th>${gl('rc','风险贡献')}</th><th></th><th title="该标的切片内风险占比减切片内资金占比；正(红)=波动放大器、负(绿)=分散器">风险−切片资金</th></tr></thead>
    <tbody>${rows}</tbody></table></div>${exNote}
-   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把组合总波动按各持仓的边际贡献拆开（合计 100%）。<b>差额为正(红)= 该标的对波动的贡献高于其资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。高 Beta 单票常常风险占比远超资金占比。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且仅含股票（不含现金/保证金/期权，会<b>低估</b>你的真实杠杆风险）。${DATA.account?` <span class="note-lk" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key==='\ '){event.preventDefault();this.click();}" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
+   <div class="note" style="margin-top:8px"><b>怎么读：</b>“风险贡献”把<b>已覆盖股票切片</b>的总波动按边际贡献拆开（切片内合计 100%）。<b>差额为正(红)= 该标的对切片波动的贡献高于其切片资金占比</b>（隐藏的风险放大器）；<b>为负(绿)= 分散器</b>。全组合资金列不会被重标。<br>这是对<b>窗口内已实现风险</b>的描述性分解（样本有限、非预测），且不含未覆盖股票、现金、保证金或期权，会<b>低估</b>真实杠杆风险。${DATA.account?` <span class="note-lk" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key==='\ '){event.preventDefault();this.click();}" onclick="ovGo('nw')">→ 去“净值 · 全账户”看期权敞口</span>`:''}<b>非投资建议。</b></div></div>`;
 }
 /* ===== Rebalancing Planner (Thaler commitment device) ===== */
 let rebalDraft=null;
 function rebalDefault(){return{policy:'cap',cap:20,band:5,glide:'edge',setOn:null};}
-function rebalLoad(){try{const s=JSON.parse(localStorage.getItem('ptrak.rebal.v1'));if(s&&s.policy)return Object.assign(rebalDefault(),s);}catch(e){}return rebalDefault();}
+function rebalLoad(){
+ try{
+  const s=JSON.parse(localStorage.getItem('ptrak.rebal.v1'));
+  if(s&&typeof s==='object')return{
+   policy:['cap','equal','invvol'].includes(s.policy)?s.policy:'cap',
+   cap:Math.max(5,Math.min(50,Number(s.cap)||20)),
+   band:Math.max(1,Math.min(20,Number(s.band)||5)),
+   glide:['edge','center'].includes(s.glide)?s.glide:'edge',
+   setOn:/^\d{4}-\d{2}-\d{2}$/.test(String(s.setOn||''))?String(s.setOn):null,
+  };
+ }catch(e){}
+ return rebalDefault();
+}
 // User-initiated localStorage saves should NEVER silently fail — private browsing and quota-exceeded leave the trader thinking their journal/rebal rule saved when it didn't.
 function _ptrakSafeSet(k,v){try{localStorage.setItem(k,v);return true;}catch(e){return false;}}
 function _ptrakNotifySaveFailed(what){const reason=(navigator&&navigator.cookieEnabled===false)?'浏览器禁用 Cookie / 存储':(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'存储空间已满或浏览器在隐私模式':'存储空间已满');alert(what+' 未能保存 — '+reason+'。\n\n尝试：关闭隐私模式或清理浏览器存储后重试。');}
@@ -5109,7 +6382,7 @@ function rebalancePlanner(){
  const bt=(active,attrs,lbl,dis)=>`<button ${attrs} ${dis?'disabled':''} style="padding:5px 11px;border-radius:var(--r-ctl);border:1px solid ${dis?'var(--line)':(active?'#E8B339':'var(--line)')};background:${dis?'transparent':(active?'rgba(232,179,57,.12)':'transparent')};color:${dis?'#555':(active?'#E8B339':'var(--txt)')};cursor:${dis?'not-allowed':'pointer'};font-size:var(--t-sm);margin-right:6px">${lbl}</button>`;
  const pol=(k,lbl,dis)=>bt(rule.policy===k,`data-reb="pol" data-v="${k}"`,lbl,dis);
  const gl=(k,lbl)=>bt(rule.glide===k,`data-reb="glide" data-v="${k}"`,lbl,false);
- const stamp=rule.setOn?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">规则设定于 ${rule.setOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">建议默认 · 未保存</span>`;
+ const stamp=rule.setOn?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">规则设定于 ${esc(rule.setOn)}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">建议默认 · 未保存</span>`;
  const row=(lbl,body)=>`<div style="display:flex;align-items:center;gap:10px;margin:9px 0;flex-wrap:wrap"><span style="color:var(--mut);min-width:78px;font-size:var(--t-sm)">${lbl}</span>${body}</div>`;
  const controls=`<div class="card">
    <div class="dh"><h2 class="t">再平衡计划</h2><span class="nm">现在冷静时定下规则，之后由面板替你执行（Thaler 的 planner / doer 两个自我）</span></div>
@@ -5123,7 +6396,7 @@ function rebalancePlanner(){
 }
 function rebalOutput(rule,uni,volMap){
  const tt=rebalTargets(rule,uni,volMap);
- if(tt.disabled||!tt.t)return `<div class="card"><div class="note">${tt.note||'目标不可用'}。请改选其它策略。</div></div>`;
+ if(tt.disabled||!tt.t)return `<div class="card"><div class="note">${esc(tt.note||'目标不可用')}。请改选其它策略。</div></div>`;
  const MV=uni.MV,band=rule.band;
  const rows=uni.u.map((x,i)=>{const t=tt.t[i],lo=Math.max(0,t-band),hi=t+band,inB=x.w>=lo-1e-9&&x.w<=hi+1e-9,drift=x.w-t;
    let tw=t;if(!inB)tw=rule.glide==='center'?t:(x.w>hi?hi:lo);
@@ -5137,19 +6410,19 @@ function rebalOutput(rule,uni,volMap){
  const top5n=wn.slice(0,5).reduce((a,b)=>a+b,0),top5t=tn.slice().sort((a,b)=>b-a).slice(0,5).reduce((a,b)=>a+b,0);
  let banner;
  if(!out.length)banner=`<div class="card" style="border-left:3px solid #4FB286"><div class="flag-head" style="color:#4FB286;margin:0 0 2px">✓ 全部在区间内 · 无需操作</div><div class="note" style="margin-top:4px">在带内什么都不做，才是纪律所在——也直接对冲你的高换手。这是纪律的胜利。</div></div>`;
- else banner=`<div class="card" style="border-left:3px solid #E5707A"><div class="flag-head" style="color:#E5707A;margin:0 0 2px">你预先设定的规则触发了：${out.length} 只标的越界</div><div class="note" style="margin-top:4px">这不是“市场动了快行动”，而是你冷静时定下的 ±${band}pp 带宽到点了。${tt.note?'<br>'+tt.note:''}</div></div>`;
- const badges=[['最大持仓',`${top.sym} ${top.w.toFixed(0)}% → ${topT.toFixed(0)}%`],['前五合计',`${top5n.toFixed(0)}% → ${top5t.toFixed(0)}%`],
+ else banner=`<div class="card" style="border-left:3px solid #E5707A"><div class="flag-head" style="color:#E5707A;margin:0 0 2px">你预先设定的规则触发了：${out.length} 只标的越界</div><div class="note" style="margin-top:4px">这不是“市场动了快行动”，而是你冷静时定下的 ±${band}pp 带宽到点了。${tt.note?'<br>'+esc(tt.note):''}</div></div>`;
+ const badges=[['最大持仓',`${esc(top.sym)} ${top.w.toFixed(0)}% → ${topT.toFixed(0)}%`],['前五合计',`${top5n.toFixed(0)}% → ${top5t.toFixed(0)}%`],
    ['HHI 集中度',`${hhi(wn).toFixed(2)} → ${hhi(tn).toFixed(2)}`],['越界标的',`${out.length} / ${rows.length}`],['双向成交额',`≈ ${fmt(sells+buys)}`]];
  const barRow=r=>{const c=r.inB?'#888D96':'#E8B339',wd=Math.min(Math.abs(r.drift),20)/20*50,left=r.drift>=0?50:50-wd;
-   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${r.sym}')">
-     <span class="fsym">${r.sym}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
+   return `<div class="frow" style="cursor:pointer" tabindex="0" role="button" data-sym="${esc(r.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <span class="fsym">${esc(r.sym)}</span><div class="fbar"><div class="z"></div><div class="p" style="left:${left}%;width:${wd}%;background:${c}"></div></div>
      <span class="fval" style="color:${c}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</span><span class="fst">${r.inB?'区间内':(r.drift>0?'超配':'低配')}</span></div>`;};
  const inRows=rows.filter(r=>r.inB);
  const bars=rows.filter(r=>!r.inB).map(barRow).join('')
    +(inRows.length?`<details style="margin-top:6px"><summary>其余 ${inRows.length} 只在容差内 — 什么都不做才是纪律</summary><div style="margin-top:6px">${inRows.map(barRow).join('')}</div></details>`:'');
  const arows=out.map(r=>{const sh=r.sh==null?'<span class="note">缺价</span>':((r.d$<0?'−':'+')+Math.abs(r.sh)+'股'),edge=rule.glide==='center'?'目标':(r.drift>0?'上沿':'下沿');
-   return `<tr style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${r.sym}')">
-     <td class="l">${r.sym}</td><td>${r.w.toFixed(1)}%</td><td>${r.lo.toFixed(0)}–${(r.t+band).toFixed(0)}%</td>
+   return `<tr style="cursor:pointer" tabindex="0" data-sym="${esc(r.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym)">
+     <td class="l">${esc(r.sym)}</td><td>${r.w.toFixed(1)}%</td><td>${r.lo.toFixed(0)}–${(r.t+band).toFixed(0)}%</td>
      <td style="color:${r.inB?'#888D96':'#E8B339'}">${r.drift>0?'+':''}${r.drift.toFixed(1)}</td>
      <td class="l">${sh} <span class="note">(${fmt(Math.abs(r.d$))})</span> 拉回${edge}</td></tr>`;}).join('');
  const actionTable=out.length?`<div class="card"><div class="dh"><h2 class="t">动作清单</h2><span class="nm">仅越界标的 · 你的规则触发</span></div>
@@ -5172,7 +6445,7 @@ let journalState=null, journalDraft=null;
 const journalDrafts={};   // per-symbol draft cache: navigating between stocks preserves in-progress edits
 const J_DESTRUCT=['FOMO追高','报复','无聊'], J_CONSTRUCT=['冷静','坚定','纪律'];
 const jToday=()=>new Date().toISOString().slice(0,10);
-const jesc=s=>(s||'').replace(/</g,'&lt;');
+const jesc=s=>esc(s||'');
 function journalLoad(){if(journalState)return journalState;try{const s=JSON.parse(localStorage.getItem('ptrak.journal.v1'));if(s&&s.entries&&typeof s.entries==='object'){journalState={v:1,entries:s.entries};return journalState;}}catch(e){}journalState={v:1,entries:{}};return journalState;}
 function journalEntry(sym){return journalLoad().entries[sym]||null;}
 function journalSaveEntry(sym,e){const st=journalLoad();e.updatedAt=jToday();st.entries[sym]=Object.assign({},st.entries[sym],e);journalState=st;if(!_ptrakSafeSet('ptrak.journal.v1',JSON.stringify(st)))_ptrakNotifySaveFailed('交易日志「'+sym+'」');}
@@ -5241,7 +6514,7 @@ function unjournaledWorklist(){
  const held=stocks.filter(x=>x.held).sort((a,b)=>b.value-a.value);
  const todo=held.filter(x=>!J[x.sym]);
  if(!todo.length)return `<div class="card"><div class="dh"><h2 class="t">待写日志</h2></div><div class="note">✓ 所有持仓都已写下论点。保持下去。</div></div>`;
- const rows=todo.map(x=>`<div class="frow jwork" data-jsym="${x.sym}" style="cursor:pointer"><span class="fsym">${x.sym}</span><div class="fbar"><div class="p" style="left:0;width:${Math.min(x.value/mv*100,100)}%;background:#E8B339"></div></div><span class="fval">${(x.value/mv*100).toFixed(1)}%</span><span class="fst" style="width:auto;min-width:80px;text-align:right">${fmt(x.value)}</span></div>`).join('');
+ const rows=todo.map(x=>`<div class="frow jwork" data-jsym="${esc(x.sym)}" style="cursor:pointer" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"><span class="fsym">${esc(x.sym)}</span><div class="fbar"><div class="p" style="left:0;width:${Math.min(x.value/mv*100,100)}%;background:#E8B339"></div></div><span class="fval">${(x.value/mv*100).toFixed(1)}%</span><span class="fst" style="width:auto;min-width:80px;text-align:right">${fmt(x.value)}</span></div>`).join('');
  return `<div class="card"><div class="dh"><h2 class="t">待写日志 · ${todo.length} 只</h2><span class="nm">按权重排序（点开写论点）</span></div>${rows}
    <div class="note" style="margin-top:8px">先给这些持仓写下论点，最能提高你的日志覆盖率。</div></div>`;
 }
@@ -5252,7 +6525,7 @@ function weeklyReview(){
    ['最大回撤',DATA.risk?(DATA.risk.maxDrawdown.toFixed(1)+'%'):'—'],['行为缺口',S.behaviorGap==null?'—':((S.behaviorGap>0?'+':'')+S.behaviorGap.toFixed(2)+'pp '+(S.behaviorGap>0?'(择时拖累)':(S.behaviorGap<0?'(择时帮忙)':'(中性)')))],
    ['最大持仓',topH?topH.sym+' '+(topH.value/mv*100).toFixed(0)+'%':'—'],['本周日志覆盖',cov+'/'+heldN]];
  const ta=(id,lbl,v)=>`<div style="margin:8px 0 2px;font-size:var(--t-sm);color:var(--mut)">${lbl}</div><textarea id="${id}" rows="2" aria-label="${lbl}" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:var(--t-sm);resize:vertical">${jesc(v)}</textarea>`;
- const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">本周复盘 · 保存于 ${r.savedOn}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">本周尚未复盘</span>`;
+ const stamp=r.savedOn?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">本周复盘 · 保存于 ${esc(r.savedOn)}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">本周尚未复盘</span>`;
  return `<div class="card t1"><div class="dh"><h2 class="t">每周复盘<span class="t-en">Trade Journal</span> · ${wk}</h2><span class="nm">把复盘做成每周默认动作</span> ${stamp}</div>
    <div class="badges">${facts.map(f=>`<div class="badge"><div class="l">${f[0]}</div><div class="v">${f[1]}</div></div>`).join('')}</div>
    <div class="note" style="margin:6px 0">事实由面板自动带入——你无法事后改写，只能据此反思。</div>
@@ -5266,7 +6539,7 @@ function thesisCheckpointCard(){
    let rail='var(--line)',tag='<span class="chip">区间内</span>',msg='现价仍在你写下的失效价与目标价之间。';
    if(e.planStop!=null&&p<=e.planStop){rail='var(--red)';tag='<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red)">失效触及</span>';msg=`现价 ${fmt(p)} ≤ 你写下的失效价 ${fmt(e.planStop)} —— 论点已被你自己的规则证伪，去复盘是否离场。`;}
    else if(e.planTarget!=null&&p>=e.planTarget){rail='var(--accent)';tag='<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">目标触及</span>';msg=`现价 ${fmt(p)} ≥ 你写下的目标价 ${fmt(e.planTarget)} —— 按计划兑现，还是上移止盈？`;}
-   return `<div class="frow" style="cursor:pointer;border-left:3px solid ${rail};padding-left:9px" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${x.sym}','journal')"><span class="fsym" style="width:auto;min-width:120px">${x.sym} ${tag}</span><span class="note" style="flex:1">${msg}</span></div>`;}).join('');
+   return `<div class="frow" style="cursor:pointer;border-left:3px solid ${rail};padding-left:9px" tabindex="0" role="button" data-sym="${esc(x.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'journal')"><span class="fsym" style="width:auto;min-width:120px">${esc(x.sym)} ${tag}</span><span class="note" style="flex:1">${msg}</span></div>`;}).join('');
  return `<div class="card"><div class="dh"><h2 class="t">论点检查点</h2><span class="nm">现价 vs 你写下的失效 / 目标价 —— 让离场由你冷静时的规则触发，而非价格噪音</span></div>${rows}
    <div class="note" style="margin-top:8px">仅对照你在“日志”里写下的计划价，纯描述、不预测；触及不等于必须操作。<b>非投资建议。</b></div></div>`;
 }
@@ -5287,12 +6560,12 @@ function positionJournalEditor(s){
  const d=journalDraft;
  const chip=(field,val,active)=>`<button data-jf="${field}" data-jv="${val}" aria-pressed="${active?'true':'false'}" style="padding:5px 11px;border-radius:var(--r-ctl);border:1px solid ${active?'#E8B339':'var(--line)'};background:${active?'rgba(232,179,57,.12)':'transparent'};color:${active?'#E8B339':'var(--txt)'};cursor:pointer;font-size:var(--t-sm);margin:0 6px 6px 0">${val}</button>`;
  const row=(lbl,body)=>`<div style="margin:9px 0"><div style="font-size:var(--t-sm);color:var(--mut);margin-bottom:5px">${lbl}</div>${body}</div>`;
- const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${v==null?'':v}" placeholder="${ph}" aria-label="${ph}" style="width:90px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-right:8px">`;
+ const num=(id,v,ph)=>`<input id="${id}" type="number" step="any" value="${esc(v==null?'':String(v))}" placeholder="${esc(ph)}" aria-label="${esc(ph)}" style="width:90px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-right:8px">`;
  const ck=(d.adherence==='计划外'&&((DATA.behavior&&DATA.behavior.biasBySym&&DATA.behavior.biasBySym[s.sym])||[]).some(b=>b.id==='disposition'))?`<div class="note" style="margin:6px 0;color:#E5707A">⚠ 处置效应 + 计划外卖出 = 信号叠加，值得复盘。</div>`:'';
  const ck2=(d.conviction>=4&&d.planStop==null)?`<div class="note" style="margin:6px 0;color:#E8B339">⚠ 高信念却未设失效条件（“看到再说”反模式）。</div>`:'';
- const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">上次更新 ${d.updatedAt}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">尚未记录 · 未保存</span>`;
+ const stamp=d.updatedAt?`<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green)">上次更新 ${esc(d.updatedAt)}</span>`:`<span class="chip" style="color:#E8B339;border-color:var(--chip-bd-amber)">尚未记录 · 未保存</span>`;
  return `<div class="card">
-   <div class="dh"><h2 class="t">交易日志 · ${s.sym}</h2><span class="nm">大多是点选，目标 &lt; 1 分钟</span> ${stamp}</div>
+   <div class="dh"><h2 class="t">交易日志 · ${esc(s.sym)}</h2><span class="nm">大多是点选，目标 &lt; 1 分钟</span> ${stamp}</div>
    ${row('论点（为什么买/持有）',`<textarea id="jThesis" rows="2" aria-label="论点（为什么买/持有）" style="width:100%;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-family:var(--f-ui);font-size:var(--t-sm);resize:vertical" placeholder="买入时就写下卖出条件，让卖出由逻辑驱动、而非红绿驱动">${jesc(d.thesis)}</textarea>`)}
    ${row('计划（入场 · 目标 · 止损/失效）',num('jEntry',d.planEntry,'入场')+num('jTarget',d.planTarget,'目标')+num('jStop',d.planStop,'止损/失效'))}
    ${row('计划仓位（占组合）',['≤2%','2–5%','5–10%','＞10%'].map(v=>chip('size',v,d.size===v)).join(''))}
@@ -5315,7 +6588,8 @@ function wireJournalEditor(s){const seg=document.querySelector('.seg[data-seg="j
 function rerenderJournalEditor(s){const seg=document.querySelector('.seg[data-seg="journal"]');if(seg){seg.innerHTML=positionJournalEditor(s);wireJournalEditor(s);}}
 // Recompute the EMA/momentum/RSI/state ribbons from s.prices on first use (memoized).
 // MIRRORS Python compute_fib exactly: same EMA seeding (first value), Wilder RSI with
-// first-14 backfill, mom=100*tanh(sep/0.06) rounded to 0.1, state from UNROUNDED EMAs.
+// neutral/non-predictive first-14 warm-up, mom=100*tanh(sep/0.06) rounded to 0.1,
+// state from UNROUNDED EMAs.
 // The payload no longer ships these arrays (~40% of the old JSON); signals/resonance/now
 // still come from Python and remain the source of truth for headline numbers.
 const _fibMemo={};
@@ -5329,9 +6603,9 @@ function fibArrays(s){
   const d=[];for(let i=1;i<L;i++)d.push(px[i]-px[i-1]);
   let ag=0,al=0;for(let i=0;i<N;i++){if(d[i]>0)ag+=d[i];if(d[i]<0)al-=d[i];}
   ag/=N;al/=N;
-  let rs=al>0?ag/al:999;rsi[N]=100-100/(1+rs);
-  for(let i=N+1;i<L;i++){const x=d[i-1];ag=(ag*(N-1)+Math.max(x,0))/N;al=(al*(N-1)+Math.max(-x,0))/N;rs=al>0?ag/al:999;rsi[i]=100-100/(1+rs);}
-  for(let i=0;i<N;i++)rsi[i]=rsi[N];
+  const rv=()=>al===0?(ag===0?50:100):(ag===0?0:100-100/(1+ag/al));
+  rsi[N]=rv();
+  for(let i=N+1;i<L;i++){const x=d[i-1];ag=(ag*(N-1)+Math.max(x,0))/N;al=(al*(N-1)+Math.max(-x,0))/N;rsi[i]=rv();}
  }
  const mom=[],state=[];
  for(let i=0;i<L;i++){
@@ -5399,10 +6673,10 @@ function renderFib(s){
  const resChip=n.res==='bull'?'<span class="chip" style="color:#4FB286;border-color:var(--chip-bd-green);background:rgba(79,178,134,.1)">⚡ 多头共振</span>'
    :(n.res==='bear'?'<span class="chip" style="color:#E5707A;border-color:var(--chip-bd-red);background:rgba(229,112,122,.1)">⚡ 空头共振</span>':'');
  const badges=[
-  ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${n.label}`],
+  ['斐波那契状态',`<span style="color:${FIBCOL[n.state]}">●</span> ${esc(n.label)}`],
   [gl('mom','动能强弱'),`<span style="color:${sc}">${n.mom>0?'+':''}${n.mom}</span> <span class="note">/100</span>`],
   [gl('rsi','RSI(14)'),`<span style="color:${rsiCol}">${n.rsi}</span>`],
-  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${lastSig.date}</span>`:`<span class="neg">死叉 ${lastSig.date}</span>`):'—'],
+  ['最近信号',lastSig?(lastSig.type==='golden'?`<span class="pos">金叉 ${esc(lastSig.date)}</span>`:`<span class="neg">死叉 ${esc(lastSig.date)}</span>`):'—'],
   [gl('res','多指标共振'),n.res==='bull'?'<span class="pos">多头共振中</span>':(n.res==='bear'?'<span class="neg">空头共振中</span>':'无')],
  ];
  return `<div class="card">
@@ -5435,9 +6709,10 @@ function renderDetail(){
  const badges=[['当前持股',s.held?fmtN(s.shares)+' 股':'已清仓'],['平均成本',s.held?fmt(s.avg):'—'],
   ['现价',fmt(s.curPrice)],['市值',s.held?fmt(s.value):'—'],
   ['未实现盈亏',s.held?`<span class="${cls(s.unreal)}">${fmt(s.unreal)} (${pct(s.unrealPct)})</span>`:'—'],
-  ['已实现盈亏(窗口)',`<span class="${cls(s.realized)}">${fmt(s.realized)}</span>`]];
+  ['已实现盈亏(窗口) '+qualityChip(s.realizedConfidence,s.realizedConfidence||'待核'),`<span class="${cls(s.realized)}">${fmt(s.realized)}</span>`]];
+ const realizedQuality=`<div class="note" style="margin:8px 0 10px;padding:8px 10px;background:var(--bg2);border-left:3px solid ${s.realizedConfidence==='low'?'var(--red)':'var(--accent)'};line-height:1.65"><b>已实现 P&amp;L 口径：${esc(s.realizedConfidence||'未提供')}</b> · ${esc(s.realizedBasisScope||'平均成本重建')}。${(s.realizedWarnings||[]).length?`<br>复核：${(s.realizedWarnings||[]).map(esc).join('；')}`:' 仍为模型化平均成本，不等于券商选定的税务 lot P&amp;L。'}</div>`;
  const rows=s.txns.map(t=>{const tag=t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">期初底仓</span>');
-   return `<tr><td class="l">${t.date}</td><td class="l">${tag}</td><td>${fmtN(t.qty,0)}</td><td>${fmt(t.price)}</td>
+   return `<tr><td class="l">${esc(t.date)}</td><td class="l">${tag}</td><td>${fmtN(t.qty,0)}</td><td>${fmt(t.price)}</td>
     <td>${fmt(t.amount)}</td><td>${fmtN(t.pos,0)}</td><td>${t.avg?fmt(t.avg):'—'}</td>
     <td class="${cls(t.realized)}">${t.realized==null?'—':fmt(t.realized)}</td></tr>`;}).join('');
  document.getElementById('right').innerHTML=`
@@ -5445,10 +6720,10 @@ function renderDetail(){
  <nav aria-label="个股分页" class="seg-rail-wrap"><div class="seg-rail"><button class="on" data-seg="price" title="价格曲线与你的买卖点">价格 · 操作</button><button data-seg="fin" title="FMP 财务质量、财报记录、下一财报风险与市场行为">财务状态</button><button data-seg="tx" title="逐笔交易明细">交易明细</button><button data-seg="fib" title="这只股票的斐波那契动能">斐波那契</button><button data-seg="journal" title="给这只持仓写下论点、计划与情绪（目标 <1 分钟）">日志</button></div></nav>
  <div class="seg segin" data-seg="price">
  <div class="card">
-   <div class="dh"><h2 class="t">${s.sym}</h2><span class="nm">${s.name}</span>
+   <div class="dh"><h2 class="t">${esc(s.sym)}</h2><span class="nm">${esc(s.name)}</span>
      ${s.hasLegacy?'<span class="legacychip">含 '+D0+' 前旧底仓 · 成本按当日市价估算</span>':''}
      ${(()=>{const j=journalEntry(s.sym);if(!s.held)return '';
-       return j?`<span class="chip" style="cursor:pointer;color:var(--mut);border-color:var(--line)" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${s.sym}','journal')" title="上次更新：${j.updatedAt||'—'}">📝 已记录</span>`:`<span class="chip" style="cursor:pointer;color:var(--amber-line);border-color:var(--chip-bd-amber)" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo('${s.sym}','journal')" title="给这只持仓写下论点与计划 · 目标 <1 分钟">📝 未记录论点 · 写入</span>`;
+       return j?`<span class="chip" style="cursor:pointer;color:var(--mut);border-color:var(--line)" role="button" tabindex="0" data-sym="${esc(s.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'journal')" title="上次更新：${esc(j.updatedAt||'—')}">📝 已记录</span>`:`<span class="chip" style="cursor:pointer;color:var(--amber-line);border-color:var(--chip-bd-amber)" role="button" tabindex="0" data-sym="${esc(s.sym)}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" onclick="stockGo(this.dataset.sym,'journal')" title="给这只持仓写下论点与计划 · 目标 <1 分钟">📝 未记录论点 · 写入</span>`;
      })()}</div>
    <div class="badges">${badges.map(b=>`<div class="badge"><div class="l">${b[0]}</div><div class="v">${b[1]}</div></div>`).join('')}${financialMiniBadge(s.sym)}${marketMassStockBadge(s.sym)}</div>
    <div class="legend"><span><i class="ln" style="color:#8A8F98"></i>市场价格(Yahoo)</span><span><i class="lnd" style="color:#B89030"></i>持仓平均成本</span>
@@ -5459,6 +6734,7 @@ function renderDetail(){
  <div class="seg" data-seg="fin" hidden>`+financialStockDetailCard(s)+`</div>
  <div class="seg" data-seg="tx" hidden>
  <div class="card"><div class="dh"><h2 class="t">交易明细</h2><span class="nm">${s.numTrades} 笔交易${s.hasLegacy?' · 另含期初底仓 1 行':''}</span></div>
+   ${realizedQuality}
    <div class="scroll"><table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>数量</th><th>成交价</th><th>金额</th><th>持仓后</th><th>均价后</th><th>已实现</th></tr></thead>
    <tbody>${rows}</tbody></table></div></div>
  </div>
@@ -5468,9 +6744,9 @@ function renderDetail(){
 }
 function segWire(){const r=document.getElementById('right');
  r.querySelectorAll('.seg-rail,.ws-rail').forEach(rail=>rail.setAttribute('role','tablist'));
- r.querySelectorAll('.ws-rail button[data-ws]').forEach(b=>{b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');});
+ r.querySelectorAll('.ws-rail button[data-ws]').forEach(b=>{const on=b.classList.contains('on');b.setAttribute('role','tab');b.setAttribute('aria-selected',on?'true':'false');b.tabIndex=on?0:-1;});
  r.querySelectorAll('.seg-rail button').forEach(b=>{
-  b.setAttribute('role','tab');b.setAttribute('aria-selected',b.classList.contains('on')?'true':'false');
+  const on=b.classList.contains('on');b.setAttribute('role','tab');b.setAttribute('aria-selected',on?'true':'false');b.tabIndex=on?0:-1;
   {const sg=b.dataset.seg,panel=r.querySelector('.seg[data-seg="'+sg+'"]');if(panel){const tid='segtab-'+sg,pid='segpanel-'+sg;b.id=tid;b.setAttribute('aria-controls',pid);panel.id=pid;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',tid);if(!panel.hasAttribute('tabindex'))panel.setAttribute('tabindex','0');}}
   b.onclick=()=>activateSeg(b.dataset.seg,{push:true});});}
 function restoreSeg(ctx){if(routeApplying)return;try{var want=localStorage.getItem('ptrak.seg.'+ctx);if(want)activateSeg(want,{push:false});}catch(e){}}
@@ -5478,7 +6754,7 @@ function onboardStrip(){let done=false;try{done=localStorage.getItem('ptrak.onbo
  const j=(seg,t)=>`<span class="ib-lk" role="button" tabindex="0" style="margin-left:0" onclick="ovGo('${seg}')">${t}</span>`;
  return `<div id="onboard" class="note" style="margin-bottom:14px;padding:10px 13px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-card);line-height:1.7">
    <b style="color:var(--accent)">从这里开始</b> · 想知道我赚了多少 → ${j('score','决策一览')} / ${j('nw','净值')}　|　财务/财报 → ${j('fin','财务状态')}　|　AI/半导体框架 → ${j('aisemi','AI半导体')}　|　QQQ/TQQQ 节奏 → ${j('qt','策略台')}　|　钱和风险集中在哪 → ${j('struct','结构')} / ${j('risk','风险')}　|　该不该调仓 → ${j('beh','行为决策')} / ${j('rebal','再平衡计划')}
-   <span role="button" tabindex="0" style="float:right;cursor:pointer;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var _o=document.getElementById('onboard-slot');if(_o)_o.innerHTML=onboardStrip()">不再显示 ✕</span></div>`;}
+   <button type="button" class="microbtn" style="float:right;color:var(--mut)" onclick="try{localStorage.setItem('ptrak.onboard.v1','done')}catch(e){};var _o=document.getElementById('onboard-slot');if(_o)_o.innerHTML=onboardStrip()">不再显示 ✕</button></div>`;}
 /* ===== plain-language glossary: hover/tap any .gl term -> reuse the #tt tooltip ===== */
 const GLOSS={
  thesisCov:'论点覆盖率：写了买入逻辑的持仓 ÷ 全部持仓。没论点的仓位无法事后复盘，会拉低成熟度评分。',
@@ -5498,11 +6774,11 @@ const GLOSS={
  beta:'Beta：相对大盘(S&P)的波动倍数，>1 比大盘更猛、<1 更稳。窗口内日收益小样本估计，区间窄时不稳定、非预测。',
  dd:'回撤：相对历史最高点跌了多少（描述风险，不预测未来）。',
  vol:'年化波动率：日收益标准差×√252（颠簸幅度，非盈亏）。这里红=高于S&P（更颠簸），绿=低于S&P（更稳）；红≠亏损。',
- rc:'风险贡献：组合总波动按各持仓边际贡献拆开（合计100%），不等于资金权重。',
+ rc:'风险贡献：已覆盖股票切片的总波动按边际贡献拆开（切片内合计100%）；覆盖率不足80%则不发布。',
  mom:'动能：EMA5 相对 EMA21 的偏离度，±100 封顶，正=多头、负=空头。',
  rsi:'RSI(14)：0–100 的强弱摆动，>70 偏超买、<30 偏超卖（技术参考）。',
  cross:'金叉 / 死叉：快线 EMA5 上穿 / 下穿 EMA13，比传统 50 / 200 日更灵敏。',
- attn:'关注度：四类红色信号的计数，是默认排序键，不是评分也不是买卖建议。',
+ attn:'关注度：与页顶共用的去重警报账本在该标的上的条目数，并按严重度排序。不是买卖评分。',
  res:'共振：趋势排列 + 近3日金 / 死叉 + RSI 未极端 三者同向，确信度更高的技术信号。',
  atr:'ATR(14)：平均真实波幅，衡量近 14 日每天大约波动多少美元，用来把 EMA 变成价格作战带（技术参考）。',
  ema:'EMA：指数移动平均，越近的价格权重越大；EMA8 / 21 / 55 的排列用来判断趋势方向（技术参考）。',
@@ -5551,15 +6827,18 @@ function bindMarkers(){
      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY+14)+'px';
      const side=t.side==='BUY'?'买入':(t.side==='SELL'?'卖出':'期初底仓');
      if(ts.length===1){
-       tt.innerHTML=`<b>${m.dataset.sym} · ${side}</b><br>${t.date}<br>数量 ${fmtN(t.qty,0)} @ ${fmt(t.price)}<br>金额 ${fmt(t.amount)}${t.realized!=null?'<br>已实现 <span class="'+cls(t.realized)+'">'+fmt(t.realized)+'</span>':''}`;
+       tt.innerHTML=`<b>${esc(m.dataset.sym)} · ${side}</b><br>${esc(t.date)}<br>数量 ${fmtN(t.qty,0)} @ ${fmt(t.price)}<br>金额 ${fmt(t.amount)}${t.realized!=null?'<br>已实现 <span class="'+cls(t.realized)+'">'+fmt(t.realized)+'</span>':''}`;
      }else{   // merged same-day same-side marker: summary line + the individual legs
        const qty=ts.reduce((a,x)=>a+(x.qty||0),0),amt=ts.reduce((a,x)=>a+(x.amount||0),0);
        const wp=qty?ts.reduce((a,x)=>a+(x.price||0)*(x.qty||0),0)/qty:t.price;
-       const legs=ts.slice(0,4).map(x=>`${x.date.slice(5)} · ${fmtN(x.qty,0)} @ ${fmt(x.price)}`).join('<br>')+(ts.length>4?`<br>… 共 ${ts.length} 笔`:'');
+       const legs=ts.slice(0,4).map(x=>`${esc(x.date.slice(5))} · ${fmtN(x.qty,0)} @ ${fmt(x.price)}`).join('<br>')+(ts.length>4?`<br>… 共 ${ts.length} 笔`:'');
        const dr=ts[0].date===ts[ts.length-1].date?t.date:`${ts[0].date} → ${ts[ts.length-1].date.slice(5)}`;
-       tt.innerHTML=`<b>${m.dataset.sym} · ${side} ×${ts.length}</b><br>${dr}<br>合计 ${fmtN(qty,0)} @ 均价 ${fmt(wp)}<br>金额 ${fmt(amt)}<br><span class="note">${legs}</span>`;
+       tt.innerHTML=`<b>${esc(m.dataset.sym)} · ${side} ×${ts.length}</b><br>${esc(dr)}<br>合计 ${fmtN(qty,0)} @ 均价 ${fmt(wp)}<br>金额 ${fmt(amt)}<br><span class="note">${legs}</span>`;
      }};
    m.onmouseleave=()=>tt.style.display='none';
+   m.onfocus=()=>{const r=m.getBoundingClientRect();m.onmousemove({clientX:r.left+r.width/2,clientY:r.top+r.height/2});};
+   m.onblur=()=>{if(!window.__ttPinned)tt.style.display='none';};
+   m.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();m.onfocus();}else if(e.key==='Escape'){tt.style.display='none';m.blur();}};
    m.ontouchstart=e=>{if(e.touches&&e.touches.length>1)return;const p=e.touches&&e.touches[0];if(!p)return;e.stopPropagation();e.preventDefault();m.onmousemove({clientX:p.clientX,clientY:p.clientY});};});   // multi-touch → defer to native pinch-zoom; single-touch shows the trade-marker tooltip
  if(!window.__mkTouchWired){window.__mkTouchWired=1;document.addEventListener('touchstart',ev=>{if(!(ev.target.classList&&ev.target.classList.contains('mk'))&&!(ev.target.closest&&ev.target.closest('svg.xh')))tt.style.display='none';},{passive:true});}
 }
@@ -5614,8 +6893,8 @@ function bindCharts(){
 }
 function renderOptions(){   // reference foldCard (default-closed), rendered ONLY inside the 净值 seg — was a ~900px coda appended to all 11 tabs
  if(!DATA.options.length)return'';
- const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${t.date}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">到期/行权</span>')}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.amount)}</td></tr>`).join('');
-   return `<details><summary>${o.sym} · 净现金流 <span class="${cls(o.net)}">${fmt(o.net)}</span></summary>
+ const rows=DATA.options.map(o=>{const tr=o.txns.map(t=>`<tr><td class="l">${esc(t.date)}</td><td class="l">${t.side==='BUY'?'<span class="tag b">买入</span>':(t.side==='SELL'?'<span class="tag s">卖出</span>':'<span class="tag o">到期/行权</span>')}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.amount)}</td></tr>`).join('');
+   return `<details><summary>${esc(o.sym)} · 净现金流 <span class="${cls(o.net)}">${fmt(o.net)}</span></summary>
      <table><thead><tr><th class="l">日期</th><th class="l">动作</th><th>合约</th><th>权利金</th><th>金额</th></tr></thead><tbody>${tr}</tbody></table></details>`;}).join('');
  return foldCard('期权交易',`净现金流合计 <span class="${cls(S.optNet)}">${fmt(S.optNet)}</span> · ${DATA.options.length} 个合约逐笔`,rows);
 }
@@ -5666,7 +6945,7 @@ function rememberList(){try{localStorage.setItem('ptrak.list.v1',JSON.stringify(
 function syncListUI(){   // mirror restored state into the visible controls when the URL/storage rehydrates filter/q/sortKey
  try{const si=document.getElementById('search');if(si&&si.value!==q)si.value=q;
    const so=document.getElementById('sort');if(so&&so.value!==sortKey)so.value=sortKey;
-   document.querySelectorAll('.tabs button').forEach(b=>{const on=b.dataset.f===filter; b.classList.toggle('on',on); b.setAttribute('aria-selected',on?'true':'false');});
+   document.querySelectorAll('.tabs button').forEach(b=>{const on=b.dataset.f===filter; b.classList.toggle('on',on); b.setAttribute('aria-selected',on?'true':'false');b.tabIndex=on?0:-1;});
  }catch(e){}
 }
 document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().trim();
@@ -5676,7 +6955,7 @@ document.getElementById('search').oninput=e=>{q=e.target.value.toLowerCase().tri
 document.getElementById('search').addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(__searchT);renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'search',q});}});
 document.getElementById('sort').onchange=e=>{sortKey=e.target.value;renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'sort',s:sortKey});};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
- document.querySelectorAll('.tabs button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');});
+ document.querySelectorAll('.tabs button').forEach(x=>{const on=x===b;x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');x.tabIndex=on?0:-1;});
  filter=b.dataset.f;renderHoldingsList();rememberList();writeRoute(sel,activeSeg(),true);_tmLog({type:'filter',f:filter});});
 function _inTypingField(el){if(!el)return false;const tag=(el.tagName||'').toLowerCase();return tag==='input'||tag==='textarea'||el.isContentEditable;}
 document.addEventListener('keydown',e=>{
@@ -5690,10 +6969,10 @@ document.addEventListener('keydown',e=>{
    if(sel!=='__OV__')goBack();
    return;
  }
- if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&a&&a.parentElement&&a.parentElement.classList&&(a.parentElement.classList.contains('seg-rail')||a.parentElement.classList.contains('ws-rail')||a.parentElement.classList.contains('tabs'))){
-   let sib=e.key==='ArrowRight'?a.nextElementSibling:a.previousElementSibling;
-   while(sib&&(sib.tagName!=='BUTTON'||sib.hidden))sib=e.key==='ArrowRight'?sib.nextElementSibling:sib.previousElementSibling;   // skip .rail-here span + segs hidden by the inactive workspace
-   if(sib){const _ws=sib.dataset&&sib.dataset.ws;sib.click();if(_ws){const _nb=document.querySelector('.ws-rail button[data-ws="'+_ws+'"]');if(_nb)_nb.focus();else sib.focus();}else sib.focus();e.preventDefault();}return;}
+ if((e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='Home'||e.key==='End')&&a&&a.parentElement&&a.parentElement.classList&&(a.parentElement.classList.contains('seg-rail')||a.parentElement.classList.contains('ws-rail')||a.parentElement.classList.contains('tabs'))){
+   const bs=[...a.parentElement.querySelectorAll('button')].filter(x=>!x.hidden),i=Math.max(0,bs.indexOf(a));let ni=i;
+   if(e.key==='ArrowRight')ni=(i+1)%bs.length;else if(e.key==='ArrowLeft')ni=(i-1+bs.length)%bs.length;else if(e.key==='Home')ni=0;else ni=bs.length-1;
+   const sib=bs[ni];if(sib){sib.click();const _ws=sib.dataset&&sib.dataset.ws,_nb=_ws&&document.querySelector('.ws-rail button[data-ws="'+_ws+'"]');(_nb||sib).focus();e.preventDefault();}return;}
  // keyboard listbox on the holdings list: ArrowUp/Down/Home/End cycle row focus; Enter/Space already wired per-row
  if(a&&a.classList&&a.classList.contains('row')){
    if(e.key==='ArrowDown'||e.key==='ArrowUp'){const sib=e.key==='ArrowDown'?a.nextElementSibling:a.previousElementSibling;if(sib&&sib.classList&&sib.classList.contains('row')){sib.focus();e.preventDefault();}return;}
@@ -5806,9 +7085,15 @@ def main():
     ap = argparse.ArgumentParser(description="Generate portfolio timeline dashboard from Fidelity CSVs.")
     ap.add_argument("--portfolio", help="Portfolio Positions CSV (current holdings)")
     ap.add_argument("--history", help="Account History CSV (transactions)")
+    ap.add_argument("--history-mode", choices=("cumulative", "exact"), default="cumulative",
+                    help="merge local overlapping history exports (default) or use only --history")
+    ap.add_argument("--history-start",
+                    help="explicit analysis start (YYYY-MM-DD; default: earliest known trade)")
     ap.add_argument("--input-dir", default=os.path.join(HOME, "Downloads"),
                     help="where to auto-detect CSVs (default: ~/Downloads)")
     ap.add_argument("--out", default=os.path.join(HERE, "output", "portfolio_dashboard.html"))
+    ap.add_argument("--artifact-dir",
+                    help="directory containing optional research JSON (default: --out directory)")
     ap.add_argument("--no-fetch", action="store_true", help="reuse cached prices (offline)")
     ap.add_argument("--mark-to-market", action="store_true",
                     help="revalue held stocks from the latest Yahoo price while keeping shares/cost from the Portfolio CSV")
@@ -5825,18 +7110,23 @@ def main():
     # (and may include deposits the other file misses). So pick the best source
     # for each purpose instead of trusting a single file. An explicit --history
     # is ADDED to the accumulated local set, not used as a replacement.
-    hist_files = collect_history_files(args.input_dir, args.history)
+    hist_files = collect_history_files(args.input_dir, args.history, exact=args.history_mode == "exact")
     if not hist_files:
         sys.exit("!! Could not find any history CSV. Pass --history explicitly.")
-    parsed = [parse_history(p) for p in hist_files]
+    try:
+        parsed = [parse_history(p) for p in hist_files]
+    except ValueError as exc:
+        sys.exit(f"!! History parse failed: {exc}")
 
     # Merge ALL exports (each contributes the dates it covers; dedup by max-count
-    # per identical transaction). Then restrict the timeline to the largest
-    # gap-free span ending at the latest trade — a >=20-day hole means an export
-    # is simply missing those weeks, and reconstructing across it would be wrong.
+    # per identical transaction). Inactivity is not a coverage gap: default to
+    # the earliest known trade unless the user explicitly requests a later start.
     txns_all, opt_txns, names = merge_histories(parsed)
-    dmin, gaps = continuous_start(txns_all)
     txn_dmax = max((t["date"] for L in txns_all.values() for t in L), default=None)
+    try:
+        dmin = resolve_history_start(txns_all, args.history_start)
+    except ValueError as exc:
+        sys.exit(f"!! --history-start: {exc}")
     if not dmin or not txn_dmax:
         sys.exit("!! Could not find any dated stock transactions in the history exports.")
 
@@ -5844,13 +7134,17 @@ def main():
     txns = {s: L for s, L in txns.items() if L}
     opt_txns = {s: [t for t in L if t["date"] >= dmin] for s, L in opt_txns.items()}
     opt_txns = {s: L for s, L in opt_txns.items() if L}
-    tot_buy = sum(-t["amount"] for L in txns.values() for t in L if t["side"] == "BUY")
-    tot_sell = sum(t["amount"] for L in txns.values() for t in L if t["side"] == "SELL")
+    accounting_txns, _ = partition_equity_option_settlements(txns)
+    tot_buy = sum(-t["amount"] for L in accounting_txns.values() for t in L if t["side"] == "BUY")
+    tot_sell = sum(t["amount"] for L in accounting_txns.values() for t in L if t["side"] == "SELL")
     totals = (tot_buy, tot_sell)
 
     n_trades = sum(len(L) for L in txns.values())
-    cur = parse_portfolio(portfolio)
-    acct_extras = parse_account_extras(portfolio)
+    try:
+        cur = parse_portfolio(portfolio)
+        acct_extras = parse_account_extras(portfolio)
+    except ValueError as exc:
+        sys.exit(f"!! Portfolio parse failed: {exc}")
     strategy_tickers = {"QQQ", "TQQQ"}
     tickers = sorted(set(list(txns) + list(cur)))
 
@@ -5859,7 +7153,15 @@ def main():
         datetime.date.fromisoformat(target_asof)
     except ValueError:
         sys.exit("!! --as-of must be YYYY-MM-DD")
-    fetch_dmax = target_asof if args.mark_to_market else txn_dmax
+    snapshot_asof = broker_snapshot_date(acct_extras.get("asOf"))
+    if args.mark_to_market:
+        latest_position_fact = max(txn_dmax, snapshot_asof or txn_dmax)
+        if target_asof < latest_position_fact:
+            sys.exit(
+                "!! --as-of predates the current holdings/history snapshot; "
+                "historical holdings cannot be reconstructed from a later position export")
+    fetch_dmax = (target_asof if args.mark_to_market
+                  else max(txn_dmax, snapshot_asof or txn_dmax))
 
     # fetch window: a few days before first trade through day after last needed
     price_start = datetime.date.fromisoformat(dmin) - datetime.timedelta(days=4)
@@ -5875,7 +7177,7 @@ def main():
     dmax = txn_dmax
     refreshed = {}
     price_mode = "broker"
-    price_as_of = txn_dmax
+    price_as_of = snapshot_asof or txn_dmax
     if args.mark_to_market:
         price_dmax = latest_price_date(prices, sorted(set(tickers) | set(BENCH) | strategy_tickers), target_asof)
         if not price_dmax:
@@ -5884,34 +7186,52 @@ def main():
         price_as_of = price_dmax
         price_mode = "mark-to-market"
         refreshed = mark_to_market(cur, prices, price_dmax)
+        # A cache-only final render is the last step of the close orchestrator.
+        # Exact requested closes are verified as-of data, not stale merely
+        # because the renderer avoided a second network request.
+        reconcile_fetch_freshness(target_asof, price_dmax)
+    else:
+        history_price_dmax = latest_price_date(
+            prices, sorted(set(tickers) | set(BENCH) | strategy_tickers), fetch_dmax)
+        if history_price_dmax:
+            dmax = max(txn_dmax, history_price_dmax)
 
-    deposits, dividends = union_cash(parsed, dmin, dmax)
+    cash_hi = max(dmax, price_as_of)
+    cash_events = union_cash_events(parsed, dmin, cash_hi)
+    deposits, dividends, corporate_action_cash = union_cash(
+        parsed, dmin, cash_hi, include_corporate_actions=True)
     life_dep, _ = union_cash(parsed, "0000-00", "9999-99")
 
-    print(f"· portfolio:  {portfolio}")
+    print(f"· portfolio:  {os.path.basename(portfolio)} (local path redacted)")
     print(f"· merged {len(parsed)} exports → {n_trades} trades, window {dmin}→{dmax}")
     if args.mark_to_market:
         print(f"· mark-to-market: refreshed {len(refreshed)}/{len(cur)} held/equity symbols with Yahoo prices as of {price_as_of}")
-    if gaps:
-        print(f"  (excluded earlier data before {dmin}: coverage gap "
-              + ", ".join(f"{a}→{b}" for a, b in gaps) + ")")
-    print(f"· deposits {dmin[:7]}→{dmax[:7]}: ${deposits:,.0f}  ·  lifetime deposits ${life_dep:,.0f}  ·  dividends ${dividends:,.2f}")
+    print(f"· deposits {dmin[:7]}→{cash_hi[:7]}: ${deposits:,.0f}  ·  lifetime deposits ${life_dep:,.0f}  ·  dividends ${dividends:,.2f}  ·  corporate-action cash ${corporate_action_cash:,.2f}")
 
     sectors = fetch_sectors(tickers, no_fetch=args.no_fetch)
 
     payload = build_payload(txns, opt_txns, names, cur, prices, deposits, totals,
                             dmin, dmax, dividends, life_dep, acct_extras, sectors,
                             ohlc, price_mode=price_mode, price_as_of=price_as_of,
-                            refreshed_prices=refreshed)
-    payload["decision"] = load_decision_analysis(os.path.dirname(args.out))
-    payload["aiSemiQuant"] = load_ai_semi_quant(os.path.dirname(args.out))
-    payload["aiWatchlist"] = load_ai_watchlist(os.path.dirname(args.out))
-    payload["aics"] = load_aics_payload(os.path.dirname(args.out))
-    payload["marketMass"] = load_market_mass_dashboard(os.path.dirname(args.out))
-    payload["momentumTop3"] = load_momentum_top3(os.path.dirname(args.out))
-    payload["financialStatus"] = load_financial_status(os.path.dirname(args.out))
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    open(args.out, "w").write(render_html(payload))
+                            refreshed_prices=refreshed,
+                            corporate_action_cash=corporate_action_cash,
+                            cash_events=cash_events)
+    artifact_dir = (os.path.abspath(args.artifact_dir) if args.artifact_dir
+                    else os.path.dirname(os.path.abspath(args.out)))
+    artifact_reference = payload["summary"].get("priceAsOf") or dmax
+    artifact_health = {}
+    payload["decision"] = load_decision_analysis(artifact_dir, artifact_reference, artifact_health)
+    payload["aiSemiQuant"] = load_ai_semi_quant(artifact_dir, artifact_reference, artifact_health)
+    payload["aiWatchlist"] = load_ai_watchlist(artifact_dir, artifact_reference, artifact_health)
+    payload["aics"] = load_aics_payload(artifact_dir, artifact_reference, artifact_health)
+    payload["marketMass"] = load_market_mass_dashboard(artifact_dir, artifact_reference, artifact_health)
+    payload["momentumTop3"] = load_momentum_top3(artifact_dir, artifact_reference, artifact_health)
+    payload["financialStatus"] = load_financial_status(artifact_dir, artifact_reference, artifact_health)
+    payload["closeVsIntraday"] = load_close_vs_intraday(artifact_dir, artifact_reference, artifact_health)
+    payload["memoryFlow"] = load_memory_flow(artifact_dir, artifact_reference, artifact_health)
+    payload["artifactHealth"] = artifact_health
+    payload["counterfactual"] = compact_counterfactual(payload.get("counterfactual"))
+    _write_text_atomic_private(args.out, render_html(payload))
     s = payload["summary"]
     print(f"\n✓ dashboard written: {args.out}")
     print(f"  window {s['dateRange'][0]}→{s['dateRange'][1]} · {s['numStocks']} stocks ({s['numHeld']} held) · {len(payload['options'])} options")

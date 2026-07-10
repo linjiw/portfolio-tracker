@@ -1,5 +1,9 @@
 # Portfolio Dashboard — UI/UX + Performance Review & Improvement Plan
 
+> Historical review plan. The current renderer and `tests/test_dashboard_ui.py`
+> are the source of truth after the July 9, 2026 accessibility, mobile, data-
+> quality, and injection-safety pass.
+
 > **STATUS 2026-06-09 — implemented.** All P0s, the high-value P1s and PERF-2/4 landed:
 > `--amber-line` defined (VIS-1) · Google Fonts removed, fully self-contained (PERF-1) ·
 > mobile 12px cell floor + 决策一览 stacked-card view replaces the side-scrolling table (MOB-1/2) ·

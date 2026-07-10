@@ -2,6 +2,7 @@
 import json
 import sys
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,26 @@ def toy_px():
     return pd.DataFrame({"AAA": a, "BBB": b, "CCC": c, "SPY": spy}, index=idx)
 
 
+@pytest.fixture
+def payload_px(toy_px):
+    """Payload/cache fixture with both benchmarks and five signal candidates."""
+    return toy_px.assign(
+        QQQ=toy_px["BBB"],
+        DDD=(toy_px["AAA"] + toy_px["BBB"]) / 2,
+        EEE=(toy_px["BBB"] + toy_px["CCC"]) / 2,
+        FFF=(toy_px["AAA"] + toy_px["CCC"]) / 2,
+    )
+
+
+def small_cache_config():
+    cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
+    return {
+        **cfg,
+        "backtest": {**cfg["backtest"], "years": 2},
+        "universe": {**cfg["universe"], "min_cache_members": 5},
+    }
+
+
 def test_momentum_scores_ranks_trend(toy_px):
     s = mt.momentum_scores(toy_px, 9, exclude=("SPY",))
     assert list(s.sort_values(ascending=False).index) == ["AAA", "BBB", "CCC"]
@@ -34,6 +55,17 @@ def test_momentum_scores_ranks_trend(toy_px):
 
 def test_momentum_scores_excludes_benchmarks(toy_px):
     assert "SPY" not in mt.momentum_scores(toy_px, 6, exclude=("SPY",)).index
+
+
+def test_asof_price_uses_last_close_on_or_before_calendar_anchor():
+    index = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-03", "2026-03-02"])
+    prices = pd.DataFrame({"AAA": [90, 100, 110, 150]}, index=index)
+
+    anchor = mt.asof_price(prices, 12)
+
+    # 2026-03-02 minus 12 months is Sunday 2025-03-02, so the valid anchor is
+    # Friday 2025-02-28, not Monday 2025-03-03.
+    assert anchor["AAA"] == 100
 
 
 def test_valid_columns_drops_sparse(toy_px):
@@ -52,6 +84,127 @@ def test_backtest_no_lookahead_and_costs(toy_px):
     assert float(eq0.iloc[-1]) > 1.5
 
 
+def test_backtest_fills_at_next_close_and_carries_prior_weights_on_fill_day(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04",
+        "2026-02-28", "2026-03-03", "2026-03-04",
+    ])
+    px = pd.DataFrame({
+        "AAA": [100, 100, 200, 200, 200, 400, 400],
+        "BBB": [100, 100, 100, 100, 100, 100, 100],
+    }, index=idx, dtype=float)
+
+    def scores(hist, *_args, **_kwargs):
+        if hist.index[-1] == pd.Timestamp("2026-01-31"):
+            return pd.Series({"AAA": 1.0, "BBB": 0.0})
+        return pd.Series({"BBB": 1.0, "AAA": 0.0})
+
+    monkeypatch.setattr(mt, "momentum_scores", scores)
+    eq, turnover, audit = mt.run_backtest(
+        px, 1, 1, idx[0], idx[-1], 0.0, return_diagnostics=True,
+    )
+
+    # Jan-31 signal cannot capture AAA's Jan-31 -> Feb-03 jump: the initial
+    # book is cash through the Feb-03 close, then buys AAA at that close.
+    assert eq.loc["2026-02-03"] == pytest.approx(1.0)
+    # Feb-28 selects BBB, but old AAA remains held through the Mar-03 close and
+    # captures that fill-day jump before the switch to BBB.
+    assert eq.loc["2026-03-03"] == pytest.approx(2.0)
+    assert [row["fillDate"] for row in audit["fills"]] == ["2026-02-03", "2026-03-03"]
+    assert turnover == pytest.approx(0.75)  # 0.5 initial entry, 1.0 full rotation
+
+
+def test_fill_close_turnover_uses_drifted_weights_and_cost_is_charged_after_return(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04",
+        "2026-02-28", "2026-03-03", "2026-03-04",
+    ])
+    px = pd.DataFrame({
+        "AAA": [100, 100, 100, 100, 100, 200, 200],
+        "BBB": [100, 100, 100, 100, 100, 100, 100],
+    }, index=idx, dtype=float)
+    monkeypatch.setattr(
+        mt,
+        "momentum_scores",
+        lambda *_args, **_kwargs: pd.Series({"AAA": 1.0, "BBB": 0.5}),
+    )
+
+    eq, turnover, audit = mt.run_backtest(
+        px, 1, 2, idx[0], idx[-1], 0.01, return_diagnostics=True,
+    )
+    first, second = audit["fills"]
+
+    assert eq.iloc[0] == 1.0  # explicit initial-capital anchor
+    assert first["grossTraded"] == pytest.approx(1.0)
+    assert eq.loc["2026-02-03"] == pytest.approx(0.99)
+    # AAA doubles on the second fill day: 50/50 drifts to 2/3 vs 1/3 before
+    # turnover is measured. Rebalancing to 50/50 trades 1/3 gross, then costs.
+    assert second["preTradeWeights"]["AAA"] == pytest.approx(2 / 3)
+    assert second["oneWayTurnover"] == pytest.approx(1 / 6)
+    assert second["equityBeforeCost"] == pytest.approx(0.99 * 1.5)
+    assert second["costRate"] == pytest.approx((1 / 3) * 0.01)
+    assert eq.loc["2026-03-03"] == pytest.approx(0.99 * 1.5 * (1 - (1 / 3) * 0.01))
+    assert turnover == pytest.approx((0.5 + 1 / 6) / 2)
+
+
+def test_initial_anchor_makes_first_fill_cost_visible_in_drawdown(monkeypatch):
+    idx = pd.to_datetime(["2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04"])
+    px = pd.DataFrame({"AAA": [100, 100, 100, 100]}, index=idx, dtype=float)
+    monkeypatch.setattr(mt, "momentum_scores", lambda *_args, **_kwargs: pd.Series({"AAA": 1.0}))
+
+    eq, _ = mt.run_backtest(px, 1, 1, idx[0], idx[-1], 0.10)
+    metrics = mt.perf_metrics(eq)
+
+    assert eq.iloc[0] == 1.0
+    assert eq.loc["2026-02-03"] == pytest.approx(0.9)
+    assert metrics["total_x"] == pytest.approx(0.9)
+    assert metrics["max_dd_pct"] == pytest.approx(-10.0)
+
+
+def test_held_price_gap_catches_up_from_last_observed_close(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
+    ])
+    px = pd.DataFrame({
+        "AAA": [100, 100, 100, np.nan, 110],
+        "BBB": [100, 100, 100, 100, 100],
+    }, index=idx, dtype=float)
+    monkeypatch.setattr(mt, "momentum_scores", lambda *_args, **_kwargs: pd.Series({"AAA": 1.0}))
+
+    eq, _, audit = mt.run_backtest(
+        px, 1, 1, idx[0], idx[-1], 0.0, return_diagnostics=True,
+    )
+
+    assert eq.loc["2026-02-04"] == pytest.approx(1.0)
+    assert eq.loc["2026-02-05"] == pytest.approx(1.1)
+    assert audit["priceGapObservations"] == [{
+        "symbol": "AAA",
+        "date": "2026-02-04",
+        "lastObservedDate": "2026-02-03",
+    }]
+    assert audit["cumulativeGapReturns"][0]["cumulativeReturnPct"] == pytest.approx(10.0)
+    assert audit["unresolvedPriceGaps"] == []
+
+
+def test_unresolved_held_price_gap_truncates_invalid_evaluation_segment(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
+    ])
+    px = pd.DataFrame({
+        "AAA": [100, 100, 100, np.nan, np.nan],
+        "BBB": [100, 100, 100, 100, 100],
+    }, index=idx, dtype=float)
+    monkeypatch.setattr(mt, "momentum_scores", lambda *_args, **_kwargs: pd.Series({"AAA": 1.0}))
+
+    eq, _, audit = mt.run_backtest(
+        px, 1, 1, idx[0], idx[-1], 0.0, return_diagnostics=True,
+    )
+
+    assert eq.index[-1] == pd.Timestamp("2026-02-03")
+    assert audit["evaluationTruncatedBefore"] == "2026-02-04"
+    assert audit["unresolvedPriceGaps"][0]["symbol"] == "AAA"
+
+
 def test_perf_metrics_shape(toy_px):
     eq = toy_px["AAA"] / toy_px["AAA"].iloc[0]
     m = mt.perf_metrics(eq)
@@ -59,28 +212,119 @@ def test_perf_metrics_shape(toy_px):
     assert m["total_x"] > 1 and m["max_dd_pct"] <= 0
 
 
-def test_config_and_payload_schema(toy_px):
+def test_config_and_payload_schema(toy_px, payload_px):
     cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
     assert [s["id"] for s in cfg["strategies"]] == [
         "RET_11M_top3", "RET_9M_top3", "RET_5M_top5"]
     cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
-    payload = mt.build_payload(cfg, toy_px.rename(columns={"BBB": "QQQ"}))
+    payload = mt.build_payload(cfg, payload_px)
     assert {"generated_at", "window", "strategies", "benchmarks",
             "disclaimer"} <= set(payload)
+    assert payload["schemaVersion"] == 2
+    assert payload["researchOnly"] is True
+    assert payload["decisionGrade"] is False
+    assert payload["methodology"]["fillTiming"] == "next trading session close"
+    assert "cumulative return" in payload["methodology"]["missingHeldClosePolicy"]
+    assert "truncate" in payload["methodology"]["unresolvedHeldClosePolicy"]
+    assert payload["methodology"]["currentUniverseSurvivorship"] is True
+    assert payload["methodology"]["inSampleStrategySelection"] is True
+    assert payload["price_freshness"]["fresh_count"] == len(payload_px.columns)
     for s in payload["strategies"]:
         assert len(s["current_signal"]["holdings"]) <= s["top_n"]
         assert s["equity_weekly"], "equity curve must be non-empty"
         w = sum(h["weight_pct"] for h in s["current_signal"]["holdings"])
-        assert w <= 100.1
+        assert w == pytest.approx(100.0, abs=0.2)
 
 
-def test_render_html_embeds_data(toy_px):
+def test_current_signal_excludes_symbol_without_latest_close(payload_px):
     cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
     cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
-    payload = mt.build_payload(cfg, toy_px.rename(columns={"BBB": "QQQ"}))
+    px = payload_px.copy()
+    px.loc[px.index[-1], "AAA"] = np.nan
+    payload = mt.build_payload(cfg, px)
+    latest_ranked = {h["ticker"] for s in payload["strategies"]
+                     for h in s["latest_rank_snapshot"]["holdings"]}
+    assert "AAA" not in latest_ranked
+    assert "AAA" in payload["price_freshness"]["stale_symbols"]
+    for strategy in payload["strategies"]:
+        current = strategy["current_signal"]
+        if "AAA" in {row["ticker"] for row in current["holdings"]}:
+            assert current["status"] == "BLOCK_PRICE_STALE"
+            assert "AAA" in current["stale_target_symbols"]
+
+
+def test_current_signal_uses_completed_month_end_and_latest_rank_is_non_actionable(payload_px):
+    cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
+    cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
+
+    payload = mt.build_payload(cfg, payload_px)
+
+    for strategy in payload["strategies"]:
+        signal = strategy["current_signal"]
+        assert signal["as_of"] < payload["window"]["end"]
+        assert signal["effective_from"] > signal["as_of"]
+        assert strategy["latest_rank_snapshot"]["actionable"] is False
+
+
+def test_live_price_refresh_falls_back_to_cached_universe(tmp_path, payload_px):
+    cache = tmp_path / "prices.csv.gz"
+    payload_px.to_csv(cache, compression="gzip")
+    cfg = small_cache_config()
+    downloaded = payload_px.copy()
+    with (mock.patch.object(mt, "PRICE_CACHE", cache),
+          mock.patch.object(mt, "fetch_universe", side_effect=RuntimeError("markup changed")),
+          mock.patch("yfinance.download", return_value=pd.concat({"Close": downloaded}, axis=1))):
+        got = mt.load_prices(cfg, no_fetch=False)
+    assert set(got.columns) == set(payload_px.columns)
+    assert got.attrs["universeSource"] == "cached_constituents_live_prices"
+    assert "markup changed" in got.attrs["universeWarning"]
+
+
+def test_partial_download_preserves_last_known_good_cache(tmp_path, payload_px):
+    cache = tmp_path / "prices.csv.gz"
+    payload_px.to_csv(cache, compression="gzip")
+    before = cache.read_bytes()
+    cfg = small_cache_config()
+    universe = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+    partial = payload_px[["SPY"]]
+    with (mock.patch.object(mt, "PRICE_CACHE", cache),
+          mock.patch.object(mt, "fetch_universe", return_value=universe),
+          mock.patch("yfinance.download", return_value=pd.concat({"Close": partial}, axis=1))):
+        got = mt.load_prices(cfg, no_fetch=False)
+    assert got.attrs["universeSource"] == "price_cache_fallback"
+    assert "rejected" in got.attrs["universeWarning"]
+    assert cache.read_bytes() == before
+
+
+def test_price_cache_publish_is_validated_and_atomic(tmp_path, payload_px):
+    cache = tmp_path / "prices.csv.gz"
+    cfg = small_cache_config()
+    published = mt.publish_price_cache(
+        payload_px,
+        cfg,
+        expected_tickers=list(payload_px.columns),
+        path=cache,
+    )
+    assert cache.exists()
+    assert set(published.columns) == set(payload_px.columns)
+    assert not list(tmp_path.glob(".prices.csv.gz.tmp.*"))
+    assert mt.read_price_cache(cache).index[-1] == payload_px.index[-1]
+
+
+def test_payload_rejects_missing_benchmark(payload_px):
+    cfg = small_cache_config()
+    with pytest.raises(ValueError, match="missing benchmark QQQ"):
+        mt.build_payload(cfg, payload_px.drop(columns=["QQQ"]))
+
+
+def test_render_html_embeds_data(payload_px):
+    cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
+    cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
+    payload = mt.build_payload(cfg, payload_px)
     html = mt.render_html(payload)
     assert "__DATA__" not in html and "RET_11M_top3" in html
-    assert "幸存者偏差" in html
+    assert "Decision Grade: NO" in html
+    assert "样本外证据" in html
 
 
 def test_cycle_stats_basic():
@@ -107,10 +351,10 @@ def test_live_plan_status():
     assert st["since_entry_pct"] is not None   # 净值自 started 起的收益
 
 
-def test_payload_has_cycle_and_live_plan(toy_px):
+def test_payload_has_cycle_and_live_plan(payload_px):
     cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
     cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
-    payload = mt.build_payload(cfg, toy_px.rename(columns={"BBB": "QQQ"}))
+    payload = mt.build_payload(cfg, payload_px)
     assert "cycle" in payload["strategies"][0]
     assert payload["strategies"][0]["cycle"]["phase"] in ("早期", "成熟", "回吐中", "深回撤")
     for v in payload["benchmarks"].values():
@@ -170,4 +414,6 @@ def test_render_html_escapes_script_close():
                "strategies": [], "benchmarks": {},
                "disclaimer": "评</script><b>注入", "note": ""}
     html = mt.render_html(payload)
-    assert "评</script>" not in html and "<\\/script>" in html
+    assert "评</script>" not in html
+    assert "\\u003c/script\\u003e" in html
+    assert "function esc(v)" in html

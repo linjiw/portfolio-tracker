@@ -8,19 +8,36 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
 
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+except ImportError:  # direct `python scripts/usd_liquidity_score.py`
+    from artifact_io import atomic_write_json, atomic_write_text
+
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_JSON = ROOT / "output" / "usd_liquidity_score.json"
 OUT_MD = ROOT / "output" / "usd_liquidity_report.md"
 BASE_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
-MODEL_VERSION = "0.1"
+MODEL_VERSION = "0.2"
+SOURCE_MAX_LAG_DAYS = {
+    "WALCL": 14,
+    "WDTGAL": 14,
+    "WRBWFRBL": 14,
+    "RRPONTSYD": 7,
+    "SOFR": 7,
+    "IORB": 7,
+    "DGS2": 7,
+    "DGS10": 7,
+    "DTWEXBGS": 7,
+    "VIXCLS": 7,
+    "BAMLH0A0HYM2": 7,
+}
 
 SERIES = {
     "WALCL": "fed_assets_mn",
@@ -79,8 +96,12 @@ def latest_observation_dates(frames: Dict[str, pd.DataFrame]) -> Dict[str, str]:
     return out
 
 
-def load_all_series(series=SERIES, base_url: str = BASE_URL):
-    frames = {sid: load_fred_series(sid, name, base_url=base_url) for sid, name in series.items()}
+def load_all_series(series=SERIES, base_url: str = BASE_URL, as_of: Optional[dt.date] = None):
+    cutoff = pd.Timestamp(as_of or dt.date.today())
+    frames = {
+        sid: load_fred_series(sid, name, base_url=base_url).loc[:cutoff]
+        for sid, name in series.items()
+    }
     return pd.concat(frames.values(), axis=1).sort_index().ffill(), latest_observation_dates(frames)
 
 
@@ -90,6 +111,17 @@ def rolling_z(s: pd.Series, window: int = 756, min_periods: int = 252) -> pd.Ser
     return (s - mean) / std.replace(0, np.nan)
 
 
+def calendar_lag(series: pd.Series, days: int) -> pd.Series:
+    """Value observed on or immediately before ``days`` calendar days ago."""
+    idx = series.index
+    values = []
+    for stamp in idx:
+        target = stamp - pd.Timedelta(days=days)
+        pos = idx.searchsorted(target, side="right") - 1
+        values.append(series.iloc[pos] if pos >= 0 else np.nan)
+    return pd.Series(values, index=idx, dtype=float)
+
+
 def build_features(data: pd.DataFrame) -> pd.DataFrame:
     data = data.copy()
     data["fed_assets_bn"] = data["fed_assets_mn"] / 1000.0
@@ -97,16 +129,18 @@ def build_features(data: pd.DataFrame) -> pd.DataFrame:
     data["reserves_bn"] = data["reserves_mn"] / 1000.0
     data["net_liquidity_bn"] = data["fed_assets_bn"] - data["tga_bn"] - data["rrp_bn"]
 
-    data["net_liq_4w_chg"] = data["net_liquidity_bn"] - data["net_liquidity_bn"].shift(28)
-    data["net_liq_13w_chg"] = data["net_liquidity_bn"] - data["net_liquidity_bn"].shift(91)
-    data["reserves_4w_chg"] = data["reserves_bn"] - data["reserves_bn"].shift(28)
-    data["tga_4w_chg"] = data["tga_bn"] - data["tga_bn"].shift(28)
+    lag4 = lambda s: calendar_lag(s, 28)
+    lag13 = lambda s: calendar_lag(s, 91)
+    data["net_liq_4w_chg"] = data["net_liquidity_bn"] - lag4(data["net_liquidity_bn"])
+    data["net_liq_13w_chg"] = data["net_liquidity_bn"] - lag13(data["net_liquidity_bn"])
+    data["reserves_4w_chg"] = data["reserves_bn"] - lag4(data["reserves_bn"])
+    data["tga_4w_chg"] = data["tga_bn"] - lag4(data["tga_bn"])
     data["sofr_iorb_bp"] = (data["sofr"] - data["iorb"]) * 100.0
-    data["usd_4w_chg_pct"] = data["broad_usd"].pct_change(28) * 100.0
-    data["ust2y_4w_chg_bp"] = (data["ust2y"] - data["ust2y"].shift(28)) * 100.0
-    data["ust10y_4w_chg_bp"] = (data["ust10y"] - data["ust10y"].shift(28)) * 100.0
-    data["vix_4w_chg"] = data["vix"] - data["vix"].shift(28)
-    data["hy_oas_4w_chg_bp"] = (data["hy_oas"] - data["hy_oas"].shift(28)) * 100.0
+    data["usd_4w_chg_pct"] = (data["broad_usd"] / lag4(data["broad_usd"]) - 1.0) * 100.0
+    data["ust2y_4w_chg_bp"] = (data["ust2y"] - lag4(data["ust2y"])) * 100.0
+    data["ust10y_4w_chg_bp"] = (data["ust10y"] - lag4(data["ust10y"])) * 100.0
+    data["vix_4w_chg"] = data["vix"] - lag4(data["vix"])
+    data["hy_oas_4w_chg_bp"] = (data["hy_oas"] - lag4(data["hy_oas"])) * 100.0
     return data
 
 
@@ -150,17 +184,22 @@ def classify_score(score: Optional[float]) -> Dict[str, str]:
 
 
 def score_delta(row, data: pd.DataFrame, days: int):
-    loc = data.index.get_loc(row.name)
-    if not isinstance(loc, int) or loc < days:
+    target = row.name - pd.Timedelta(days=days)
+    prior = data.loc[:target, "usd_liquidity_score"].dropna()
+    if prior.empty:
         return None
-    prev = data.iloc[loc - days].get("usd_liquidity_score")
+    prev = prior.iloc[-1]
     cur = row.get("usd_liquidity_score")
     if pd.isna(prev) or pd.isna(cur):
         return None
     return float(cur - prev)
 
 
-def latest_document(data: pd.DataFrame, source_dates: Dict[str, str]) -> Dict:
+def latest_document(
+    data: pd.DataFrame,
+    source_dates: Dict[str, str],
+    requested_as_of: Optional[dt.date] = None,
+) -> Dict:
     scored = attach_score(data).dropna(subset=["usd_liquidity_score"])
     if scored.empty:
         raise RuntimeError("not enough data to compute USD liquidity score")
@@ -195,10 +234,49 @@ def latest_document(data: pd.DataFrame, source_dates: Dict[str, str]) -> Dict:
         "hyOas": rn(row.get("hy_oas"), 2),
         "hyOas4wChangeBp": rn(row.get("hy_oas_4w_chg_bp"), 1),
     }
+    as_of = row.name.date()
+    freshness_reference = requested_as_of or as_of
+    source_lags = {}
+    for series_id, source_date in source_dates.items():
+        try:
+            source_lags[series_id] = (freshness_reference - dt.date.fromisoformat(source_date)).days
+        except (TypeError, ValueError):
+            source_lags[series_id] = None
+    missing_sources = sorted(set(SERIES) - set(source_dates))
+    stale_sources = sorted(
+        series_id
+        for series_id, lag in source_lags.items()
+        if (
+            lag is None or lag < 0 or lag > SOURCE_MAX_LAG_DAYS.get(series_id, 7)
+            or (parse_iso_date(source_dates.get(series_id)) or dt.date.max) > as_of
+        )
+    )
+    freshness_reasons = []
+    if missing_sources:
+        freshness_reasons.append("missing source dates: " + ", ".join(missing_sources))
+    if stale_sources:
+        freshness_reasons.append("stale/future source dates: " + ", ".join(stale_sources))
+    score_row_lag = (freshness_reference - as_of).days
+    if score_row_lag < 0 or score_row_lag > 7:
+        freshness_reasons.append(
+            f"composite score row {as_of.isoformat()} is not current for {freshness_reference.isoformat()}"
+        )
+    freshness_status = "PASS" if not freshness_reasons else "BLOCK"
+    interpretation = interpret(regime["label"], metrics)
+    if freshness_reasons:
+        interpretation["portfolioAction"] = (
+            "DATA BLOCK: refresh the listed FRED series before using this regime for portfolio decisions."
+        )
+    valid_source_dates = [value for value in source_dates.values() if parse_iso_date(value)]
     return {
         "modelVersion": MODEL_VERSION,
-        "generatedAt": dt.datetime.now().isoformat(timespec="seconds"),
-        "asOf": row.name.date().isoformat(),
+        "generatedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "asOf": as_of.isoformat(),
+        "requestedAsOf": freshness_reference.isoformat(),
+        "researchOnly": True,
+        "decisionGrade": False,
+        "backtestEligible": False,
+        "decisionGradeReason": "Heuristic mixed-frequency composite; FRED observation dates do not provide vintage/release-time point-in-time data.",
         "score": rn(row.get("usd_liquidity_score"), 1),
         "rawScore": rn(row.get("usd_liquidity_raw"), 3),
         "regime": regime,
@@ -210,9 +288,28 @@ def latest_document(data: pd.DataFrame, source_dates: Dict[str, str]) -> Dict:
         "metrics": metrics,
         "components": components,
         "sourceDates": source_dates,
+        "sourceLagDays": source_lags,
+        "oldestSourceDate": min(valid_source_dates) if valid_source_dates else None,
+        "mixedSourceDates": len(set(source_dates.values())) > 1,
+        "dataFreshness": {
+            "status": freshness_status,
+            "referenceDate": freshness_reference.isoformat(),
+            "scoreRowLagDays": score_row_lag,
+            "missingSources": missing_sources,
+            "staleSources": stale_sources,
+            "reasons": freshness_reasons,
+            "maxLagDaysBySource": SOURCE_MAX_LAG_DAYS,
+        },
         "sources": {series_id: f"{BASE_URL}{series_id}" for series_id in SERIES},
-        "interpretation": interpret(regime["label"], metrics),
+        "interpretation": interpretation,
     }
+
+
+def parse_iso_date(value):
+    try:
+        return dt.date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def interpret(label: str, metrics: Dict) -> Dict[str, str]:
@@ -248,6 +345,8 @@ def render_report(doc: Dict) -> str:
         "",
         f"Generated: {doc['generatedAt']}",
         f"Data as of: {doc['asOf']}",
+        f"Data freshness: **{doc['dataFreshness']['status']}**"
+        + (f" · {'; '.join(doc['dataFreshness']['reasons'])}" if doc['dataFreshness']['reasons'] else ""),
         f"Score: **{doc['score']}/100** · Regime: **{doc['regime']['label']}**",
         f"Meaning: {doc['regime']['meaning']}",
         "",
@@ -290,19 +389,23 @@ def render_report(doc: Dict) -> str:
 def write_outputs(doc: Dict, out_json=OUT_JSON, out_md=OUT_MD) -> None:
     out_json = Path(out_json)
     out_md = Path(out_md)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
-    out_md.write_text(render_report(doc), encoding="utf-8")
+    atomic_write_json(out_json, doc)
+    atomic_write_text(out_md, render_report(doc))
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Build USD Liquidity Composite from FRED data.")
     parser.add_argument("--out-json", default=str(OUT_JSON))
     parser.add_argument("--out-md", default=str(OUT_MD))
+    parser.add_argument("--as-of", type=dt.date.fromisoformat, default=dt.date.today(),
+                        help="ignore observations dated after this YYYY-MM-DD cutoff")
     args = parser.parse_args(argv)
 
-    data, source_dates = load_all_series()
-    doc = latest_document(data, source_dates)
+    if args.as_of > dt.date.today():
+        raise SystemExit(f"--as-of {args.as_of} is in the future")
+
+    data, source_dates = load_all_series(as_of=args.as_of)
+    doc = latest_document(data, source_dates, requested_as_of=args.as_of)
     write_outputs(doc, args.out_json, args.out_md)
     print(f"USD liquidity {doc['score']}/100 {doc['regime']['label']} as of {doc['asOf']}")
     print(Path(args.out_json).resolve())

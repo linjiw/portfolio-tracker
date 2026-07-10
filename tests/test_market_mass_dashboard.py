@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import csv
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -172,10 +173,49 @@ class MarketMassDashboardTests(unittest.TestCase):
 
         self.assertEqual(payload["generatedAt"], generated_at.isoformat())
         self.assertEqual(payload["universeMode"], "anchor_first")
-        self.assertEqual(payload["portfolioPath"], "/tmp/portfolio.csv")
+        self.assertTrue(payload["portfolioSourcePresent"])
+        self.assertEqual(payload["schemaVersion"], 1)
         self.assertEqual(payload["profile"]["gravityProfile"], "swing")
         self.assertIn("QQQ", payload["symbols"])
         self.assertIn("Probabilistic research model", payload["disclaimer"])
+        self.assertFalse(payload["validation"]["decisionGrade"])
+
+    def test_portfolio_symbol_parser_is_header_driven_and_excludes_options(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "positions.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["metadata"])
+                writer.writerow(["Current Value", "Symbol", "Account Number", "Quantity"])
+                writer.writerow(["$1,000", "QQQ", "acct-01 / IRA", "2"])
+                writer.writerow(["$200", "QQQ260717C00500000", "acct-01 / IRA", "1"])
+                writer.writerow(["$300", "SPAXX**", "acct-01 / IRA", "300"])
+                writer.writerow(["($500)", "NVDA", "acct-01 / IRA", "-2"])
+
+            self.assertEqual(mmd.parse_portfolio_symbols(path), {"QQQ", "NVDA"})
+
+    def test_portfolio_symbol_parser_fails_closed_on_malformed_numeric(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "positions.csv"
+            path.write_text(
+                "Account Number,Symbol,Quantity,Current Value\n"
+                "acct-01,QQQ,not-a-number,$100\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid Quantity"):
+                mmd.parse_portfolio_symbols(path)
+
+    def test_freshness_uses_new_york_date_not_utc_rollover(self):
+        rows = synthetic_rows(40)
+        rows[-1]["date"] = "2026-01-01"
+        state = {"as_of": "2026-01-01"}
+        generated = dt.datetime(2026, 1, 2, 1, 0, tzinfo=dt.timezone.utc)
+
+        freshness = mmd.freshness_metadata(state, rows, generated)
+
+        self.assertEqual(freshness["ageCalendarDays"], 0)
+        self.assertFalse(freshness["stale"])
 
     def test_resolve_symbols_supports_anchor_first_mode(self):
         args = mmd.parse_args(["--anchor-only"])
@@ -216,9 +256,17 @@ class MarketMassDashboardTests(unittest.TestCase):
             path.write_text("{bad json", encoding="utf-8")
             self.assertIsNone(generate.load_market_mass_dashboard(tmp))
 
-            good = {"generatedAt": "now", "symbols": {"QQQ": {}}}
+            good = {
+                "schemaVersion": 1, "generatedAt": "2026-07-09T20:00:00Z",
+                "researchOnly": True, "decisionGrade": False,
+                "profile": {}, "symbols": {"QQQ": {"priceAsOf": "2026-07-09"}},
+            }
             path.write_text(json.dumps(good), encoding="utf-8")
-            self.assertEqual(generate.load_market_mass_dashboard(tmp), good)
+            loaded = generate.load_market_mass_dashboard(tmp)
+            self.assertEqual(loaded["generatedAt"], "2026-07-09T20:00:00Z")
+            self.assertEqual(loaded["profile"], {})
+            self.assertIn("QQQ", loaded["symbols"])
+            self.assertEqual(loaded["symbols"]["QQQ"]["history"], [])
 
 
 if __name__ == "__main__":

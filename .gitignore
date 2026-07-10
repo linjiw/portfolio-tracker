@@ -34,6 +34,8 @@ scripts/_scratch/
 
 # generated dashboard/runtime artifacts
 output/
+outputs/
+screenshots/
 *.log
 *.pid
 *.tmp
@@ -43,3 +45,9 @@ output/
 *.pem
 *.p12
 *.pfx
+telegram.json
+fmp.json
+*credentials*.json
+
+# point-in-time live option chains are generated market/runtime evidence, not source
+data/option_chain_snapshots/

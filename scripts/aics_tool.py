@@ -25,6 +25,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+except ModuleNotFoundError:  # direct ``python scripts/aics_tool.py``
+    from artifact_io import atomic_write_json, atomic_write_text
+
 import ai_semi_quant as aiq
 
 
@@ -33,8 +38,11 @@ OUT_JSON = ROOT / "output" / "aics.json"
 OUT_MD = ROOT / "output" / "aics_report.md"
 HISTORY = ROOT / "output" / "aics_history.jsonl"
 DASHBOARD = ROOT / "output" / "portfolio_dashboard.html"
-MODEL_VERSION = "0.1"
+MODEL_VERSION = "0.2.0"
 HISTORY_TRANSACTION_COST_BPS = 10
+HISTORY_MIN_EVALUATED_PAIRS = 12
+HISTORY_MIN_SPAN_DAYS = 90
+HISTORY_MIN_PRICE_COVERAGE = 1.0
 
 EDGE_COMPONENT_PROFILES = {
     "direct_platform_spend": (92, 88, 82, 85, 78),
@@ -264,7 +272,7 @@ def parse_snapshot_time(snapshot: Optional[dict]) -> Optional[dt.datetime]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+        return None
     return parsed
 
 
@@ -285,8 +293,33 @@ def read_history_snapshots(path: Path) -> List[dict]:
                 snapshots.append(snap)
     except OSError:
         return []
-    snapshots.sort(key=lambda s: parse_snapshot_time(s) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
-    return snapshots
+    # Re-running the producer on the same market close is a refresh, not a new
+    # out-of-sample observation.  Keep only the newest snapshot for each market
+    # data date so automation retries cannot manufacture one-day backtest pairs.
+    by_market_date = {}
+    for snap in snapshots:
+        key = snap.get("marketDataAsOf")
+        if not key:
+            # A price-bearing row without a market date cannot be aligned to
+            # an executable return window and must not enter validation.
+            continue
+        generated = parse_snapshot_time(snap)
+        try:
+            market_date = dt.date.fromisoformat(str(key)[:10])
+        except ValueError:
+            continue
+        # Daily research snapshots are aligned to the dashboard's US-market
+        # price date.  A next-calendar-day global/forming bar is not a valid
+        # out-of-sample observation for an earlier portfolio close.
+        if generated and market_date > generated.astimezone().date():
+            continue
+        prior = by_market_date.get(str(key))
+        if prior is None or ((parse_snapshot_time(snap) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+                             >= (parse_snapshot_time(prior) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))):
+            by_market_date[str(key)] = snap
+    collapsed = list(by_market_date.values())
+    collapsed.sort(key=lambda s: parse_snapshot_time(s) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    return collapsed
 
 
 def latest_snapshot_before(snapshots: Iterable[dict], now: dt.datetime) -> Optional[dict]:
@@ -339,8 +372,10 @@ def benchmark_snapshot_rows(benchmark_prices) -> List[dict]:
 
 def compact_score_snapshot(generated_at: Optional[str], market_data_as_of: Optional[str], scores: List[dict], benchmarks: Optional[List[dict]] = None) -> dict:
     return {
+        "snapshotSchemaVersion": 2,
         "generatedAt": generated_at,
         "marketDataAsOf": market_data_as_of,
+        "priceBasis": "point-in-time USD snapshot mark; dividend and corporate-action continuity is not independently reconciled across saved runs",
         "benchmarks": list(benchmarks or []),
         "scores": [
             {
@@ -356,12 +391,17 @@ def compact_score_snapshot(generated_at: Optional[str], market_data_as_of: Optio
                 "financialCapitalFlowScore": r.get("financialCapitalFlowScore"),
                 "valuationScore": r.get("valuationScore"),
                 "riskScore": r.get("riskScore"),
+                "industrialCapitalFlowChange1Run": r.get("industrialCapitalFlowChange1Run"),
+                "financialCapitalFlowChange1Run": r.get("financialCapitalFlowChange1Run"),
                 "gate": r.get("gate"),
+                "dataQualitySeverity": r.get("dataQualitySeverity"),
                 "market": {
                     "date": (r.get("market") or {}).get("date"),
                     "priceUsd": (r.get("market") or {}).get("priceUsd"),
                     "price": (r.get("market") or {}).get("price"),
                     "currency": (r.get("market") or {}).get("currency"),
+                    "analysisCurrency": (r.get("market") or {}).get("analysisCurrency"),
+                    "returnBasis": (r.get("market") or {}).get("returnBasis"),
                     "ret1m": (r.get("market") or {}).get("ret1m"),
                     "ret3m": (r.get("market") or {}).get("ret3m"),
                     "ret6m": (r.get("market") or {}).get("ret6m"),
@@ -375,9 +415,17 @@ def compact_score_snapshot(generated_at: Optional[str], market_data_as_of: Optio
 
 def append_history(path: Path, doc: dict) -> None:
     snapshot = compact_score_snapshot(doc.get("generatedAt"), doc.get("marketDataAsOf"), doc.get("scores", []), doc.get("benchmarkSnapshot") or [])
+    if not snapshot.get("marketDataAsOf"):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")) + "\n")
+    existing = read_history_snapshots(path)
+    market_date = snapshot.get("marketDataAsOf")
+    if market_date:
+        existing = [row for row in existing if row.get("marketDataAsOf") != market_date]
+    existing.append(snapshot)
+    existing.sort(key=lambda s: parse_snapshot_time(s) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    payload = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in existing)
+    atomic_write_text(path, payload)
 
 
 def previous_score_maps(previous: Optional[dict]) -> Dict[str, dict]:
@@ -435,6 +483,7 @@ def component_scores(row: dict) -> dict:
         "industrialCapitalFlowScore": industrial_flow,
         "financialCapitalFlowScore": financial_flow,
         "valuationScore": valuation,
+        "valuationGrowthPriorScore": valuation,
         "momentumScore": momentum,
         "balanceSheetResilienceScore": resilience,
     }
@@ -554,7 +603,9 @@ def score_row(
         "gateReasons": row.get("gateReasons") or [],
         "topPositiveDrivers": positives,
         "topNegativeDrivers": negatives,
-        "sourceConfidence": row.get("dataQualityScore"),
+        "sourceConfidence": None,
+        "sourceConfidenceStatus": "not_scored; market-data quality is not research-source confidence",
+        "marketDataQualityScore": row.get("dataQualityScore"),
         "dataQualityScore": row.get("dataQualityScore"),
         "dataQualitySeverity": row.get("dataQualitySeverity"),
         "dataQualityReasons": row.get("dataQualityReasons") or [],
@@ -562,6 +613,13 @@ def score_row(
         "market": market,
         "portfolio": row.get("portfolio") or {},
         "factors": row.get("factors") or {},
+        "scoreSemantics": {
+            "bottleneckPowerScore": "curated structural prior",
+            "industrialCapitalFlowScore": "curated capex-conversion prior; not observed fund flow",
+            "financialCapitalFlowScore": "price-momentum proxy; not observed securities flow",
+            "valuationScore": "curated valuation-growth prior; not a live multiple or DCF",
+            "decisionGrade": False,
+        },
         "peerGroupSize": row.get("peerGroupSize"),
         "universePercentile": row.get("universePercentile"),
         "peerPercentile": row.get("peerPercentile"),
@@ -603,6 +661,8 @@ def relationship_edges(base_rows: List[dict], previous_edges: Optional[Dict[Tupl
                 "relationshipType": edge["edgeType"],
                 "edgeWeight": edge["weight"],
                 "revenueCorrelation": profile[0],
+                "revenueDependencyPrior": profile[0],
+                "revenueCorrelationStatus": "curated dependency prior; no statistical revenue correlation was calculated",
                 "technicalDependency": profile[1],
                 "substitutionDifficulty": profile[2],
                 "orderVisibility": profile[3],
@@ -802,6 +862,7 @@ def evaluate_custom_scenario(scores: List[dict], assumptions: Optional[Dict[str,
     losers = sorted(rows, key=lambda x: ((x["scoreDelta"] or 0), (x["scenarioScore"] or 0), x["ticker"]))[:6]
     denom = portfolio_weight or 1.0
     return {
+        "decisionGrade": False,
         "assumptions": selected,
         "rows": rows,
         "winners": winners,
@@ -823,6 +884,7 @@ def scenario_model(scores: List[dict]) -> dict:
     default_assumptions = default_scenario_assumptions()
     return {
         "version": MODEL_VERSION,
+        "decisionGrade": False,
         "method": "Deterministic assumption-shock model using curated sensitivity coefficients. Revenue, margin, EPS, valuation, and score outputs are directional MVP proxies.",
         "controls": list(SCENARIO_CONTROLS),
         "defaultAssumptions": default_assumptions,
@@ -851,6 +913,12 @@ def scenario_results(scores: List[dict]) -> List[dict]:
 
 
 def return_attribution(scores: List[dict]) -> List[dict]:
+    """Expose return and factor sensitivities without fabricating causal attribution.
+
+    The repository has no point-in-time EPS estimate, valuation-multiple,
+    dividend, or historical FX-attribution feed.  Allocating observed return to
+    those labels would be numerically tidy but economically unsupported.
+    """
     rows = []
     for row in scores:
         market = row.get("market") or {}
@@ -863,24 +931,29 @@ def return_attribution(scores: List[dict]) -> List[dict]:
         flow_weight = clamp(row.get("financialCapitalFlowScore"), 0, 100) / 100
         raw = [0.30 + growth_weight * 0.20, 0.18 + valuation_weight * 0.15, 0.26 + flow_weight * 0.20]
         denom = sum(raw)
-        earnings = ret * raw[0] / denom
-        multiple = ret * raw[1] / denom
-        flow = ret * raw[2] / denom
-        residual = ret - earnings - multiple - flow
+        sensitivity_weights = {
+            "growthPrior": rn(raw[0] / denom, 4),
+            "valuationGrowthPrior": rn(raw[1] / denom, 4),
+            "priceMomentumProxy": rn(raw[2] / denom, 4),
+        }
         rows.append(
             {
                 "ticker": row["ticker"],
                 "window": "3M",
                 "available": True,
                 "totalReturn": rn(ret),
-                "earningsRevisionContribution": rn(earnings),
-                "valuationMultipleContribution": rn(multiple),
-                "capitalFlowMomentumContribution": rn(flow),
-                "fxDividendResidualContribution": rn(residual),
+                "earningsRevisionContribution": None,
+                "valuationMultipleContribution": None,
+                "capitalFlowMomentumContribution": None,
+                "fxDividendResidualContribution": None,
+                "sensitivityWeights": sensitivity_weights,
+                "causalAttributionAvailable": False,
+                "decisionGrade": False,
+                "attributionStatus": "unavailable_missing_point_in_time_fundamental_and_fx_decomposition",
                 "qualityFlag": "low_quality_rally"
                 if ret > 20 and row.get("valuationScore", 0) < 55 and row.get("growthRealizationScore", 0) < 70
                 else "normal",
-                "method": "proxy decomposition from growth, valuation, and financial-flow scores; replace with estimate data when available",
+                "method": "Observed 3M return plus non-causal factor sensitivities only; causal contribution fields are withheld until point-in-time EPS, multiple, dividend, and FX data exist.",
             }
         )
     return rows
@@ -911,14 +984,19 @@ def return_attribution_summary(attribution: List[dict]) -> dict:
         ],
         "topTotalReturn": sorted(available, key=lambda r: (-(r.get("totalReturn") or 0), r["ticker"]))[:8],
         "worstTotalReturn": sorted(available, key=lambda r: ((r.get("totalReturn") or 0), r["ticker"]))[:8],
-        "largestResiduals": sorted(available, key=lambda r: (-abs(r.get("fxDividendResidualContribution") or 0), r["ticker"]))[:8],
+        "largestResiduals": sorted(
+            [r for r in available if r.get("fxDividendResidualContribution") is not None],
+            key=lambda r: (-abs(r.get("fxDividendResidualContribution") or 0), r["ticker"]),
+        )[:8],
         "averageContribution": {
             "earningsRevisionContribution": avg_key("earningsRevisionContribution"),
             "valuationMultipleContribution": avg_key("valuationMultipleContribution"),
             "capitalFlowMomentumContribution": avg_key("capitalFlowMomentumContribution"),
             "fxDividendResidualContribution": avg_key("fxDividendResidualContribution"),
         },
-        "method": "3M proxy attribution. Replace with EPS-estimate, multiple, FX, ADR/local, and dividend feeds as data quality improves.",
+        "causalAttributionAvailable": False,
+        "decisionGrade": False,
+        "method": "3M return screen only. Causal attribution is withheld pending point-in-time EPS-estimate, multiple, FX, ADR/local, and dividend feeds.",
     }
 
 
@@ -973,11 +1051,12 @@ def flow_turn_alert(row: dict) -> Optional[dict]:
                 "type": "capital_flow_turn_positive",
                 "severity": "medium",
                 "ticker": row["ticker"],
-                "title": f"{row['ticker']} {label} turned positive",
-                "detail": f"{label.capitalize()} moved from {previous:.1f} to {current:.1f} versus {delta_label(delta_key)}.",
+                "title": f"{row['ticker']} {label} proxy turned positive",
+                "detail": f"Curated/proxy {label} moved from {previous:.1f} to {current:.1f} versus {delta_label(delta_key)}; this is not observed fund-flow data.",
                 "metric": score_key,
                 "value": rn(current, 1),
                 "threshold": 50,
+                "decisionGrade": False,
             }
     return None
 
@@ -1000,11 +1079,12 @@ def industry_threshold_alerts(scores: List[dict], edges: List[dict]) -> List[dic
                 "type": "industry_threshold",
                 "subtype": "cowos",
                 "severity": "medium",
-                "title": "CoWoS bottleneck remains active",
-                "detail": f"{len(tight_cowos)} advanced-packaging edges have capacity tightness above threshold.",
+                "title": "CoWoS curated bottleneck prior is elevated",
+                "detail": f"{len(tight_cowos)} curated advanced-packaging edges have capacity tightness above threshold; no live capacity feed is attached.",
                 "metric": "capacityTightness",
                 "value": max(e.get("capacityTightness") or 0 for e in tight_cowos),
                 "threshold": 82,
+                "decisionGrade": False,
             }
         )
 
@@ -1016,11 +1096,12 @@ def industry_threshold_alerts(scores: List[dict], edges: List[dict]) -> List[dic
                 "type": "industry_threshold",
                 "subtype": "hbm_dram",
                 "severity": "medium",
-                "title": "HBM / DRAM capital-flow threshold triggered",
-                "detail": f"Memory peer-group average industrial flow is {memory_flow}.",
+                "title": "HBM / DRAM capex-conversion prior is elevated",
+                "detail": f"Memory peer-group average curated industrial-flow proxy is {memory_flow}; this is not observed fund flow.",
                 "metric": "memoryAvgIndustrialFlow",
                 "value": memory_flow,
                 "threshold": 80,
+                "decisionGrade": False,
             }
         )
 
@@ -1032,11 +1113,12 @@ def industry_threshold_alerts(scores: List[dict], edges: List[dict]) -> List[dic
                 "type": "industry_threshold",
                 "subtype": "wfe",
                 "severity": "medium",
-                "title": "WFE capex threshold triggered",
-                "detail": f"Equipment peer-group average industrial flow is {equipment_flow}.",
+                "title": "WFE capex-conversion prior is elevated",
+                "detail": f"Equipment peer-group average curated industrial-flow proxy is {equipment_flow}; this is not observed order flow.",
                 "metric": "equipmentAvgIndustrialFlow",
                 "value": equipment_flow,
                 "threshold": 82,
+                "decisionGrade": False,
             }
         )
 
@@ -1151,11 +1233,12 @@ def alerts(scores: List[dict], overlay: dict, edges: Optional[List[dict]] = None
                     "type": "valuation_percentile",
                     "severity": "low",
                     "ticker": row["ticker"],
-                    "title": f"{row['ticker']} valuation score is in the top percentile",
-                    "detail": f"Valuation score {row.get('valuationScore')} is at or above the current 95th-percentile threshold {valuation_threshold:.1f}.",
+                    "title": f"{row['ticker']} valuation-growth prior is in the top percentile",
+                    "detail": f"Curated valuation-growth prior {row.get('valuationScore')} is at or above the current 95th-percentile threshold {valuation_threshold:.1f}; it is not a live multiple or DCF.",
                     "metric": "valuationScore",
                     "value": row.get("valuationScore"),
                     "threshold": rn(valuation_threshold, 1),
+                    "decisionGrade": False,
                 }
             )
 
@@ -1169,10 +1252,11 @@ def alerts(scores: List[dict], overlay: dict, edges: Optional[List[dict]] = None
                     "severity": "medium",
                     "ticker": row["ticker"],
                     "title": f"{row['ticker']} rally quality is weak",
-                    "detail": "3M price return is positive while growth/valuation support is weak in the current proxy model.",
+                    "detail": "3M USD-adjusted return is positive while curated growth/valuation priors are weak; this is a screen, not causal return attribution.",
                     "metric": "returnAttribution.qualityFlag",
                     "value": attr.get("totalReturn"),
                     "threshold": "low_quality_rally",
+                    "decisionGrade": False,
                 }
             )
 
@@ -1236,7 +1320,7 @@ def avg_window_return(rows: List[dict], return_key: str) -> Optional[float]:
                 vals.append(float(value))
             except Exception:
                 pass
-    if not vals:
+    if not vals or len(vals) != len(rows):
         return None
     return rn(sum(vals) / len(vals), 2)
 
@@ -1280,7 +1364,16 @@ def basket_result(name: str, rows: List[dict], benchmark_returns: Dict[str, Dict
 
 def snapshot_row_price(row: dict) -> Optional[float]:
     market = row.get("market") or {}
-    for key in ("priceUsd", "price", "close", "last"):
+    value = market.get("priceUsd", row.get("priceUsd"))
+    try:
+        if value is not None and math.isfinite(float(value)) and float(value) > 0:
+            return float(value)
+    except Exception:
+        pass
+    currency = str(market.get("analysisCurrency") or market.get("currency") or "").upper()
+    if currency != "USD":
+        return None
+    for key in ("price", "close", "last"):
         value = market.get(key, row.get(key))
         try:
             if value is not None and math.isfinite(float(value)) and float(value) > 0:
@@ -1333,13 +1426,23 @@ def benchmark_pair_returns(start: dict, end: dict) -> Dict[str, float]:
 
 
 def historical_basket_specs() -> List[Tuple[str, Callable[[List[dict]], List[dict]]]]:
+    def eligible(rows: List[dict]) -> List[dict]:
+        return [
+            row for row in rows
+            if row.get("gate") != "DATA_REVIEW" and row.get("dataQualitySeverity") != "hard_review"
+        ]
+
     return [
-        ("Top Final Score", lambda rows: sorted(rows, key=lambda r: (-(r.get("finalInvestmentScore") or 0), r.get("ticker", "")))),
-        ("Top Bottleneck Power", lambda rows: sorted(rows, key=lambda r: (-(r.get("bottleneckPowerScore") or 0), r.get("ticker", "")))),
+        ("Top Final Score", lambda rows: sorted(eligible(rows), key=lambda r: (-(r.get("finalInvestmentScore") or 0), r.get("ticker", "")))),
+        ("Top Bottleneck Power", lambda rows: sorted(eligible(rows), key=lambda r: (-(r.get("bottleneckPowerScore") or 0), r.get("ticker", "")))),
         (
             "Improving Capital Flow",
             lambda rows: sorted(
-                rows,
+                [
+                    r for r in eligible(rows)
+                    if r.get("industrialCapitalFlowChange1Run") is not None
+                    or r.get("financialCapitalFlowChange1Run") is not None
+                ],
                 key=lambda r: (
                     -((r.get("industrialCapitalFlowChange1Run") or 0) + (r.get("financialCapitalFlowChange1Run") or 0)),
                     -((r.get("industrialCapitalFlowScore") or 0) + (r.get("financialCapitalFlowScore") or 0)),
@@ -1350,27 +1453,18 @@ def historical_basket_specs() -> List[Tuple[str, Callable[[List[dict]], List[dic
         (
             "Valuation Discipline",
             lambda rows: sorted(
-                [r for r in rows if (r.get("valuationScore") or 100) <= 85] or rows,
-                key=lambda r: (-(r.get("finalInvestmentScore") or 0), (r.get("valuationScore") or 100), r.get("ticker", "")),
+                [r for r in eligible(rows) if r.get("valuationScore") is not None and r.get("valuationScore") <= 85],
+                key=lambda r: (-(r.get("finalInvestmentScore") or 0), r.get("valuationScore"), r.get("ticker", "")),
             ),
         ),
         (
             "Risk Resilience",
             lambda rows: sorted(
-                [r for r in rows if (r.get("riskScore") or 0) >= 55] or rows,
+                [r for r in eligible(rows) if r.get("riskScore") is not None and r.get("riskScore") >= 55],
                 key=lambda r: (-(r.get("riskScore") or 0), -(r.get("finalInvestmentScore") or 0), r.get("ticker", "")),
             ),
         ),
     ]
-
-
-def annualization_factor(day_counts: List[int]) -> Optional[float]:
-    if not day_counts:
-        return None
-    avg_days = sum(day_counts) / len(day_counts)
-    if avg_days <= 0:
-        return None
-    return 365.25 / avg_days
 
 
 def max_drawdown_from_returns(returns: List[float]) -> Optional[float]:
@@ -1388,18 +1482,22 @@ def max_drawdown_from_returns(returns: List[float]) -> Optional[float]:
 
 
 def ratio_from_returns(returns: List[float], day_counts: List[int], downside_only: bool = False) -> Optional[float]:
-    if len(returns) < 2:
+    if len(returns) < 2 or len(returns) != len(day_counts):
         return None
-    mean = sum(returns) / len(returns)
+    daily_returns = []
+    for ret, days in zip(returns, day_counts):
+        if days <= 0 or ret < -100:
+            return None
+        daily_returns.append((1.0 + ret / 100.0) ** (1.0 / days) - 1.0)
+    mean = sum(daily_returns) / len(daily_returns)
     if downside_only:
-        deviations = [min(0.0, r) for r in returns]
+        deviations = [min(0.0, r) for r in daily_returns]
         denom = math.sqrt(sum(d * d for d in deviations) / len(deviations))
     else:
-        denom = math.sqrt(sum((r - mean) ** 2 for r in returns) / (len(returns) - 1))
-    ann = annualization_factor(day_counts)
-    if denom <= 0 or ann is None:
+        denom = math.sqrt(sum((r - mean) ** 2 for r in daily_returns) / (len(daily_returns) - 1))
+    if denom <= 0:
         return None
-    return rn((mean / denom) * math.sqrt(ann), 2)
+    return rn((mean / denom) * math.sqrt(365.25), 2)
 
 
 def cagr_from_returns(returns: List[float], day_counts: List[int]) -> Optional[float]:
@@ -1432,6 +1530,27 @@ def avg_factor_profile(rows: List[dict]) -> dict:
     return out
 
 
+def average_sample_factor_profiles(samples: List[dict]) -> dict:
+    """Average each numeric start-factor across all evaluated basket samples."""
+    profiles = [sample.get("factorProfile") or {} for sample in samples]
+    keys = sorted({key for profile in profiles for key in profile})
+    out = {}
+    for key in keys:
+        values = []
+        for profile in profiles:
+            value = profile.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                values.append(numeric)
+        out[key] = rn(sum(values) / len(values), 1) if values else None
+    return out
+
+
 def exposure_counts(rows: List[dict], key: str) -> List[dict]:
     counts = {}
     for row in rows:
@@ -1440,18 +1559,54 @@ def exposure_counts(rows: List[dict], key: str) -> List[dict]:
     return [{"name": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
+def snapshot_performance_date(snapshot: Optional[dict]) -> Optional[dt.date]:
+    if not snapshot:
+        return None
+    raw = snapshot.get("marketDataAsOf")
+    if raw:
+        try:
+            return dt.date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            return None
+    parsed = parse_snapshot_time(snapshot)
+    return parsed.date() if parsed else None
+
+
 def ordered_backtest_snapshots(snapshots: List[dict], current_snapshot: Optional[dict] = None) -> List[dict]:
     ordered = [s for s in snapshots if parse_snapshot_time(s)]
     if current_snapshot and parse_snapshot_time(current_snapshot):
-        current_time = parse_snapshot_time(current_snapshot)
-        if not any(parse_snapshot_time(s) == current_time for s in ordered):
+        current_market_date = current_snapshot.get("marketDataAsOf")
+        if current_market_date:
+            ordered = [s for s in ordered if s.get("marketDataAsOf") != current_market_date]
             ordered.append(current_snapshot)
-    ordered.sort(key=lambda s: parse_snapshot_time(s) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+        else:
+            current_time = parse_snapshot_time(current_snapshot)
+            if not any(parse_snapshot_time(s) == current_time for s in ordered):
+                ordered.append(current_snapshot)
+    by_market_date = {}
+    undated = []
+    for snapshot in ordered:
+        key = snapshot.get("marketDataAsOf")
+        if not key:
+            undated.append(snapshot)
+            continue
+        prior = by_market_date.get(str(key))
+        if prior is None or (parse_snapshot_time(snapshot) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) >= (
+            parse_snapshot_time(prior) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        ):
+            by_market_date[str(key)] = snapshot
+    ordered = undated + list(by_market_date.values())
+    ordered.sort(
+        key=lambda s: (
+            snapshot_performance_date(s) or dt.date.min,
+            parse_snapshot_time(s) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        )
+    )
     return ordered
 
 
 def snapshot_period_key(snapshot: dict, frequency: str) -> Optional[str]:
-    parsed = parse_snapshot_time(snapshot)
+    parsed = snapshot_performance_date(snapshot)
     if not parsed:
         return None
     if frequency == "monthly":
@@ -1478,57 +1633,89 @@ def historical_snapshot_backtest_core(
     ordered: List[dict],
     basket_size: int = 5,
     transaction_cost_bps: float = HISTORY_TRANSACTION_COST_BPS,
-    method: str = "No-lookahead snapshot validation: baskets are selected from each saved AICS snapshot and measured against the next later snapshot price.",
-    rebalance_rule: str = "one rebalance per saved snapshot pair",
+    method: str = "Lagged saved-snapshot validation: signal at snapshot t, enter at snapshot t+1, and measure to snapshot t+2.",
+    rebalance_rule: str = "one rebalance per saved signal/entry/exit snapshot triple",
 ) -> dict:
     basket_samples = {name: [] for name, _ in historical_basket_specs()}
-    prior_members: Dict[str, set] = {}
+    prior_portfolios: Dict[str, dict] = {}
     skipped_pairs = 0
+    skipped_basket_samples = 0
     evaluated_pairs = 0
 
-    for start, end in zip(ordered, ordered[1:]):
-        start_time = parse_snapshot_time(start)
+    for signal, entry, end in zip(ordered, ordered[1:], ordered[2:]):
+        signal_time = parse_snapshot_time(signal)
+        entry_time = parse_snapshot_time(entry)
         end_time = parse_snapshot_time(end)
-        if not start_time or not end_time or end_time <= start_time:
+        entry_date = snapshot_performance_date(entry)
+        end_date = snapshot_performance_date(end)
+        if (
+            not signal_time or not entry_time or not end_time
+            or not (signal_time < entry_time < end_time)
+            or not entry_date or not end_date or end_date <= entry_date
+            or signal_time.date() > entry_date
+        ):
             skipped_pairs += 1
             continue
-        start_rows = snapshot_rows(start)
+        signal_rows = [
+            row for row in snapshot_rows(signal)
+            if row.get("gate") != "DATA_REVIEW" and row.get("dataQualitySeverity") != "hard_review"
+        ]
+        entry_map = snapshot_row_maps(entry)
         end_map = snapshot_row_maps(end)
         universe_returns = []
         row_returns = {}
-        for row in start_rows:
+        for row in signal_rows:
+            entry_row = entry_map.get(row.get("ticker")) or entry_map.get(row.get("companyId"))
             end_row = end_map.get(row.get("ticker")) or end_map.get(row.get("companyId"))
-            start_price = snapshot_row_price(row)
+            start_price = snapshot_row_price(entry_row or {})
             end_price = snapshot_row_price(end_row or {})
             if start_price and end_price:
                 ret = rn((end_price / start_price - 1) * 100, 2)
                 row_returns[row["ticker"]] = ret
                 universe_returns.append(ret)
-        if len(universe_returns) < 2:
+        price_coverage = len(universe_returns) / len(signal_rows) if signal_rows else 0.0
+        if len(universe_returns) < 2 or price_coverage < HISTORY_MIN_PRICE_COVERAGE:
             skipped_pairs += 1
             continue
         evaluated_pairs += 1
         universe_avg = sum(universe_returns) / len(universe_returns)
-        benchmark_returns = benchmark_pair_returns(start, end)
-        days = max(1, (end_time - start_time).days)
+        benchmark_returns = benchmark_pair_returns(entry, end)
+        days = max(1, (end_date - entry_date).days)
         for name, selector in historical_basket_specs():
-            selected = selector(start_rows)[:basket_size]
-            selected_returns = [row_returns[r["ticker"]] for r in selected if r.get("ticker") in row_returns]
-            if not selected_returns:
+            selected = selector(signal_rows)[:basket_size]
+            if not selected or any(r.get("ticker") not in row_returns for r in selected):
+                skipped_basket_samples += 1
                 continue
+            selected_returns = [row_returns[r["ticker"]] for r in selected if r.get("ticker") in row_returns]
             members = [r["ticker"] for r in selected if r.get("ticker") in row_returns]
             current_members = set(members)
-            previous_members = prior_members.get(name)
-            turnover = None if previous_members is None else rn((1 - len(previous_members & current_members) / max(len(current_members), 1)) * 100, 2)
-            prior_members[name] = current_members
+            target_weights = {member: 1.0 / len(members) for member in members}
+            prior = prior_portfolios.get(name) or {}
+            prior_weights = prior.get("endWeights") if prior.get("endDate") == entry_date.isoformat() else None
+            if prior_weights:
+                names = set(prior_weights) | current_members
+                traded_notional = sum(abs(target_weights.get(ticker, 0.0) - prior_weights.get(ticker, 0.0)) for ticker in names) * 100.0
+                turnover = rn(traded_notional / 2.0, 2)
+            else:
+                traded_notional = 100.0
+                turnover = None
             ret = rn(sum(selected_returns) / len(selected_returns), 2)
-            assumed_turnover = 100.0 if turnover is None else turnover
-            transaction_cost_pct = rn(float(transaction_cost_bps) * assumed_turnover / 10000.0, 4)
-            net_ret = rn(ret - transaction_cost_pct, 2)
+            transaction_cost_pct = rn(float(transaction_cost_bps) * traded_notional / 10000.0, 4)
+            net_ret = rn(((1.0 - transaction_cost_pct / 100.0) * (1.0 + ret / 100.0) - 1.0) * 100.0, 2)
+            end_values = {
+                ticker: target_weights[ticker] * (1.0 + row_returns[ticker] / 100.0)
+                for ticker in members
+            }
+            end_total = sum(end_values.values())
+            prior_portfolios[name] = {
+                "endDate": end_date.isoformat(),
+                "endWeights": ({ticker: value / end_total for ticker, value in end_values.items()} if end_total > 0 else {}),
+            }
             basket_samples[name].append(
                 {
-                    "start": start.get("generatedAt") or start.get("marketDataAsOf"),
-                    "end": end.get("generatedAt") or end.get("marketDataAsOf"),
+                    "signal": signal.get("generatedAt") or signal.get("marketDataAsOf"),
+                    "entry": entry.get("marketDataAsOf") or entry.get("generatedAt"),
+                    "end": end.get("marketDataAsOf") or end.get("generatedAt"),
                     "days": days,
                     "members": members,
                     "grossReturnPct": ret,
@@ -1536,7 +1723,10 @@ def historical_snapshot_backtest_core(
                     "netReturnPct": net_ret,
                     "transactionCostPct": transaction_cost_pct,
                     "transactionCostBps": transaction_cost_bps,
+                    "tradedNotionalPct": rn(traded_notional, 2),
                     "universeReturnPct": rn(universe_avg, 2),
+                    "universeReturnBasis": "gross equal-weight eligible universe; no comparator trading costs",
+                    "universePriceCoveragePct": rn(price_coverage * 100.0, 1),
                     "excessVsUniversePct": rn(net_ret - universe_avg, 2),
                     "benchmarkReturns": benchmark_returns,
                     "excessVsSOXXPct": rn(net_ret - benchmark_returns.get("SOXX"), 2) if benchmark_returns.get("SOXX") is not None else None,
@@ -1553,6 +1743,10 @@ def historical_snapshot_backtest_core(
                 }
             )
 
+    valid_dates = [snapshot_performance_date(snapshot) for snapshot in ordered]
+    valid_dates = [date for date in valid_dates if date]
+    history_span_days = ((valid_dates[-1] - valid_dates[0]).days if len(valid_dates) >= 2 else 0)
+    possible_triples = max(0, len(ordered) - 2)
     baskets = []
     for name, samples in basket_samples.items():
         returns = [s["returnPct"] for s in samples if s.get("returnPct") is not None]
@@ -1563,6 +1757,11 @@ def historical_snapshot_backtest_core(
         costs = [s["transactionCostPct"] for s in samples if s.get("transactionCostPct") is not None]
         day_counts = [s["days"] for s in samples if s.get("days")]
         turnovers = [s["turnoverPct"] for s in samples if s.get("turnoverPct") is not None]
+        statistics_ready = (
+            len(returns) >= HISTORY_MIN_EVALUATED_PAIRS
+            and sum(day_counts) >= HISTORY_MIN_SPAN_DAYS
+            and len(samples) == possible_triples
+        )
         baskets.append(
             {
                 "name": name,
@@ -1575,16 +1774,20 @@ def historical_snapshot_backtest_core(
                 "avgExcessVsUniversePct": rn(sum(excess) / len(excess), 2) if excess else None,
                 "avgExcessVsSOXXPct": rn(sum(excess_soxx) / len(excess_soxx), 2) if excess_soxx else None,
                 "avgExcessVsSMHPct": rn(sum(excess_smh) / len(excess_smh), 2) if excess_smh else None,
-                "hitRatePct": rn(100 * sum(1 for s in samples if s.get("hit")) / len(samples), 1) if samples else None,
+                "hitRatePct": (rn(100 * sum(1 for s in samples if s.get("hit")) / len(samples), 1)
+                               if samples and statistics_ready else None),
                 "turnoverPct": rn(sum(turnovers) / len(turnovers), 2) if turnovers else None,
-                "cagrPct": cagr_from_returns(returns, day_counts),
-                "maxDrawdownPct": max_drawdown_from_returns(returns),
-                "sharpe": ratio_from_returns(returns, day_counts),
-                "sortino": ratio_from_returns(returns, day_counts, downside_only=True),
+                "cagrPct": cagr_from_returns(returns, day_counts) if statistics_ready else None,
+                "maxDrawdownPct": max_drawdown_from_returns(returns) if statistics_ready else None,
+                "sharpe": ratio_from_returns(returns, day_counts) if statistics_ready else None,
+                "sortino": (ratio_from_returns(returns, day_counts, downside_only=True)
+                            if statistics_ready else None),
+                "statisticsStatus": "available" if statistics_ready else "insufficient_history",
                 "latestMembers": samples[-1]["members"] if samples else [],
                 "latestRegionExposure": samples[-1]["regionExposure"] if samples else [],
                 "latestValueChainExposure": samples[-1]["valueChainExposure"] if samples else [],
-                "avgStartFactorProfile": samples[-1]["factorProfile"] if samples else {},
+                "avgStartFactorProfile": average_sample_factor_profiles(samples),
+                "latestStartFactorProfile": samples[-1]["factorProfile"] if samples else {},
                 "drawdownAttribution": sorted(
                     [s["worstMember"] for s in samples if s.get("worstMember")],
                     key=lambda x: x["returnPct"],
@@ -1593,23 +1796,45 @@ def historical_snapshot_backtest_core(
             }
         )
 
-    enough = any((b.get("rebalanceCount") or 0) > 0 for b in baskets)
+    has_samples = any((b.get("rebalanceCount") or 0) > 0 for b in baskets)
+    primary = next((b for b in baskets if b.get("name") == "Top Final Score"), {})
+    enough = primary.get("statisticsStatus") == "available"
     return {
-        "status": "available" if enough else "not_enough_price_snapshots",
+        "status": ("available" if enough else
+                   ("insufficient_history" if has_samples else "not_enough_price_snapshots")),
+        "decisionGrade": False,
+        "corporateActionSafe": False,
         "method": method,
         "snapshotCount": len(ordered),
         "evaluatedPairs": evaluated_pairs,
+        "historySpanDays": history_span_days,
+        "minimumEvaluatedPairs": HISTORY_MIN_EVALUATED_PAIRS,
+        "minimumHistoryDays": HISTORY_MIN_SPAN_DAYS,
+        "statisticalMetricsAvailable": enough,
+        "statisticsNote": ("CAGR, drawdown, Sharpe, Sortino, and hit rate are withheld until "
+                           f"at least {HISTORY_MIN_EVALUATED_PAIRS} evaluated pairs and "
+                           f"{HISTORY_MIN_SPAN_DAYS} calendar days are available with complete, continuous signal/entry/exit coverage. "
+                           "Drawdown is snapshot-to-snapshot and cannot measure intraperiod losses."),
         "skippedPairs": skipped_pairs,
+        "skippedBasketSamples": skipped_basket_samples,
+        "possibleSignalEntryExitTriples": possible_triples,
         "basketSize": basket_size,
-        "benchmark": "Equal-weight AICS universe over the same snapshot pair, plus SOXX/SMH where both snapshots persist benchmark prices.",
+        "benchmark": "Equal-weight point-in-time eligible AICS universe over the same lagged entry/exit window, plus SOXX/SMH where both snapshots persist benchmark prices.",
         "rules": {
             "rebalance": rebalance_rule,
-            "lookahead": "selection uses start snapshot only",
-            "publicationLag": "snapshot timestamp is treated as the publication timestamp; fundamentals enter the test only after they are saved in a snapshot",
+            "lookahead": "selection uses signal snapshot only; signal-close prices are never used as entry prices",
+            "publicationLag": "one saved snapshot: signal t enters at t+1 and exits/rebalances at t+2",
             "transactionCostBps": transaction_cost_bps,
-            "fx": "uses priceUsd when present; otherwise local price fallback",
+            "transactionCostConvention": "basis points per traded notional; first formation is 100%, replacements charge sells plus buys (2x one-way turnover)",
+            "minimumPriceCoveragePct": HISTORY_MIN_PRICE_COVERAGE * 100.0,
+            "fx": "requires priceUsd, or an explicitly USD analysis/listing currency; non-USD local-price fallback is prohibited",
+            "comparators": "strategy returns are net of modeled costs; universe and ETF comparators are gross, making reported excess conservative but not cost-symmetric",
+            "returnBasis": "point-to-point USD snapshot marks; dividends and split/corporate-action continuity are not independently reconciled, so validation remains non-decision-grade",
             "adrLocalDedup": "MVP universe is companyId-based so ADR/local listings do not create duplicate basket members",
-            "liquidity": "inherits current AICS universe filters",
+            "eligibility": "DATA_REVIEW and hard-review rows are excluded at the signal snapshot",
+            "liquidity": "no historical bid/ask, volume, borrow, tax, or market-impact model; treat results as research validation only",
+            "riskRatios": "Sharpe/Sortino use geometric daily-equivalent net returns and a 0% risk-free/minimum-acceptable return; observations are sparse snapshot windows",
+            "drawdown": "compounded snapshot-to-snapshot net returns only; intraperiod drawdown is unobserved",
         },
         "plannedMetrics": ["CAGR", "Max Drawdown", "Sharpe", "Sortino", "Hit Rate", "Turnover", "Excess Return", "Factor Profile", "Region Exposure", "Value-Chain Exposure", "Drawdown Attribution"],
         "baskets": baskets,
@@ -1630,10 +1855,10 @@ def calendar_rebalance_validations(
             basket_size=basket_size,
             transaction_cost_bps=transaction_cost_bps,
             method=(
-                f"No-lookahead {label} calendar rebalance validation: select the first saved AICS snapshot "
-                f"inside each {label} period and measure against the next selected period snapshot."
+                f"Lagged {label} calendar validation: select the first saved AICS signal snapshot "
+                f"inside each {label} period, enter at the next selected period snapshot, and exit at the following one."
             ),
-            rebalance_rule=f"first saved snapshot per {label} calendar period",
+            rebalance_rule=f"first saved signal snapshot per {label} calendar period with one selected-period execution lag",
         )
         validation["frequency"] = frequency
         validation["selectedPeriods"] = [p for p in periods if p]
@@ -1663,13 +1888,17 @@ def historical_snapshot_backtest(
 
 def static_basket_backtest(scores: List[dict], benchmark_prices=None, history_snapshots: Optional[List[dict]] = None, current_snapshot: Optional[dict] = None) -> dict:
     benchmark_returns = benchmark_window_returns(benchmark_prices)
-    investable = [r for r in scores if r.get("gate") not in ("BLOCK", "DATA_REVIEW", "PORTFOLIO_BLOCK")]
+    research_eligible = [
+        r for r in scores
+        if r.get("gate") != "DATA_REVIEW" and r.get("dataQualitySeverity") != "hard_review"
+    ]
+    investable = [r for r in research_eligible if r.get("gate") not in ("BLOCK", "PORTFOLIO_BLOCK")]
     baskets = [
-        basket_result("Top Final Score", scores[:5], benchmark_returns),
-        basket_result("Top Bottleneck Power", sorted(scores, key=lambda r: -r.get("bottleneckPowerScore", 0))[:5], benchmark_returns),
+        basket_result("Top Final Score", research_eligible[:5], benchmark_returns),
+        basket_result("Top Bottleneck Power", sorted(research_eligible, key=lambda r: -r.get("bottleneckPowerScore", 0))[:5], benchmark_returns),
         basket_result(
             "Top Capital Flow",
-            sorted(scores, key=lambda r: -(r.get("industrialCapitalFlowScore", 0) + r.get("financialCapitalFlowScore", 0)))[:5],
+            sorted(research_eligible, key=lambda r: -(r.get("industrialCapitalFlowScore", 0) + r.get("financialCapitalFlowScore", 0)))[:5],
             benchmark_returns,
         ),
         basket_result(
@@ -1684,8 +1913,10 @@ def static_basket_backtest(scores: List[dict], benchmark_prices=None, history_sn
         for window in (basket.get("windows") or {}).values()
     )
     return {
-        "status": "available" if any_returns else "not_enough_market_history",
-        "method": "Static equal-weight basket backtest from current AICS ranks using trailing market returns. This is not a point-in-time rebalance test.",
+        "status": "descriptive_only" if any_returns else "not_enough_market_history",
+        "decisionGrade": False,
+        "predictiveValidation": False,
+        "method": "Descriptive current cross-section: today's AICS ranks shown beside the same trailing returns that informed momentum-related scores. This is in-sample and is not a backtest or predictive validation.",
         "benchmarkReturns": benchmark_returns,
         "baskets": baskets,
         "plannedMetrics": ["CAGR", "Max Drawdown", "Sharpe", "Sortino", "Hit Rate", "Turnover", "Excess Return"],
@@ -1696,7 +1927,7 @@ def static_basket_backtest(scores: List[dict], benchmark_prices=None, history_sn
             "investableTacticalBasket": baskets[3]["members"],
         },
         "historyValidation": historical_snapshot_backtest(history_snapshots or [], current_snapshot),
-        "note": "This validates current ranks against recent returns. History validation adds saved-snapshot and calendar rebalance checks once enough price-bearing AICS snapshots exist.",
+        "note": "Do not interpret the static baskets as evidence of alpha. Only the separately labeled lagged history validation is out-of-sample in time, and it remains non-decision-grade until its minimum history and data-coverage gates pass.",
     }
 
 
@@ -1728,6 +1959,14 @@ def model_card(base: dict, scores: List[dict], edges: List[dict], previous: Opti
             "hard_review": sum(1 for r in scores if r.get("dataQualitySeverity") == "hard_review"),
         },
         "hasPreviousSnapshot": bool(previous),
+        "scoreSemantics": {
+            "industrialCapitalFlow": "curated capex-conversion prior, not observed flow",
+            "financialCapitalFlow": "price-momentum proxy, not observed securities flow",
+            "valuation": "curated valuation-growth prior, not a live multiple or DCF",
+            "returnAttribution": "causal attribution unavailable; contribution fields withheld",
+            "staticBaskets": "descriptive and in-sample, not predictive validation",
+            "historyValidation": "one-snapshot-lag research validation; decision-grade only after minimum history and coverage gates",
+        },
         "history": history_meta or {},
         "requirements": {
             "scoresClamped": all(0 <= (r.get("finalInvestmentScore") or 0) <= 100 for r in scores),
@@ -1752,7 +1991,7 @@ def build_aics_document(args, previous: Optional[dict] = None, history_snapshots
         else:
             generated_at = dt.datetime.fromisoformat(str(generated_at_override).replace("Z", "+00:00"))
         if generated_at.tzinfo is None:
-            generated_at = generated_at.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+            raise ValueError("generated_at must include an explicit UTC offset")
     else:
         generated_at = dt.datetime.now().astimezone()
     history_path = Path(getattr(args, "history", HISTORY))
@@ -1772,7 +2011,8 @@ def build_aics_document(args, previous: Optional[dict] = None, history_snapshots
     previous_1w_rows = previous_score_maps(previous_1w)
     previous_1m_rows = previous_score_maps(previous_1m)
     history_meta = {
-        "historyPath": str(history_path),
+        "historyFile": history_path.name,
+        "historyPathIncluded": False,
         "snapshotsRead": len(snapshots),
         "previousRunAt": (previous_run or {}).get("generatedAt"),
         "oneWeekSnapshotAt": (previous_1w or {}).get("generatedAt"),
@@ -1798,16 +2038,20 @@ def build_aics_document(args, previous: Optional[dict] = None, history_snapshots
     attribution = return_attribution(scores)
     generated_at_iso = generated_at.isoformat(timespec="seconds")
     benchmark_prices = aiq.load_market_data(("SOXX", "SMH"), getattr(args, "period", "2y"), no_fetch=getattr(args, "no_fetch", False))
+    benchmark_prices = aiq.truncate_market_data(benchmark_prices, base.get("marketDataAsOf"))
     benchmark_snapshot = benchmark_snapshot_rows(benchmark_prices)
     current_snapshot = compact_score_snapshot(generated_at_iso, base.get("marketDataAsOf"), scores, benchmark_snapshot)
     doc = {
         "schemaVersion": 1,
+        "researchOnly": True,
+        "decisionGrade": False,
         "toolVersion": MODEL_VERSION,
         "generatedAt": generated_at_iso,
         "marketDataAsOf": base.get("marketDataAsOf"),
+        "dataAlignment": base.get("dataAlignment") or {},
         "title": "AICS",
         "subtitle": "AI Semiconductor Capital Flow & Scoring System",
-        "method": "AICS contract built from AI-SemiQuant structural scores, Yahoo-style market overlay, curated supply-chain edges, and portfolio exposure.",
+        "method": "AICS research contract built from curated structural priors, USD-adjusted market proxies, curated supply-chain edges, and portfolio exposure. Proxy scores are not observed capital flows or causal return attribution.",
         "universe": [universe_row(r) for r in base_rows],
         "scores": scores,
         "scoreDeltas": score_deltas(scores),
@@ -1877,7 +2121,7 @@ def render_report(doc: dict) -> str:
     lines.extend(
         [
             "",
-            "## Static Basket Backtest",
+            "## Descriptive Current Cross-Section (Not a Backtest)",
             "",
             (doc.get("backtest") or {}).get("method", ""),
             "",
@@ -1948,6 +2192,9 @@ def render_report(doc: dict) -> str:
             f"- Missing price count: {card.get('missingPriceCount')}",
             f"- DATA_REVIEW count: {card.get('dataReviewCount')}",
             f"- Score saturation count: {card.get('scoreSaturationCount')}",
+            "- Industrial/financial capital-flow fields are curated/price proxies, not observed fund-flow feeds.",
+            "- Valuation score is a curated valuation-growth prior, not a live multiple or DCF.",
+            "- Causal return attribution is unavailable; contribution fields are withheld.",
             f"- History snapshots read: {history.get('snapshotsRead', 0)}",
             f"- Previous run snapshot: {history.get('previousRunAt') or '-'}",
             f"- 1W comparison snapshot: {history.get('oneWeekSnapshotAt') or '-'}",
@@ -1986,10 +2233,8 @@ def main() -> None:
     doc = build_aics_document(args)
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_md.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    out_md.write_text(render_report(doc), encoding="utf-8")
+    atomic_write_json(out_json, doc)
+    atomic_write_text(out_md, render_report(doc))
     if not args.no_history:
         append_history(Path(args.history), doc)
     print(f"✓ wrote {out_json}")

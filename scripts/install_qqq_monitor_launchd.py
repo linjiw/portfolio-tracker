@@ -22,6 +22,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import atomic_write_bytes
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "qqq_intraday_monitor.py"
@@ -60,14 +65,14 @@ def build_plist(python_exe):
 
 def install(python_exe):
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
-    OUT.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    OUT.chmod(0o700)
     path = plist_path()
     payload = build_plist(python_exe)
     # Unload if already loaded so we can overwrite cleanly
     if path.exists():
         subprocess.run(["launchctl", "unload", str(path)], stderr=subprocess.DEVNULL)
-    with open(path, "wb") as f:
-        plistlib.dump(payload, f)
+    atomic_write_bytes(path, plistlib.dumps(payload))
     print(f"· wrote {path}")
     # Load (launchctl bootstrap is the modern API; fall back to load on older macOS)
     uid = os.getuid()

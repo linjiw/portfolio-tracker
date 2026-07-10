@@ -1,4 +1,9 @@
 # Code Review Summary — Portfolio Tracker
+
+> Historical snapshot. Superseded by the July 9, 2026 hardening pass and the
+> current tests/methodology; findings and coverage counts below are retained
+> only as review history.
+
 **Date:** July 3, 2026 | **Completed:** 2h 45min  
 **Output:** CODE_REVIEW_2026-07-03.md (609 lines)
 

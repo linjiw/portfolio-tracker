@@ -1,9 +1,12 @@
 {
-  "$schema_note": "Momentum Top-3 sleeve config. Edited by hand; consumed by scripts/momentum_top3.py. All lookbacks in calendar months; signal computed at month-end close, held from next trading day (no lookahead).",
+  "$schema_note": "Momentum Top-3 research config. Signals use month-end closes; targets fill at the next session close after the prior book earns that day's return. Current-universe and in-sample-selection biases make outputs non-decision-grade.",
   "universe": {
     "indices": ["SPX", "NDX", "DJIA"],
     "min_history_coverage": 0.95,
-    "note": "current constituents scraped from Wikipedia -> survivorship bias: absolute backtest numbers are upper bounds; cross-strategy ranking remains valid"
+    "min_cache_members": 400,
+    "min_download_fraction": 0.90,
+    "min_fresh_fraction": 0.80,
+    "note": "current constituents scraped from Wikipedia -> survivorship bias; neither absolute performance nor in-sample cross-strategy ranking is decision-grade"
   },
   "backtest": {
     "years": 8,
@@ -19,7 +22,7 @@
       "top_n": 3,
       "weighting": "equal",
       "role": "aggressive-core",
-      "thesis": "11m total return, 3-name concentration. Champion of 40-variant sweep: best total return AND best head-4y robustness; Sharpe 1.65."
+      "thesis": "11m total return with 3-name concentration; selected in-sample from a 40-variant sweep and retained only as a research hypothesis."
     },
     {
       "id": "RET_9M_top3",
@@ -28,7 +31,7 @@
       "top_n": 3,
       "weighting": "equal",
       "role": "balanced",
-      "thesis": "9m lookback sits on the second momentum peak; slightly faster signal than 11m with similar DD profile."
+      "thesis": "9m lookback is a faster concentrated research variant; relative ranking versus other variants remains in-sample."
     },
     {
       "id": "RET_5M_top5",
@@ -37,7 +40,7 @@
       "top_n": 5,
       "weighting": "equal",
       "role": "defensive-diversifier",
-      "thesis": "Short-peak lookback + 5-name breadth: best Sharpe (1.70) and shallowest DD of head group; low overlap with 9-11m signals."
+      "thesis": "5m lookback plus 5-name breadth tests whether shorter momentum and wider diversification change the in-sample profile."
     }
   ],
   "sleeve_caps": {

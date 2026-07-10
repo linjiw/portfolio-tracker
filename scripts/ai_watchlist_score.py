@@ -12,11 +12,18 @@ import argparse
 import csv
 import datetime as dt
 import importlib.util
+import io
 import json
 import math
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
+
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+except ModuleNotFoundError:  # direct ``python scripts/ai_watchlist_score.py``
+    from artifact_io import atomic_write_json, atomic_write_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +39,7 @@ aiq = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = aiq
 SPEC.loader.exec_module(aiq)
 
-MODEL_VERSION = "0.3.1"
+MODEL_VERSION = "0.4.0"
 BENCHMARK = "SPY"
 DEFAULT_RESEARCH_SOURCE_DATE = "2026-06-21"
 FACTOR_WEIGHTS = {
@@ -84,6 +91,7 @@ EVIDENCE_LEVEL_SCORES = {
     "early_optional": 54,
     "application_uncertain": 44,
 }
+EVIDENCE_CONFIDENCE_LEVELS = {"low", "low-medium", "medium-low", "medium", "medium-high", "high"}
 FRAMEWORK_STAGES = (
     "Stage 1/2 - compute foundation",
     "Stage 2 - AI factory bottlenecks",
@@ -128,6 +136,7 @@ def load_universe(path: Path) -> List[dict]:
     if not isinstance(raw, list):
         raise ValueError(f"{path} must contain a JSON list")
     seen = set()
+    seen_company_ids = set()
     out = []
     for i, item in enumerate(raw, 1):
         if not isinstance(item, dict):
@@ -135,14 +144,54 @@ def load_universe(path: Path) -> List[dict]:
         ticker = str(item.get("ticker") or "").strip()
         cid = str(item.get("companyId") or "").strip()
         factors = item.get("factors") or {}
+        if not isinstance(factors, dict):
+            raise ValueError(f"{ticker or f'row {i}'} factors must be an object")
         missing = [k for k in FACTOR_WEIGHTS if k not in factors]
         if not ticker or not cid:
             raise ValueError(f"watchlist row {i} needs companyId and ticker")
+        if not str(item.get("name") or "").strip() or not str(item.get("bucket") or "").strip():
+            raise ValueError(f"{ticker} needs name and bucket")
         if ticker.upper() in seen:
             raise ValueError(f"duplicate ticker in watchlist: {ticker}")
+        if cid.lower() in seen_company_ids:
+            raise ValueError(f"duplicate companyId in watchlist: {cid}")
         if missing:
             raise ValueError(f"{ticker} missing factors: {', '.join(missing)}")
+        for key in FACTOR_WEIGHTS:
+            aiq.validated_factor(factors[key], f"{ticker}.factors.{key}")
+        tier = item.get("priorityTier") or "T4 long-cycle watch"
+        evidence_level = item.get("evidenceLevel") or "early_optional"
+        if tier not in TIER_ORDER:
+            raise ValueError(f"{ticker} has unknown priorityTier: {tier}")
+        if evidence_level not in EVIDENCE_LEVEL_SCORES:
+            raise ValueError(f"{ticker} has unknown evidenceLevel: {evidence_level}")
+        conviction = str(item.get("conviction") or "medium").lower()
+        if conviction not in EVIDENCE_CONFIDENCE_LEVELS:
+            raise ValueError(f"{ticker} has unknown conviction: {conviction}")
+        list_fields = (
+            "aliases",
+            "riskFlags",
+            "watchKpis",
+            "catalysts",
+            "rebuttalChecks",
+            "researchQuestions",
+            "sourceReportTags",
+            "evidenceLedger",
+        )
+        for field in list_fields:
+            value = item.get(field)
+            if value is not None and not isinstance(value, list):
+                raise ValueError(f"{ticker}.{field} must be a list")
+            if field != "evidenceLedger" and value is not None and any(not isinstance(entry, str) for entry in value):
+                raise ValueError(f"{ticker}.{field} entries must be strings")
+            if field == "evidenceLedger" and value is not None and any(not isinstance(entry, dict) for entry in value):
+                raise ValueError(f"{ticker}.evidenceLedger entries must be objects")
+        for entry in item.get("evidenceLedger") or []:
+            confidence = str(entry.get("rawConfidence") or entry.get("confidence") or conviction).lower()
+            if confidence not in EVIDENCE_CONFIDENCE_LEVELS:
+                raise ValueError(f"{ticker} has unknown evidence confidence: {confidence}")
         seen.add(ticker.upper())
+        seen_company_ids.add(cid.lower())
         item = dict(item)
         item["aliases"] = list(item.get("aliases") or [])
         item["riskFlags"] = list(item.get("riskFlags") or [])
@@ -158,13 +207,24 @@ def load_universe(path: Path) -> List[dict]:
         item.setdefault("evidenceLevel", "early_optional")
         item.setdefault("conviction", "medium")
         out.append(item)
+    symbol_owner = {}
+    for item in out:
+        for symbol in (item["ticker"], *(item.get("aliases") or [])):
+            normalized = str(symbol or "").strip().upper()
+            if not normalized:
+                raise ValueError(f"{item['ticker']} contains an empty instrument symbol")
+            owner = symbol_owner.get(normalized)
+            if owner and owner != item["companyId"]:
+                raise ValueError(f"instrument symbol {normalized} is assigned to both {owner} and {item['companyId']}")
+            symbol_owner[normalized] = item["companyId"]
     return out
 
 
 def structural_score(factors: Dict[str, int]) -> int:
-    score = 0.0
-    for key, weight in FACTOR_WEIGHTS.items():
-        score += float(factors.get(key, 50)) * weight
+    missing = [key for key in FACTOR_WEIGHTS if key not in factors]
+    if missing:
+        raise ValueError(f"missing watchlist factors: {', '.join(missing)}")
+    score = sum(aiq.validated_factor(factors[key], key) * weight for key, weight in FACTOR_WEIGHTS.items())
     return int(round(clamp(score)))
 
 
@@ -191,7 +251,9 @@ def score_band(score: int) -> str:
 
 
 def evidence_score(level: Optional[str]) -> int:
-    return EVIDENCE_LEVEL_SCORES.get(level or "", 54)
+    if level not in EVIDENCE_LEVEL_SCORES:
+        raise ValueError(f"unknown evidence level: {level}")
+    return EVIDENCE_LEVEL_SCORES[level]
 
 
 def tier_rank(tier: Optional[str]) -> int:
@@ -212,20 +274,25 @@ def normalize_evidence_ledger(item: dict) -> List[dict]:
         if not isinstance(entry, dict):
             continue
         source_url = entry.get("sourceUrl")
-        raw_confidence = entry.get("rawConfidence") or entry.get("confidence") or item.get("conviction") or "medium"
+        raw_confidence = str(entry.get("rawConfidence") or entry.get("confidence") or item.get("conviction") or "medium").lower()
         confidence = capped_evidence_confidence(raw_confidence, source_url)
         ledger.append(
             {
                 "claim": entry.get("claim") or item.get("thesis") or item.get("aiBottleneck") or "Research claim needs wording.",
                 "sourceType": entry.get("sourceType") or "internal_research_report",
+                "sourceTypeStatus": "explicit" if entry.get("sourceType") else "default_internal_research",
                 "sourceUrl": source_url,
                 "sourceDate": entry.get("sourceDate") or DEFAULT_RESEARCH_SOURCE_DATE,
+                "sourceDateStatus": "explicit" if entry.get("sourceDate") else "default_research_import_date",
                 "rawConfidence": raw_confidence,
                 "confidence": confidence,
                 "confidenceCapped": confidence != raw_confidence,
                 "financialLink": entry.get("financialLink") or item.get("evidenceLevel") or "early_optional",
+                "financialLinkStatus": "categorical evidence-to-financials linkage; not a URL",
                 "expiresAfter": entry.get("expiresAfter") or "2026-12-31",
+                "expiryStatus": "explicit" if entry.get("expiresAfter") else "default_review_deadline",
                 "needsRefresh": bool(entry.get("needsRefresh", False)),
+                "verified": bool(entry.get("verified", False)),
             }
         )
     if ledger:
@@ -242,46 +309,129 @@ def normalize_evidence_ledger(item: dict) -> List[dict]:
     if tags:
         claim = f"{claim} Evidence tags: {', '.join(tags[:3])}."
     source_url = item.get("sourceUrl")
-    raw_confidence = item.get("conviction") or "medium"
+    raw_confidence = str(item.get("conviction") or "medium").lower()
     confidence = capped_evidence_confidence(raw_confidence, source_url)
     return [
         {
             "claim": claim,
             "sourceType": source_type,
+            "sourceTypeStatus": "inferred_from_evidence_level",
             "sourceUrl": source_url,
             "sourceDate": DEFAULT_RESEARCH_SOURCE_DATE,
+            "sourceDateStatus": "default_research_import_date",
             "rawConfidence": raw_confidence,
             "confidence": confidence,
             "confidenceCapped": confidence != raw_confidence,
             "financialLink": level,
+            "financialLinkStatus": "categorical evidence-to-financials linkage; not a URL",
             "expiresAfter": "2026-12-31",
+            "expiryStatus": "default_review_deadline",
             "needsRefresh": False,
-            "sourceStatus": "attached" if source_url else "needs_external_url",
+            "verified": False,
+            "sourceStatus": "attached" if valid_source_url(source_url) else "needs_external_url",
         }
     ]
 
 
 def capped_evidence_confidence(confidence: str, source_url: Optional[str]) -> str:
-    if source_url:
+    if valid_source_url(source_url):
         return confidence
-    order = {"low": 1, "medium": 2, "medium-high": 3, "high": 4}
+    order = {"low": 1, "low-medium": 1.5, "medium-low": 1.5, "medium": 2, "medium-high": 3, "high": 4}
     if order.get(str(confidence).lower(), 2) > order["medium"]:
         return "medium"
     return confidence
 
 
-def evidence_audit(ledger: List[dict]) -> dict:
+def valid_source_url(value: Optional[str]) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def _iso_date(value: Optional[str]) -> Optional[dt.date]:
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def evidence_assessment(ledger: List[dict], level: str, as_of: Optional[str] = None) -> dict:
+    """Turn a qualitative evidence label into an auditable effective score."""
+    raw_score = evidence_score(level)
+    reference = _iso_date(as_of) or dt.datetime.now().astimezone().date()
+    valid_urls = sum(1 for entry in ledger if valid_source_url(entry.get("sourceUrl")))
+    verified = sum(1 for entry in ledger if entry.get("verified"))
+    default_dates = sum(1 for entry in ledger if entry.get("sourceDateStatus") == "default_research_import_date")
+    future_dated = sum(
+        1 for entry in ledger
+        if _iso_date(entry.get("sourceDate")) and _iso_date(entry.get("sourceDate")) > reference
+    )
+    expired = sum(
+        1 for entry in ledger
+        if _iso_date(entry.get("expiresAfter")) and _iso_date(entry.get("expiresAfter")) < reference
+    )
+    invalid_dates = sum(
+        1 for entry in ledger
+        if not _iso_date(entry.get("sourceDate"))
+        or not _iso_date(entry.get("expiresAfter"))
+        or (
+            _iso_date(entry.get("sourceDate"))
+            and _iso_date(entry.get("expiresAfter"))
+            and _iso_date(entry.get("expiresAfter")) < _iso_date(entry.get("sourceDate"))
+        )
+    )
+    refresh = sum(1 for entry in ledger if entry.get("needsRefresh"))
+    effective = raw_score
+    reasons = []
+    if valid_urls < len(ledger):
+        effective = min(effective, EVIDENCE_LEVEL_SCORES["credible_product"])
+        reasons.append(f"{len(ledger) - valid_urls} claim(s) lack a valid http(s) source URL; evidence capped at medium confidence")
+    if future_dated:
+        effective = min(effective, EVIDENCE_LEVEL_SCORES["application_uncertain"])
+        reasons.append(f"{future_dated} evidence claim(s) have a future source date")
+    if invalid_dates:
+        effective = min(effective, EVIDENCE_LEVEL_SCORES["early_optional"])
+        reasons.append(f"{invalid_dates} evidence claim(s) have invalid dates")
+    if expired or refresh:
+        effective = min(effective, EVIDENCE_LEVEL_SCORES["early_optional"])
+        reasons.append(f"{expired} expired and {refresh} refresh-required claim(s)")
+    return {
+        "rawScore": raw_score,
+        "effectiveScore": int(effective),
+        "scoreCapApplied": effective < raw_score,
+        "sourceComplete": bool(ledger and valid_urls == len(ledger)),
+        "decisionGrade": bool(ledger and verified == len(ledger) and valid_urls == len(ledger) and not default_dates and not future_dated and not invalid_dates and not expired and not refresh),
+        "asOf": reference.isoformat(),
+        "validSourceUrlCount": valid_urls,
+        "verifiedClaimCount": verified,
+        "defaultSourceDateCount": default_dates,
+        "futureSourceDateCount": future_dated,
+        "expiredCount": expired,
+        "invalidDateCount": invalid_dates,
+        "needsRefreshCount": refresh,
+        "reasons": reasons,
+    }
+
+
+def evidence_audit(ledger: List[dict], as_of: Optional[str] = None) -> dict:
     claim_count = len(ledger)
-    source_urls = sum(1 for e in ledger if e.get("sourceUrl"))
+    source_urls = sum(1 for e in ledger if valid_source_url(e.get("sourceUrl")))
+    reference = _iso_date(as_of) or dt.datetime.now().astimezone().date()
     return {
         "claimCount": claim_count,
         "highConfidenceClaims": sum(1 for e in ledger if str(e.get("confidence", "")).lower() == "high"),
         "needsRefreshCount": sum(1 for e in ledger if e.get("needsRefresh")),
-        "missingSourceUrlCount": sum(1 for e in ledger if not e.get("sourceUrl")),
+        "missingSourceUrlCount": sum(1 for e in ledger if not valid_source_url(e.get("sourceUrl"))),
         "sourceUrlCount": source_urls,
         "sourceUrlCoverage": rn(source_urls / claim_count * 100.0, 1) if claim_count else None,
         "confidenceCappedCount": sum(1 for e in ledger if e.get("confidenceCapped")),
         "oldestSourceDate": min((e.get("sourceDate") for e in ledger if e.get("sourceDate")), default=None),
+        "defaultSourceDateCount": sum(1 for e in ledger if e.get("sourceDateStatus") == "default_research_import_date"),
+        "futureSourceDateCount": sum(1 for e in ledger if _iso_date(e.get("sourceDate")) and _iso_date(e.get("sourceDate")) > reference),
+        "expiredCount": sum(1 for e in ledger if _iso_date(e.get("expiresAfter")) and _iso_date(e.get("expiresAfter")) < reference),
+        "asOf": reference.isoformat(),
     }
 
 
@@ -316,12 +466,14 @@ def crowding_risk(metrics: dict, priority_tier: str, gate: str) -> dict:
     narrative = "high" if priority_tier in ("T1 immediate deep dive", "T2 quality discovered") and extension in ("high", "medium") else "medium"
     if priority_tier in ("T4 long-cycle watch", "T5 reference / low AI purity"):
         narrative = "low"
-    earnings = "high" if extension == "high" else ("medium" if extension == "medium" else "unknown" if extension == "unknown" else "low")
+    price_expectation_proxy = "high" if extension == "high" else ("medium" if extension == "medium" else "unknown" if extension == "unknown" else "low")
     return {
         "priceExtension": extension,
         "narrativeHeat": narrative,
         "ownershipRisk": "unknown",
-        "earningsExpectationRisk": earnings,
+        "earningsExpectationRisk": "not_measured",
+        "priceExpectationProxy": price_expectation_proxy,
+        "method": "price-extension/narrative heuristic; no ownership or earnings-consensus feed",
         "overextensionPenalty": overext,
     }
 
@@ -332,28 +484,33 @@ def entry_diagnostics(metrics: dict, dq_severity: str, benchmark_metrics: Option
         rel3m = rn(float(metrics["ret3m"]) - float(benchmark_metrics["ret3m"]), 2)
     price_ratio = metrics.get("priceTo252dMedian")
     if dq_severity == "hard_review":
-        valuation_band = "data_blocked"
+        price_position_band = "data_blocked"
     elif price_ratio is None:
-        valuation_band = "unknown"
+        price_position_band = "unknown"
     elif price_ratio >= 1.8:
-        valuation_band = "above_252d_median"
+        price_position_band = "above_trailing_median"
     elif price_ratio <= 0.8:
-        valuation_band = "below_252d_median"
+        price_position_band = "below_trailing_median"
     else:
-        valuation_band = "near_252d_median"
+        price_position_band = "near_trailing_median"
     ret3 = metrics.get("ret3m")
     vol = metrics.get("vol1y")
-    gap_risk = "unknown"
+    price_volatility_risk = "unknown"
     if dq_severity != "hard_review":
-        gap_risk = "high" if (ret3 is not None and abs(ret3) >= 80) or (vol is not None and vol >= 65) else "medium"
+        price_volatility_risk = "high" if (ret3 is not None and abs(ret3) >= 80) or (vol is not None and vol >= 65) else "medium"
     return {
         "distanceTo50DMA": metrics.get("vs50"),
         "distanceTo200DMA": metrics.get("vs200"),
         "threeMonthReturn": ret3,
         "relativeStrengthVsBenchmark3M": rel3m,
         "nextEarningsDate": None,
-        "postEarningsGapRisk": gap_risk,
-        "valuationBand": valuation_band,
+        "earningsCalendarStatus": "unavailable",
+        "postEarningsGapRisk": "not_measured",
+        "priceVolatilityRisk": price_volatility_risk,
+        "valuationBand": "not_measured",
+        "valuationDataStatus": "unavailable; price position is not fundamental valuation",
+        "pricePositionBand": price_position_band,
+        "pricePositionLookbackBars": metrics.get("medianLookbackBars"),
         "dataConfidence": dq_severity,
     }
 
@@ -368,16 +525,31 @@ def instrument_master(item: dict, metrics: dict, dq_severity: str, dq_reasons: L
         "fxRate": metrics.get("marketCapFxRate"),
         "fxSource": metrics.get("marketCapFxSource"),
         "fxMode": metrics.get("fxMode"),
+        "returnFxRate": metrics.get("priceFxRate"),
+        "returnFxAsOf": metrics.get("priceFxAsOf"),
+        "returnFxSource": metrics.get("priceFxSource"),
         "marketCapUsd": metrics.get("marketCapUsd"),
-        "marketCapSource": "Yahoo profile normalized to USD" if metrics.get("marketCapUsd") is not None else "missing",
+        "scoringMarketCapUsd": metrics.get("scoringMarketCapUsd"),
+        "marketCapAsOf": metrics.get("marketCapAsOf"),
+        "marketCapAsOfSource": metrics.get("marketCapAsOfSource"),
+        "marketCapQuoteAsOf": metrics.get("marketCapQuoteAsOf"),
+        "marketCapDecisionAsOf": metrics.get("marketCapDecisionAsOf"),
+        "marketCapAlignmentReason": metrics.get("marketCapAlignmentReason"),
+        "marketCapFetchedAt": metrics.get("marketCapFetchedAt"),
+        "marketCapPointInTimeCompatible": metrics.get("marketCapPointInTimeCompatible"),
+        "marketCapSource": metrics.get("marketCapSource") or ("Yahoo profile normalized to USD" if metrics.get("marketCapUsd") is not None else "missing"),
+        "marketCapUnitScale": metrics.get("marketCapUnitScale"),
+        "returnBasis": metrics.get("returnBasis"),
         "splitHistoryStatus": split_status,
         "shareCountSource": "Yahoo market cap profile",
+        "shareCountPointInTimeVerified": metrics.get("shareCountPointInTimeVerified"),
         "dataConfidence": dq_severity,
     }
 
 
 def data_quality_severity(metrics: dict, dq_score: int, dq_reasons: List[dict]) -> str:
-    if not metrics.get("available") or dq_score < 50:
+    rules = {(reason.get("rule") or "") for reason in dq_reasons}
+    if not metrics.get("available") or dq_score < 50 or "future_price_date" in rules or "stale_price_history" in rules or "stale_fx_history" in rules:
         return "hard_review"
     ret3 = metrics.get("ret3m")
     price_ratio = metrics.get("priceTo252dMedian")
@@ -387,7 +559,7 @@ def data_quality_severity(metrics: dict, dq_score: int, dq_reasons: List[dict]) 
         return "hard_review"
     if price_ratio is not None and 4.0 <= float(price_ratio) <= 6.0:
         return "verify_before_entry"
-    if any((reason.get("rule") or "") in ("fx_conversion_missing", "market_cap_missing") for reason in dq_reasons):
+    if any(rule in ("fx_conversion_missing", "market_cap_missing", "market_cap_future_as_of", "lagged_price_history", "lagged_fx_history", "limited_price_history") for rule in rules):
         return "verify_before_entry"
     if dq_reasons:
         return "soft_review"
@@ -406,7 +578,9 @@ def entry_eligibility(data_severity: str, crowd: dict, metrics: dict) -> dict:
     if (metrics.get("vs50") or 0.0) > 20:
         action_ready_blockers.append("price more than 20% above 50DMA")
     if metrics.get("marketCapUsd") is None:
-        action_ready_blockers.append("valuation base data missing")
+        action_ready_blockers.append("market-cap size data missing")
+    if metrics.get("vs50") is None or metrics.get("vs200") is None:
+        action_ready_blockers.append("50/200DMA history incomplete")
     return {
         "entryAllowed": not blockers,
         "actionReadyAllowed": not blockers and not action_ready_blockers,
@@ -458,12 +632,31 @@ def portfolio_correlation_bucket(item: dict, thesis_tags: List[str]) -> str:
     return "non_ai_or_other"
 
 
-def research_priority_score(structural: int, evidence: int, setup: int, factors: Dict[str, int], tier: str) -> int:
+def research_priority_components(structural: int, evidence: int, setup: int, factors: Dict[str, int], tier: str) -> dict:
     hidden = factors.get("underappreciation", 50)
     proof = factors.get("proofPoints", 50)
-    score = structural * 0.48 + evidence * 0.20 + hidden * 0.17 + proof * 0.10 + setup * 0.05
-    score += TIER_BONUS.get(tier, -2)
-    return int(round(clamp(score)))
+    raw_components = {
+        "structural": structural * 0.48,
+        "evidence": evidence * 0.20,
+        "underappreciationOverlay": hidden * 0.17,
+        "proofPointsOverlay": proof * 0.10,
+        "setup": setup * 0.05,
+    }
+    tier_bonus = TIER_BONUS.get(tier, -2)
+    before_tier = sum(raw_components.values())
+    raw_score = before_tier + tier_bonus
+    return {
+        **{key: rn(value, 3) for key, value in raw_components.items()},
+        "tierBonus": tier_bonus,
+        "beforeTierBonus": rn(before_tier, 3),
+        "rawScore": rn(raw_score, 3),
+        "finalScore": int(round(clamp(raw_score))),
+        "clamped": raw_score < 0 or raw_score > 100,
+    }
+
+
+def research_priority_score(structural: int, evidence: int, setup: int, factors: Dict[str, int], tier: str) -> int:
+    return research_priority_components(structural, evidence, setup, factors, tier)["finalScore"]
 
 
 def research_action(tier: str, gate: str) -> str:
@@ -630,6 +823,7 @@ def build_scores(
     prices,
     exposures: Optional[Dict[str, dict]] = None,
     profiles: Optional[Dict[str, dict]] = None,
+    reference_date: Optional[str] = None,
 ) -> Tuple[List[dict], Optional[str]]:
     exposures = exposures or {}
     profiles = profiles or {}
@@ -637,16 +831,37 @@ def build_scores(
     benchmark_metrics = None
     if prices is not None and BENCHMARK in getattr(prices, "columns", []):
         benchmark = prices[BENCHMARK]
-        benchmark_metrics = aiq.market_metrics(benchmark, profile={})
+    reference_date = reference_date or aiq._reference_date_from_prices(prices, BENCHMARK)
+    reference_index = getattr(benchmark, "index", None) if benchmark is not None else getattr(prices, "index", None)
+    if benchmark is not None:
+        benchmark_metrics = aiq.market_metrics(
+            benchmark,
+            profile={"currency": "USD"},
+            reference_date=reference_date,
+            reference_index=reference_index,
+        )
 
     metrics_by_ticker: Dict[str, dict] = {}
     latest_date: Optional[str] = None
     for item in universe:
         ticker = item["ticker"]
-        profile = profiles.get(ticker) or {}
+        profile = {
+            "ticker": ticker,
+            "currency": aiq.infer_ticker_currency(ticker),
+            **(profiles.get(ticker) or {}),
+        }
         metrics = {"available": False, **aiq.market_profile_fields(profile)}
         if prices is not None and ticker in getattr(prices, "columns", []):
-            metrics = aiq.market_metrics(prices[ticker], benchmark=benchmark, profile=profile)
+            currency = (profile.get("currency") or aiq.infer_ticker_currency(ticker)).upper()
+            fx_ticker = (aiq.FX_SPECS.get(currency) or (None, None))[0]
+            metrics = aiq.market_metrics(
+                prices[ticker],
+                benchmark=benchmark,
+                profile=profile,
+                fx_series=aiq._series_column(prices, fx_ticker),
+                reference_date=reference_date,
+                reference_index=reference_index,
+            )
             latest_date = max(latest_date or metrics.get("date"), metrics.get("date") or latest_date)
         metrics_by_ticker[ticker] = metrics
 
@@ -654,7 +869,7 @@ def build_scores(
     rows = []
     for item in universe:
         metrics = metrics_by_ticker[item["ticker"]]
-        factors = {k: int(v) for k, v in (item.get("factors") or {}).items()}
+        factors = {k: float(v) for k, v in (item.get("factors") or {}).items()}
         structural = structural_score(factors)
         trend, risk, tactical, risk_penalty = aiq.market_overlay(metrics, peer_metrics)
         exp = exposure_for(item, exposures)
@@ -662,14 +877,18 @@ def build_scores(
         dq_score, dq_reasons = aiq.data_quality(metrics)
         dq_severity = data_quality_severity(metrics, dq_score, dq_reasons)
         hard_review = dq_severity == "hard_review"
-        ev_score = evidence_score(item.get("evidenceLevel"))
+        evidence_ledger = normalize_evidence_ledger(item)
+        evidence_eval = evidence_assessment(evidence_ledger, item.get("evidenceLevel"), reference_date)
+        raw_evidence_score = evidence_eval["rawScore"]
+        ev_score = evidence_eval["effectiveScore"]
         raw_setup = int(round(clamp(structural * 0.55 + tactical * 0.30 + risk * 0.15 - risk_penalty)))
         raw_entry_score = int(round(clamp(raw_setup - p_penalty)))
         crowd = crowding_risk(metrics, item.get("priorityTier") or "", "DATA_REVIEW" if hard_review else "")
         eligibility = entry_eligibility(dq_severity, crowd, metrics)
         setup = 0 if hard_review else raw_setup
         entry_score = adjust_entry_score(raw_entry_score, dq_severity, crowd, metrics)
-        final = research_priority_score(structural, ev_score, entry_score, factors, item.get("priorityTier") or "")
+        priority_components = research_priority_components(structural, ev_score, entry_score, factors, item.get("priorityTier") or "")
+        final = priority_components["finalScore"]
         gate, tone, gate_note, gate_reasons = research_gate_for(
             final,
             structural,
@@ -682,7 +901,8 @@ def build_scores(
         crowd = crowding_risk(metrics, item.get("priorityTier") or "", gate)
         eligibility = entry_eligibility(dq_severity, crowd, metrics)
         entry_score = adjust_entry_score(raw_entry_score, dq_severity, crowd, metrics)
-        final = research_priority_score(structural, ev_score, entry_score, factors, item.get("priorityTier") or "")
+        priority_components = research_priority_components(structural, ev_score, entry_score, factors, item.get("priorityTier") or "")
+        final = priority_components["finalScore"]
         entry_gate, entry_note, entry_reasons = entry_gate_for(
             entry_score,
             structural,
@@ -698,7 +918,6 @@ def build_scores(
         queue = "Data Review Queue" if hard_review else "Research Queue"
         if not hard_review and entry_gate in ("ACTION_READY", "ALLOW_REVIEW"):
             queue = "Entry Queue"
-        evidence_ledger = normalize_evidence_ledger(item)
         thesis_tags = infer_thesis_tags(item)
         correlation_bucket = portfolio_correlation_bucket(item, thesis_tags)
         row = {
@@ -709,9 +928,11 @@ def build_scores(
             "modelWorkstream": model_workstream(item, hard_review),
             "queue": queue,
             "dataQuarantined": hard_review,
+            "rawEvidenceScore": raw_evidence_score,
             "evidenceScore": ev_score,
+            "evidenceAssessment": evidence_eval,
             "evidenceLedger": evidence_ledger,
-            "evidenceAudit": evidence_audit(evidence_ledger),
+            "evidenceAudit": evidence_audit(evidence_ledger, reference_date),
             "structuralScore": structural,
             "trendScore": trend,
             "riskScore": risk,
@@ -727,6 +948,7 @@ def build_scores(
             "standaloneScore": setup,
             "finalScore": final,
             "researchPriorityScore": final,
+            "researchScoreComponents": priority_components,
             "scoreBand": score_band(final),
             "gate": gate,
             "gateFamily": gate_family(gate),
@@ -745,31 +967,38 @@ def build_scores(
             "instrumentMaster": instrument_master(item, metrics, dq_severity, dq_reasons),
             "thesisTags": thesis_tags,
             "portfolioCorrelationBucket": correlation_bucket,
+            "portfolioCorrelationMethod": "qualitative thesis-tag overlap; not a measured return correlation",
             "market": metrics,
             "portfolio": exp,
         }
         rows.append(row)
 
-    final_values = [r["finalScore"] for r in rows]
+    ranked_rows = [r for r in rows if not r.get("dataQuarantined")]
+    final_values = [r["finalScore"] for r in ranked_rows]
     structural_values = [r["structuralScore"] for r in rows]
-    tactical_values = [r["tacticalScore"] for r in rows]
+    tactical_values = [r["tacticalScore"] for r in ranked_rows]
     by_bucket: Dict[str, List[dict]] = {}
     by_direction: Dict[str, List[dict]] = {}
     for row in rows:
         by_bucket.setdefault(row["bucket"], []).append(row)
         by_direction.setdefault(row.get("direction") or row["bucket"], []).append(row)
     for row in rows:
-        peers = by_bucket.get(row["bucket"], [])
-        direction_peers = by_direction.get(row.get("direction") or row["bucket"], [])
+        is_ranked = not row.get("dataQuarantined")
+        peers = [p for p in by_bucket.get(row["bucket"], []) if not p.get("dataQuarantined")]
+        direction_peers = [p for p in by_direction.get(row.get("direction") or row["bucket"], []) if not p.get("dataQuarantined")]
         direction_sorted = sorted(direction_peers, key=lambda r: (-r["finalScore"], -r["structuralScore"], r["ticker"]))
-        row["universePercentile"] = percentile(row["finalScore"], final_values)
+        row["universePercentile"] = percentile(row["finalScore"], final_values) if is_ranked else None
         row["structuralPercentile"] = percentile(row["structuralScore"], structural_values)
-        row["tacticalPercentile"] = percentile(row["tacticalScore"], tactical_values)
+        row["tacticalPercentile"] = percentile(row["tacticalScore"], tactical_values) if is_ranked else None
         row["bucketSize"] = len(peers)
-        row["bucketPercentile"] = percentile(row["finalScore"], [p["finalScore"] for p in peers])
+        row["bucketPercentile"] = percentile(row["finalScore"], [p["finalScore"] for p in peers]) if is_ranked else None
         row["directionSize"] = len(direction_peers)
         row["directionRank"] = next((i + 1 for i, peer in enumerate(direction_sorted) if peer["ticker"] == row["ticker"]), None)
-        if len(direction_peers) >= 3:
+        if not is_ranked:
+            row["directionRelativeScore"] = None
+            row["directionPeerGroupStatus"] = "data_quarantined_not_ranked"
+            row["directionRankLabel"] = "Data review / not ranked"
+        elif len(direction_peers) >= 3:
             row["directionRelativeScore"] = percentile(row["finalScore"], [p["finalScore"] for p in direction_peers])
             row["directionPeerGroupStatus"] = "peer_percentile"
             row["directionRankLabel"] = f"{row['directionRank']}/{len(direction_peers)}"
@@ -907,13 +1136,25 @@ def model_card(rows: List[dict], latest_date: Optional[str], universe_path: Path
     entry_rows = [r for r in research_rows if r.get("entryGate") in ("ACTION_READY", "ALLOW_REVIEW")]
     ledgers = [r.get("evidenceLedger") or [] for r in rows]
     total_claims = sum(len(ledger) for ledger in ledgers)
-    attached_urls = sum(1 for ledger in ledgers for entry in ledger if entry.get("sourceUrl"))
+    attached_urls = sum(1 for ledger in ledgers for entry in ledger if valid_source_url(entry.get("sourceUrl")))
+    evidence_decision_grade = sum(1 for r in rows if (r.get("evidenceAssessment") or {}).get("decisionGrade"))
     return {
         "modelVersion": MODEL_VERSION,
         "dataDate": latest_date,
-        "universePath": str(universe_path),
+        "universeFile": universe_path.name,
+        "universePathIncluded": False,
         "universeSize": len(rows),
         "factorWeights": FACTOR_WEIGHTS,
+        "effectiveResearchWeightsBeforeTierBonus": {
+            "bottleneckFit": 0.1344,
+            "proofPoints": 0.2152,
+            "monetizationPath": 0.0864,
+            "underappreciation": 0.2564,
+            "executionRiskControl": 0.0576,
+            "evidence": 0.20,
+            "setup": 0.05,
+        },
+        "priorityTierBonusIsAdditive": True,
         "frameworkStages": list(FRAMEWORK_STAGES),
         "evidenceLevelScores": EVIDENCE_LEVEL_SCORES,
         "priorityTierOrder": TIER_ORDER,
@@ -932,9 +1173,16 @@ def model_card(rows: List[dict], latest_date: Optional[str], universe_path: Path
         "evidenceLedgerCoverage": rn(sum(1 for ledger in ledgers if ledger) / len(rows) * 100.0, 1) if rows else None,
         "evidenceLedgerMissingUrlCount": sum((r.get("evidenceAudit") or {}).get("missingSourceUrlCount", 0) for r in rows),
         "evidenceLedgerRefreshCount": sum((r.get("evidenceAudit") or {}).get("needsRefreshCount", 0) for r in rows),
+        "evidenceDefaultSourceDateCount": sum((r.get("evidenceAudit") or {}).get("defaultSourceDateCount", 0) for r in rows),
         "evidenceConfidenceCappedCount": sum((r.get("evidenceAudit") or {}).get("confidenceCappedCount", 0) for r in rows),
+        "evidenceScoreCappedCount": sum(1 for r in rows if (r.get("evidenceAssessment") or {}).get("scoreCapApplied")),
+        "evidenceDecisionGradeCount": evidence_decision_grade,
+        "evidenceDecisionGradePct": rn(evidence_decision_grade / len(rows) * 100.0, 1) if rows else None,
         "instrumentMasterCoverage": rn(sum(1 for r in rows if r.get("instrumentMaster")) / len(rows) * 100.0, 1) if rows else None,
         "portfolioThesisExposure": portfolio_thesis_exposure(rows),
+        "portfolioCorrelationSemantics": "Buckets are qualitative thesis-overlap labels, not Pearson/Spearman return correlations.",
+        "valuationSemantics": "No fundamental valuation feed is present; pricePositionBand is only price versus its trailing median.",
+        "earningsAndOwnershipSemantics": "No earnings-calendar, consensus-expectation, ownership, or observed gap feed is present; related fields are withheld and priceVolatilityRisk is only a proxy.",
         "benchmark": BENCHMARK,
         "thresholds": {
             "buildModelTier": "T1 immediate deep dive",
@@ -1001,6 +1249,8 @@ def render_report(doc: dict) -> str:
         "- Hard data review is a quarantine fuse: those rows are removed from the main research queue until price/FX/split/share-count data is checked.",
         "- Direction-relative score is shown only for directions with at least three names; singleton directions show N/A.",
         "- Evidence audit separates ledger schema coverage from source URL coverage so populated slots are not mistaken for cited evidence.",
+        "- Evidence labels without a valid source URL are retained as priors but capped at 64/100 in the research-priority calculation; expired, future-dated, or refresh-required claims are capped further.",
+        "- Research-priority effective factor weights are disclosed in the model card because proof points and underappreciation are intentionally emphasized both inside and outside the structural score.",
         "- Gates are research workflow labels, not buy/sell recommendations. Any real trade still needs market regime, sizing, invalidation, and concentration checks.",
         "",
         "| Factor | Weight | Meaning |",
@@ -1024,7 +1274,7 @@ def render_report(doc: dict) -> str:
         lines.append(
             f"| {i} | {row['ticker']} | {row['name']} | {row.get('actionTier', row.get('priorityTier', '-'))} | {row.get('modelWorkstream', '-')} | "
             f"{row.get('clusterRole', '-')} {row.get('directionRankLabel') or '-'} | {row['gate']} | {row.get('entryGate', '-')} | "
-            f"{row['finalScore']} | {direction_score_display(row)} | {row.get('entryScore', '-')} | {row.get('evidenceScore', '-')} | {row['structuralScore']} | "
+            f"{row['finalScore']} | {direction_score_display(row)} | {row.get('entryScore', '-')} | {row.get('evidenceScore', '-')} (raw {row.get('rawEvidenceScore', '-')}) | {row['structuralScore']} | "
             f"{market.get('displayPrice') or '-'} | "
             f"{pct(market.get('ret3m'))} | {pct(market.get('vs50'))} | {fmt_cap(market.get('marketCapUsd'))} | {reason} |"
         )
@@ -1034,7 +1284,7 @@ def render_report(doc: dict) -> str:
             "",
             "## Entry Queue",
             "",
-            "| Rank | Ticker | Company | Entry gate | Entry score | 50DMA | 200DMA | 3M | Rel 3M vs SPY | Valuation band | Gap risk |",
+            "| Rank | Ticker | Company | Entry gate | Entry score | 50DMA | 200DMA | 3M | Rel 3M vs SPY | Price vs trailing median | Price-volatility proxy |",
             "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
         ]
     )
@@ -1043,7 +1293,7 @@ def render_report(doc: dict) -> str:
         lines.append(
             f"| {i} | {row['ticker']} | {row['name']} | {row.get('entryGate')} | {row.get('entryScore')} | "
             f"{pct(diag.get('distanceTo50DMA'))} | {pct(diag.get('distanceTo200DMA'))} | {pct(diag.get('threeMonthReturn'))} | "
-            f"{pct(diag.get('relativeStrengthVsBenchmark3M'))} | {diag.get('valuationBand') or '-'} | {diag.get('postEarningsGapRisk') or '-'} |"
+            f"{pct(diag.get('relativeStrengthVsBenchmark3M'))} | {diag.get('pricePositionBand') or '-'} | {diag.get('priceVolatilityRisk') or '-'} |"
         )
 
     lines.extend(
@@ -1130,8 +1380,10 @@ def render_report(doc: dict) -> str:
             f"- Ledger schema coverage: {model.get('ledgerSchemaCoverage')}%",
             f"- Source URL coverage: {model.get('sourceUrlCoverage')}% ({model.get('sourceUrlAttachedCount')}/{model.get('sourceUrlRequiredCount')})",
             f"- Evidence confidence capped by missing URLs: {model.get('evidenceConfidenceCappedCount')}",
+            f"- Evidence numerical score caps: {model.get('evidenceScoreCappedCount')}; decision-grade evidence rows: {model.get('evidenceDecisionGradeCount')}/{model.get('universeSize')}",
+            f"- Evidence claims using the import-date fallback instead of an explicit source date: {model.get('evidenceDefaultSourceDateCount')}",
             f"- Instrument master coverage: {model.get('instrumentMasterCoverage')}%",
-            f"- Universe file: `{model.get('universePath')}`",
+            f"- Universe file: `{model.get('universeFile')}` (absolute path omitted)",
             "- Private/unpriced names omitted: " + ", ".join(model.get("privateOrUnpricedNamesOmitted") or []),
             "",
             "## KPI Checklist",
@@ -1150,7 +1402,7 @@ def render_report(doc: dict) -> str:
         first = ledger[0] if ledger else {}
         lines.append(
             f"- {row['ticker']}: {first.get('sourceType', '-')} · {first.get('sourceDate', '-')} · "
-            f"{first.get('confidence', '-')} · URL={'yes' if first.get('sourceUrl') else 'no'} · link={first.get('financialLink', '-')}"
+            f"{first.get('confidence', '-')} · URL={'yes' if valid_source_url(first.get('sourceUrl')) else 'no'} · financial linkage={first.get('financialLink', '-')}"
         )
 
     thesis = model.get("portfolioThesisExposure") or {}
@@ -1187,6 +1439,7 @@ def write_csv(rows: List[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "rank",
+        "dataReviewRank",
         "ticker",
         "name",
         "stage",
@@ -1208,7 +1461,9 @@ def write_csv(rows: List[dict], path: Path) -> None:
         "entryGate",
         "finalScore",
         "entryScore",
+        "rawEvidenceScore",
         "evidenceScore",
+        "evidenceDecisionGrade",
         "universePercentile",
         "structuralScore",
         "setupScore",
@@ -1220,6 +1475,8 @@ def write_csv(rows: List[dict], path: Path) -> None:
         "ret3m",
         "vs50",
         "marketCapUsd",
+        "marketCapPointInTimeCompatible",
+        "returnBasis",
         "dataQualitySeverity",
         "setupFrozen",
         "entryAllowed",
@@ -1228,6 +1485,7 @@ def write_csv(rows: List[dict], path: Path) -> None:
         "distanceTo200DMA",
         "relativeStrengthVsBenchmark3M",
         "valuationBand",
+        "pricePositionBand",
         "priceExtension",
         "narrativeHeat",
         "portfolioWeightPct",
@@ -1240,10 +1498,10 @@ def write_csv(rows: List[dict], path: Path) -> None:
         "rebuttalChecks",
         "mainReason",
     ]
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for i, row in enumerate(rows, 1):
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
             market = row.get("market") or {}
             portfolio = row.get("portfolio") or {}
             diag = row.get("entryDiagnostics") or {}
@@ -1253,7 +1511,8 @@ def write_csv(rows: List[dict], path: Path) -> None:
             reason = (row.get("gateReasons") or [{}])[0].get("detail", row.get("gateNote", ""))
             writer.writerow(
                 {
-                    "rank": i,
+                    "rank": row.get("researchQueueRank"),
+                    "dataReviewRank": row.get("dataReviewQueueRank"),
                     "ticker": row["ticker"],
                     "name": row["name"],
                     "stage": row.get("stage"),
@@ -1275,7 +1534,9 @@ def write_csv(rows: List[dict], path: Path) -> None:
                     "entryGate": row.get("entryGate"),
                     "finalScore": row["finalScore"],
                     "entryScore": row.get("entryScore"),
+                    "rawEvidenceScore": row.get("rawEvidenceScore"),
                     "evidenceScore": row.get("evidenceScore"),
+                    "evidenceDecisionGrade": (row.get("evidenceAssessment") or {}).get("decisionGrade"),
                     "universePercentile": row.get("universePercentile"),
                     "structuralScore": row["structuralScore"],
                     "setupScore": row.get("setupScore"),
@@ -1287,6 +1548,8 @@ def write_csv(rows: List[dict], path: Path) -> None:
                     "ret3m": market.get("ret3m"),
                     "vs50": market.get("vs50"),
                     "marketCapUsd": market.get("marketCapUsd"),
+                    "marketCapPointInTimeCompatible": market.get("marketCapPointInTimeCompatible"),
+                    "returnBasis": market.get("returnBasis"),
                     "dataQualitySeverity": row.get("dataQualitySeverity"),
                     "setupFrozen": row.get("setupFrozen"),
                     "entryAllowed": elig.get("entryAllowed"),
@@ -1295,6 +1558,7 @@ def write_csv(rows: List[dict], path: Path) -> None:
                     "distanceTo200DMA": diag.get("distanceTo200DMA"),
                     "relativeStrengthVsBenchmark3M": diag.get("relativeStrengthVsBenchmark3M"),
                     "valuationBand": diag.get("valuationBand"),
+                    "pricePositionBand": diag.get("pricePositionBand"),
                     "priceExtension": crowd.get("priceExtension"),
                     "narrativeHeat": crowd.get("narrativeHeat"),
                     "portfolioWeightPct": portfolio.get("weightPct"),
@@ -1308,23 +1572,48 @@ def write_csv(rows: List[dict], path: Path) -> None:
                     "mainReason": reason,
                 }
             )
+    atomic_write_text(path, buffer.getvalue())
 
 
 def build_document(args) -> dict:
     universe_path = Path(args.universe).expanduser().resolve()
     universe = load_universe(universe_path)
     tickers = [item["ticker"] for item in universe]
-    prices = fetch_prices(tickers, period=args.period, no_fetch=args.no_fetch)
-    profiles = aiq.load_market_profiles(tickers, no_fetch=args.no_fetch)
     payload = aiq.read_dashboard_payload(Path(args.dashboard))
+    target_as_of = aiq.dashboard_market_as_of(payload)
+    profiles = aiq.load_market_profiles(
+        tickers,
+        no_fetch=args.no_fetch,
+        market_data_as_of=target_as_of,
+    )
+    market_tickers = [*tickers, *aiq.required_fx_tickers(profiles, tickers)]
+    raw_prices = fetch_prices(market_tickers, period=args.period, no_fetch=args.no_fetch)
+    profiles = aiq.align_market_profile_as_of(profiles, raw_prices, target_as_of)
+    raw_rows = len(raw_prices) if raw_prices is not None else 0
+    prices = aiq.truncate_market_data(raw_prices, target_as_of)
+    aligned_rows = len(prices) if prices is not None else 0
     exposures = aiq.portfolio_exposure(payload)
-    rows, latest = build_scores(universe, prices=prices, exposures=exposures, profiles=profiles)
+    rows, latest = build_scores(
+        universe,
+        prices=prices,
+        exposures=exposures,
+        profiles=profiles,
+        reference_date=target_as_of,
+    )
     generated = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     return {
+        "schemaVersion": 1,
+        "researchOnly": True,
+        "decisionGrade": False,
         "title": "AI Old-Capability Watchlist",
         "subtitle": "Companies whose old capabilities may become new AI bottlenecks",
         "generatedAt": generated,
         "marketDataAsOf": latest,
+        "dataAlignment": {
+            "portfolioPriceAsOf": target_as_of,
+            "futureCalendarRowsExcluded": max(0, raw_rows - aligned_rows),
+            "policy": "market overlays do not use closes after the dashboard price date; non-USD technical returns include backward-filled daily FX",
+        },
         "modelVersion": MODEL_VERSION,
         "factorWeights": FACTOR_WEIGHTS,
         "factorLabels": FACTOR_LABELS,
@@ -1351,17 +1640,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
     out_csv = Path(args.out_csv)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    out_md.write_text(render_report(doc), encoding="utf-8")
+    atomic_write_json(out_json, doc)
+    atomic_write_text(out_md, render_report(doc))
     write_csv(doc["scores"], out_csv)
 
-    leaders = ", ".join(f"{r['ticker']} {r['finalScore']} {r['gate']}" for r in doc["scores"][:5])
+    ranked = [row for row in doc["scores"] if not row.get("dataQuarantined")]
+    display_rows = ranked[:5] if ranked else (doc.get("queues") or {}).get("dataReviewQueue", [])[:5]
+    leaders = ", ".join(f"{r['ticker']} {r['finalScore']} {r['gate']}" for r in display_rows)
     print(f"AI watchlist written: {out_json}")
     print(f"Report: {out_md}")
     print(f"CSV: {out_csv}")
     print(f"Market data as of: {doc.get('marketDataAsOf') or 'unavailable'}")
-    print(f"Top 5: {leaders}")
+    print(f"{'Top ranked 5' if ranked else 'Data-review priority 5'}: {leaders}")
     return 0
 
 

@@ -6,33 +6,66 @@ scores whether intraday "center of gravity" has stopped falling. It is a
 technical monitor, not trading advice.
 """
 import argparse
-import csv
 import datetime as dt
+import fcntl
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+try:
+    from scripts.artifact_io import (
+        append_csv_row_private,
+        atomic_write_csv,
+        atomic_write_json,
+        atomic_write_text as _private_atomic_write_text,
+        ensure_private_directory,
+    )
+except ModuleNotFoundError:  # direct ``python scripts/monitor_qqq_intraday.py``
+    from artifact_io import (
+        append_csv_row_private,
+        atomic_write_csv,
+        atomic_write_json,
+        atomic_write_text as _private_atomic_write_text,
+        ensure_private_directory,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "output" / "intraday_qqq"
+DEFAULT_EVENTS = ROOT / "output" / "intraday_tape" / "events.json"
 INTERVALS = ("1m", "5m", "15m", "30m")
-INTERVAL_PERIODS = {"1m": "1d", "5m": "5d", "15m": "5d", "30m": "1mo"}
-PT = dt.timezone(dt.timedelta(hours=-7), name="America/Los_Angeles")
-ET = dt.timezone(dt.timedelta(hours=-4), name="America/New_York")
+INTERVAL_PERIODS = {"1m": "7d", "5m": "30d", "15m": "60d", "30m": "60d"}
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
+PT = ZoneInfo("America/Los_Angeles")
+ET = ZoneInfo("America/New_York")
 TELEGRAM_CHAT_CACHE = "telegram_chat_id.txt"
 STATE_FILE_NAME = "state.json"
+MIN_VOLUME_BASELINE_DAYS = 3
+DAILY_SETTLEMENT_DELAY_MINUTES = 15
+
+
+def safe_symbol_component(value):
+    """Validate a Yahoo-style symbol before it becomes part of an output filename."""
+    text = str(value or "").strip().upper()
+    if (not re.fullmatch(r"[A-Z0-9^][A-Z0-9._^=-]{0,63}", text)
+            or text in {".", ".."}):
+        raise ValueError(f"unsafe symbol: {value!r}")
+    return text
 
 
 def _to_float(value):
     try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
+        if value is None:
             return None
-        return float(value)
+        converted = float(value)
+        return converted if math.isfinite(converted) else None
     except Exception:
         return None
 
@@ -57,6 +90,101 @@ def _session_time(row):
         return dt.datetime.fromisoformat(row["time"]).timetz().replace(tzinfo=None)
     except Exception:
         return None
+
+
+def _parse_timestamp(value):
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def closed_interval_rows(rows, interval, now=None):
+    """Drop the provider's still-forming final candle."""
+    if not rows:
+        return []
+    current = (now or dt.datetime.now(tz=ET)).astimezone(ET)
+    started = _parse_timestamp(rows[-1].get("time"))
+    if started is None:
+        return list(rows[:-1])
+    ended = started.astimezone(ET) + dt.timedelta(minutes=INTERVAL_MINUTES[interval])
+    if current < ended + dt.timedelta(seconds=30):
+        return list(rows[:-1])
+    return list(rows)
+
+
+def market_data_freshness(intraday, now=None):
+    """Validate current-session closed bars before a signal can be actionable."""
+    current = (now or dt.datetime.now(tz=ET)).astimezone(ET)
+    checks = {}
+    for interval in ("5m", "15m"):
+        rows = current_session_rows(intraday.get(interval) or [])
+        started = _parse_timestamp((rows[-1] if rows else {}).get("time"))
+        minutes = INTERVAL_MINUTES[interval]
+        if started is None:
+            checks[interval] = {"fresh": False, "reason": "missing_closed_bar"}
+            continue
+        started = started.astimezone(ET)
+        ended = started + dt.timedelta(minutes=minutes)
+        age = (current.astimezone(dt.timezone.utc) - ended.astimezone(dt.timezone.utc)).total_seconds() / 60.0
+        same_session = started.date() == current.date()
+        max_age = minutes + 5
+        fresh = same_session and -2.0 <= age <= max_age
+        if not same_session:
+            reason = "different_et_session_date"
+        elif age < -2.0:
+            reason = "bar_end_in_future"
+        elif age > max_age:
+            reason = "bar_stale"
+        else:
+            reason = None
+        checks[interval] = {
+            "fresh": fresh,
+            "reason": reason,
+            "barStart": started.isoformat(timespec="minutes"),
+            "barEnd": ended.isoformat(timespec="minutes"),
+            "ageMinutes": round(age, 1),
+            "maxAgeMinutes": max_age,
+        }
+    fresh = all(checks.get(interval, {}).get("fresh") for interval in ("5m", "15m"))
+    return {
+        "fresh": fresh,
+        "reason": None if fresh else "required_5m_15m_bars_missing_stale_or_wrong_session",
+        "checkedAt": current.isoformat(timespec="seconds"),
+        "intervals": checks,
+    }
+
+
+def atomic_write_text(path, text):
+    _private_atomic_write_text(path, text)
+
+
+def acquire_lock(path):
+    path = Path(path)
+    ensure_private_directory(path.parent)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    path.chmod(0o600)
+    return handle
+
+
+def release_lock(handle):
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def current_session_rows(rows):
@@ -106,16 +234,22 @@ def rsi_values(values, n=14):
         elif len(gains) == n:
             avg_gain = sum(gains[-n:]) / n
             avg_loss = sum(losses[-n:]) / n
-            out.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+            if avg_gain == 0 and avg_loss == 0:
+                out.append(50.0)
+            else:
+                out.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
         else:
             avg_gain = (avg_gain * (n - 1) + gains[-1]) / n
             avg_loss = (avg_loss * (n - 1) + losses[-1]) / n
-            out.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+            if avg_gain == 0 and avg_loss == 0:
+                out.append(50.0)
+            else:
+                out.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
         prev = cur
     return out
 
 
-def atr14_rows(rows):
+def atr_rows(rows, n=14):
     trs = []
     prev_close = None
     for row in rows:
@@ -129,15 +263,19 @@ def atr14_rows(rows):
 
     out, cur = [], None
     for i, tr in enumerate(trs):
-        if i < 13:
+        if i < n - 1:
             out.append(None)
-        elif i == 13:
-            cur = sum(trs[:14]) / 14.0
+        elif i == n - 1:
+            cur = sum(trs[:n]) / float(n)
             out.append(cur)
         else:
-            cur = (cur * 13 + tr) / 14.0
+            cur = (cur * (n - 1) + tr) / float(n)
             out.append(cur)
     return out
+
+
+def atr14_rows(rows):
+    return atr_rows(rows, 14)
 
 
 def _flatten_download(df, symbol):
@@ -173,7 +311,9 @@ def _df_to_rows(df, symbol):
         high = _to_float(row[colmap["high"]])
         low = _to_float(row[colmap["low"]])
         open_ = _to_float(row[colmap["open"]])
-        if close is None or high is None or low is None or open_ is None:
+        if (close is None or high is None or low is None or open_ is None or
+                min(open_, high, low, close) <= 0 or high < max(open_, close, low) or
+                low > min(open_, close, high)):
             continue
         vol_col = colmap.get("volume")
         volume = _to_float(row[vol_col]) if vol_col is not None else 0.0
@@ -186,9 +326,10 @@ def _df_to_rows(df, symbol):
             "high": high,
             "low": low,
             "close": close,
-            "volume": volume or 0.0,
+            "volume": max(volume or 0.0, 0.0),
         })
-    return rows
+    by_time = {row["time"]: row for row in rows}
+    return [by_time[key] for key in sorted(by_time)]
 
 
 def add_intraday_features(rows):
@@ -232,7 +373,7 @@ def fetch_intraday(symbol, intervals=INTERVALS):
             symbol,
             period=INTERVAL_PERIODS.get(interval, "1d"),
             interval=interval,
-            auto_adjust=False,
+            auto_adjust=True,
             prepost=False,
             progress=False,
             threads=False,
@@ -241,7 +382,17 @@ def fetch_intraday(symbol, intervals=INTERVALS):
     return out
 
 
-def fetch_daily_context(symbol):
+def completed_daily_rows(rows, now=None):
+    current = (now or dt.datetime.now(tz=ET)).astimezone(ET)
+    settled = current.replace(hour=16, minute=0, second=0, microsecond=0) + dt.timedelta(
+        minutes=DAILY_SETTLEMENT_DELAY_MINUTES
+    )
+    if current < settled:
+        return [row for row in rows if _session_date(row) != current.date().isoformat()]
+    return rows
+
+
+def fetch_daily_context(symbol, now=None):
     import warnings
     warnings.filterwarnings("ignore")
     import yfinance as yf
@@ -250,11 +401,11 @@ def fetch_daily_context(symbol):
         symbol,
         period="6mo",
         interval="1d",
-        auto_adjust=False,
+        auto_adjust=True,
         progress=False,
         threads=False,
     )
-    rows = _df_to_rows(df, symbol)
+    rows = completed_daily_rows(_df_to_rows(df, symbol), now=now)
     if len(rows) < 34:
         return {"available": False, "reason": "not enough daily rows"}
     closes = [r["close"] for r in rows]
@@ -278,6 +429,11 @@ def fetch_daily_context(symbol):
     if swing_high > swing_low:
         for name, ratio in (("fib23", 0.236), ("fib38", 0.382), ("fib50", 0.500), ("fib62", 0.618)):
             pullback_fibs[name] = _round(swing_high - (swing_high - swing_low) * ratio)
+    two_below = bool(
+        len(rows) >= 2
+        and all(rows[index].get("ema21") is not None for index in (-2, -1))
+        and all(rows[index]["close"] < rows[index]["ema21"] for index in (-2, -1))
+    )
     return {
         "available": True,
         "date": last["time"][:10],
@@ -291,6 +447,9 @@ def fetch_daily_context(symbol):
         "atr14": _round(last["atr14"]),
         "rsi14": _round(last["rsi14"], 1),
         "ema21Slope5": _round((last["ema21"] / rows[-6]["ema21"] - 1) * 100, 2) if len(rows) >= 6 and rows[-6].get("ema21") else None,
+        "twoBelowEma21": two_below,
+        "barStatus": "completed_daily_bar",
+        "priceBasis": "split_and_distribution_adjusted_OHLC; current scale",
         "swingWindowDays": len(recent),
         "swingHigh": _round(swing_high),
         "swingLow": _round(swing_low),
@@ -307,10 +466,6 @@ def volume_context(rows, session, interval):
         return {}
     last = session[-1]
     last_vol = _to_float(last.get("volume")) or 0.0
-    sample = [r.get("volume") for r in session[-21:-1]]
-    if len([v for v in sample if _to_float(v)]) < 5:
-        sample = [r.get("volume") for r in rows[-61:-1]]
-    vma20 = _avg(sample)
 
     minutes = interval_minutes(interval)
     recent_n = max(2, int(math.ceil(15 / minutes)))
@@ -318,26 +473,42 @@ def volume_context(rows, session, interval):
     prior_avg = _avg([r.get("volume") for r in session[-(recent_n + 20):-recent_n]])
 
     cur_time = _session_time(last)
-    current_cum = sum((_to_float(r.get("volume")) or 0.0) for r in session)
+    current_cum = sum(max(_to_float(r.get("volume")) or 0.0, 0.0) for r in session)
+    same_tod = []
     prior_cums = []
-    for date, day_rows in grouped_sessions(rows).items():
+    for date, day_rows in sorted(grouped_sessions(rows).items()):
         if date == _session_date(last) or not cur_time:
             continue
+        matches = [row for row in day_rows if _session_time(row) == cur_time]
+        if not matches:
+            continue
+        slot_volume = _to_float(matches[-1].get("volume"))
+        if slot_volume is None or slot_volume <= 0:
+            continue
+        same_tod.append(slot_volume)
         prior_cum = 0.0
         for row in day_rows:
             row_time = _session_time(row)
             if row_time and row_time <= cur_time:
-                prior_cum += _to_float(row.get("volume")) or 0.0
+                prior_cum += max(_to_float(row.get("volume")) or 0.0, 0.0)
         if prior_cum:
             prior_cums.append(prior_cum)
-    cum_base = _avg(prior_cums[-10:])
+    same_tod = same_tod[-10:]
+    prior_cums = prior_cums[-10:]
+    vma20 = _avg(same_tod)
+    cum_base = _avg(prior_cums)
+    sufficient = len(same_tod) >= MIN_VOLUME_BASELINE_DAYS and len(prior_cums) >= MIN_VOLUME_BASELINE_DAYS
     return {
         "lastVolume": _round(last_vol, 0),
         "vma20": _round(vma20, 0),
-        "volumeRatio": _round(last_vol / vma20, 2) if vma20 else None,
+        "volumeRatio": _round(last_vol / vma20, 2) if sufficient and vma20 and last_vol > 0 else None,
         "recentVolumeRatio": _round(recent_avg / prior_avg, 2) if prior_avg else None,
         "cumulativeVolume": _round(current_cum, 0),
-        "cumulativeVolumeRatio": _round(current_cum / cum_base, 2) if cum_base else None,
+        "cumulativeVolumeRatio": _round(current_cum / cum_base, 2) if sufficient and cum_base else None,
+        "volumeBaselineMethod": "same closed interval and cumulative time of day",
+        "volumeBaselineSampleDays": len(same_tod),
+        "volumeBaselineMinDays": MIN_VOLUME_BASELINE_DAYS,
+        "volumeBaselineSufficient": sufficient,
     }
 
 
@@ -413,11 +584,13 @@ def summarize_interval(rows, interval):
     recent_high = max(r["high"] for r in recent)
     prior_low = min((r["low"] for r in prior), default=None)
     prior_high = max((r["high"] for r in prior), default=None)
-    ema8_start = session[-min(len(session), bars_45m)]["ema8"]
-    ema21_start = session[-min(len(session), bars_45m)]["ema21"]
+    slope_start = session[-(bars_45m + 1)] if len(session) > bars_45m else None
     close = last["close"]
     vwap = last.get("vwap")
     bar_range = last["high"] - last["low"]
+    mean20 = _avg([row["close"] for row in session[-20:]]) if len(session) >= 20 else None
+    atr20_series = atr_rows(rows, 20)
+    atr20 = atr20_series[-1] if atr20_series else None
     out = {
         "available": True,
         "interval": interval,
@@ -440,8 +613,8 @@ def summarize_interval(rows, interval):
         "freshHigh45m": None if prior_high is None else recent_high > prior_high + 0.01,
         "ema8": _round(last.get("ema8")),
         "ema21": _round(last.get("ema21")),
-        "ema8Slope45m": _round(last["ema8"] - ema8_start),
-        "ema21Slope45m": _round(last["ema21"] - ema21_start),
+        "ema8Slope45m": _round(last["ema8"] - slope_start["ema8"]) if slope_start else None,
+        "ema21Slope45m": _round(last["ema21"] - slope_start["ema21"]) if slope_start else None,
         "vwap": _round(vwap),
         "distVwapPct": _round((close / vwap - 1) * 100, 2) if vwap else None,
         "aboveVwap": None if vwap is None else close >= vwap,
@@ -450,6 +623,11 @@ def summarize_interval(rows, interval):
         "ema8AboveEma21": last["ema8"] >= last["ema21"] if last.get("ema8") is not None and last.get("ema21") is not None else None,
         "rangePositionPct": _round((close - day_low) / (day_high - day_low) * 100, 1) if day_high > day_low else None,
         "lastBarPositionPct": _round((close - last["low"]) / bar_range * 100, 1) if bar_range > 0 else None,
+        "mean20": _round(mean20),
+        "atr20": _round(atr20),
+        "atr20Method": "Wilder true range over closed bars",
+        "extensionAtr20": _round(abs(close - mean20) / atr20, 2) if mean20 is not None and atr20 else None,
+        "moveDirection": "up" if mean20 is not None and close > mean20 else "down",
     }
     out.update(fma_context(last))
     out.update(volume_context(rows, session, interval))
@@ -564,7 +742,7 @@ def build_scenarios(label, summaries, levels):
     above = levels.get("nearestAbove") or {}
     below = levels.get("nearestBelow") or {}
     scenarios = []
-    if label == "BLOCK":
+    if label in {"BLOCK", "BLOCK_DATA"}:
         scenarios.append({
             "branch": "bear_continuation",
             "trigger": f"5m/15m 放量跌破 {fmt_num(below.get('px'))} 且收不回 VWAP/FMA",
@@ -601,7 +779,7 @@ def build_spread_plan(label, summaries, levels, daily):
     below = levels.get("nearestBelow") or {}
     daily_ema21 = daily.get("ema21")
     plans = []
-    if label == "BLOCK":
+    if label in {"BLOCK", "BLOCK_DATA"}:
         plans.append({
             "status": "BLOCK",
             "structure": "新增 TQQQ / long calls / call debit spread",
@@ -614,7 +792,7 @@ def build_spread_plan(label, summaries, levels, daily):
         })
         plans.append({
             "status": "WATCH",
-            "structure": "call credit spread",
+            "structure": "call credit spread (hedge only after verified long exposure)",
             "rule": "只有已有多头需要对冲，且价格反弹到2+成分阻力后才考虑；裸空方向仓不叫hedge。",
         })
     elif label == "WATCH":
@@ -630,13 +808,13 @@ def build_spread_plan(label, summaries, levels, daily):
         })
     else:
         plans.append({
-            "status": "ALLOW",
-            "structure": "small call debit spread",
-            "rule": "14-30DTE，近ATM long call + 上方压力short call；亏损预设，盈利后移动止盈。",
+            "status": "WATCH",
+            "structure": "small call debit spread candidate (chain not loaded)",
+            "rule": "14-30DTE，近ATM long call + 上方压力short call；只有在事件日历覆盖具体到期日、实时链确认流动性/debit/max loss 后才可 ALLOW。",
         })
         plans.append({
             "status": "WATCH",
-            "structure": "CCS hedge",
+            "structure": "CCS (hedge only after verified long exposure)",
             "rule": f"若冲到上方 {fmt_level(above)} 后滞涨，可用小宽度CCS给已有多头降波动。",
         })
     return plans
@@ -648,7 +826,11 @@ def evaluate_signal(intraday, daily):
     five = summaries.get("5m", {})
     fifteen = summaries.get("15m", {})
     thirty = summaries.get("30m", {})
-    last = one.get("close") or five.get("close") or daily.get("close")
+    last = next(
+        (value for value in (_to_float(one.get("close")), _to_float(five.get("close")), _to_float(daily.get("close")))
+         if value is not None),
+        None,
+    )
 
     checks = []
 
@@ -666,16 +848,24 @@ def evaluate_signal(intraday, daily):
     add("5m 收回 EMA21", five.get("aboveEma21"), 1, f"5m close {five.get('close')} vs EMA21 {five.get('ema21')}")
     add("5m EMA8>EMA21", five.get("ema8AboveEma21"), 1, f"5m EMA8 {five.get('ema8')} / EMA21 {five.get('ema21')}")
     add("15m 收回 EMA8", fifteen.get("aboveEma8"), 1, f"15m close {fifteen.get('close')} vs EMA8 {fifteen.get('ema8')}")
-    add("15m EMA8 斜率转正", (fifteen.get("ema8Slope45m") or 0) >= 0, 1, f"15m EMA8 45m slope {fifteen.get('ema8Slope45m')}")
-    add("45m 不再创新低", one.get("noNewLow45m") if one.get("available") else five.get("noNewLow45m"), 1,
+    slope_45m = _to_float(fifteen.get("ema8Slope45m"))
+    add("15m EMA8 斜率转正", None if slope_45m is None else slope_45m >= 0, 1, f"15m EMA8 45m slope {fifteen.get('ema8Slope45m')}")
+    no_new_low = one.get("noNewLow45m")
+    if no_new_low is None:
+        no_new_low = five.get("noNewLow45m")
+    add("45m 不再创新低", no_new_low, 1,
         f"recent low {one.get('recent45mLow') or five.get('recent45mLow')} vs prior {one.get('prior45mLow') or five.get('prior45mLow')}")
-    add("30m 收盘不在低位", (thirty.get("rangePositionPct") or 0) >= 35, 1, f"30m range position {thirty.get('rangePositionPct')}%")
-    heavy_new_low = (
-        five.get("freshLow45m") is True
-        and (_to_float(five.get("volumeRatio")) or 0) >= 1.5
-        and (_to_float(five.get("rangePositionPct")) or 0) <= 35
-    )
-    add("5m 量价不再下移", not heavy_new_low, 1, f"5m vol {five.get('volumeRatio')}x: {five.get('volumeVerdict')}")
+    range_30m = _to_float(thirty.get("rangePositionPct"))
+    add("30m 收盘不在低位", None if range_30m is None else range_30m >= 35, 1, f"30m range position {thirty.get('rangePositionPct')}%")
+    five_rvol = _to_float(five.get("volumeRatio"))
+    five_range = _to_float(five.get("rangePositionPct"))
+    if five.get("freshLow45m") is None or five_rvol is None or five_range is None:
+        no_heavy_new_low = None
+    else:
+        no_heavy_new_low = not (
+            five.get("freshLow45m") is True and five_rvol >= 1.5 and five_range <= 35
+        )
+    add("5m 量价不再下移", no_heavy_new_low, 1, f"5m vol {five.get('volumeRatio')}x: {five.get('volumeVerdict')}")
 
     score = 0
     max_score = 0
@@ -685,10 +875,52 @@ def evaluate_signal(intraday, daily):
         max_score += c["weight"]
         score += c["weight"] if c["ok"] else -min(c["weight"], 1)
 
-    if daily_hold is False:
+    data_errors = []
+    if not daily.get("available") or _to_float(daily.get("ema21")) is None:
+        data_errors.append("completed daily EMA21 context missing")
+    if daily.get("barStatus") == "completed_daily_bar":
+        required_daily = ("ema8", "ema13", "ema21", "ema34", "ema55", "atr14", "rsi14", "ema21Slope5")
+        missing_daily = [name for name in required_daily if _to_float(daily.get(name)) is None]
+        if missing_daily:
+            data_errors.append("completed daily indicators missing: " + ",".join(missing_daily))
+    if not five.get("available"):
+        data_errors.append("5m structure missing")
+    if not fifteen.get("available"):
+        data_errors.append("15m structure missing")
+
+    daily_ema8 = _to_float(daily.get("ema8"))
+    daily_ema13 = _to_float(daily.get("ema13"))
+    daily_ema21 = _to_float(daily.get("ema21"))
+    daily_slope = _to_float(daily.get("ema21Slope5"))
+    trend_broken = bool(
+        daily.get("twoBelowEma21") is True
+        or (daily_ema8 is not None and daily_ema21 is not None and daily_ema8 < daily_ema21)
+    )
+    confirmation_gaps = []
+    if no_new_low is None:
+        confirmation_gaps.append("45m no-new-low evidence missing")
+    if slope_45m is None:
+        confirmation_gaps.append("true 45m 15m-EMA8 slope missing")
+    if range_30m is None:
+        confirmation_gaps.append("30m range-position evidence missing")
+    if not fifteen.get("volumeBaselineSufficient"):
+        confirmation_gaps.append("15m same-time volume baseline insufficient")
+    elif (_to_float(fifteen.get("volumeRatio")) is None or
+          _to_float(fifteen.get("cumulativeVolumeRatio")) is None):
+        confirmation_gaps.append("15m current volume or cumulative rvol missing")
+    if all(value is not None for value in (daily_ema8, daily_ema13, daily_ema21)):
+        if not (daily_ema8 > daily_ema13 > daily_ema21):
+            confirmation_gaps.append("completed daily EMA8/13/21 is not bull stacked")
+    if daily_slope is not None and daily_slope < 0:
+        confirmation_gaps.append("completed daily EMA21 five-session slope is negative")
+
+    if data_errors:
+        label = "BLOCK_DATA"
+        action = "完成日线或 5m/15m 必需证据缺失；本轮禁止新开仓。"
+    elif daily_hold is False or trend_broken:
         label = "BLOCK"
-        action = "日线 EMA21 未守住，老师框架下先不加 TQQQ/Call，等重新站回。"
-    elif score >= 6:
+        action = "完成日线 EMA21 或 EMA8/21 趋势结构未守住，先不加 TQQQ/Call，等重新站回。"
+    elif score >= 6 and not confirmation_gaps:
         label = "ALLOW"
         action = "可以进入收盘前小仓观察区：只考虑分批、定义止损、移动止盈。"
     elif score >= 3:
@@ -704,6 +936,8 @@ def evaluate_signal(intraday, daily):
 
     return {
         "label": label,
+        "decisionScope": "closed_bar_tape_only",
+        "tradeActionAuthorized": False,
         "score": score,
         "maxScore": max_score,
         "last": last,
@@ -714,7 +948,100 @@ def evaluate_signal(intraday, daily):
         "levelMap": level_map,
         "scenarios": scenarios,
         "spreadPlan": spread_plan,
+        "dataQuality": {
+            "errors": data_errors,
+            "confirmationGaps": confirmation_gaps,
+            "decisionGrade": not data_errors and not confirmation_gaps,
+        },
     }
+
+
+def build_hard_gates(signal, freshness, now, events_file=DEFAULT_EVENTS):
+    """Apply the same deterministic gate engine used by the Codex tape path."""
+    try:
+        from scripts import intraday_tape_sensor as gate_engine
+    except ModuleNotFoundError:  # direct ``python scripts/monitor_qqq_intraday.py``
+        import intraday_tape_sensor as gate_engine
+
+    summaries = signal.get("summaries") or {}
+    intervals = {}
+    for interval, summary in summaries.items():
+        intervals[interval] = {
+            "available": bool(summary.get("available")),
+            "last_closed": {"t": summary.get("lastTime")},
+            "volume": {
+                "rvol": summary.get("volumeRatio"),
+                "cum_rvol": summary.get("cumulativeVolumeRatio"),
+                "sufficient": bool(summary.get("volumeBaselineSufficient")),
+                "sample_days": summary.get("volumeBaselineSampleDays"),
+            },
+            "extension_atr20": summary.get("extensionAtr20"),
+            "move_direction": summary.get("moveDirection"),
+        }
+    run_id = now.strftime("%Y%m%dT%H%M%S%f%z")
+    observation = {
+        "run_id": run_id,
+        "intervals": intervals,
+        "data_freshness": freshness,
+    }
+    calendar = gate_engine.load_event_calendar(events_file, now=now)
+    gates = gate_engine.build_gates(observation, {}, event_calendar=calendar, now=now)
+    gates["schemaVersion"] = 1
+    return gates
+
+
+def enforce_hard_gates(signal, gates):
+    """Cap the prose signal and every candidate structure to binding gates."""
+    triggered = list(gates.get("triggered") or [])
+    gate_names = [str(item.get("gate")) for item in triggered if item.get("gate")]
+    original = signal.get("label")
+    label = original
+    reasons = []
+    if gates.get("score_cap") == "BLOCK_DATA":
+        label = "BLOCK_DATA"
+        reasons.append("market/event evidence is unavailable or invalid")
+    elif gates.get("prohibit_allow") and label == "ALLOW":
+        label = "WATCH"
+        reasons.append("deterministic hard gates prohibit ALLOW")
+    if "G5" in gate_names and label == "ALLOW":
+        label = "WATCH"
+        reasons.append("same-direction ATR chase is blocked")
+
+    cross_event = (gates.get("cross_event_dte_policy") or {}).get("next_binary_event")
+    crosses_tactical_window = bool(
+        cross_event and _to_float(cross_event.get("hours_away")) is not None
+        and 0 <= _to_float(cross_event.get("hours_away")) <= 30 * 24
+    )
+    gated = bool(gates.get("prohibit_allow") or gates.get("action_lock") or "G5" in gate_names)
+    if gated or crosses_tactical_window:
+        for plan in signal.get("spreadPlan") or []:
+            if plan.get("status") == "ALLOW":
+                plan["status"] = "WATCH"
+            prefix = "Hard gates require manage/wait; no new risk now. " if gated else ""
+            event_rule = "Apply G4 to the exact expiry before use. " if crosses_tactical_window else ""
+            plan["rule"] = prefix + event_rule + str(plan.get("rule") or "")
+        if gated:
+            for scenario in signal.get("scenarios") or []:
+                scenario["tactic"] = "Hard gates are active: manage existing risk or wait for the next valid closed-bar trigger."
+
+    if label != original:
+        signal["originalLabel"] = original
+        signal["label"] = label
+    if label == "BLOCK_DATA":
+        signal["action"] = "市场或事件数据缺失/过期；本轮只管理已有风险，禁止新开仓。"
+    elif gated:
+        locks = " / ".join(str(item) for item in gates.get("action_lock") or [])
+        signal["action"] = f"硬门禁 {','.join(gate_names) or 'active'} 生效；{locks or '禁止追价'}，只管理已有仓位或等待。"
+    quality = signal.setdefault("dataQuality", {})
+    if gated:
+        quality["decisionGrade"] = False
+        gaps = quality.setdefault("confirmationGaps", [])
+        marker = "binding hard gates: " + ",".join(gate_names)
+        if marker not in gaps:
+            gaps.append(marker)
+    signal["teacherRead"] = f"QQQ intraday {signal.get('label')}: {signal.get('action')}"
+    signal["hardGateReasons"] = reasons
+    return signal
 
 
 def fmt_num(value, digits=2):
@@ -732,19 +1059,27 @@ def fmt_bool(value):
     return "—"
 
 
-def load_state(out_dir):
+def load_state(out_dir, session_date=None):
     path = Path(out_dir) / STATE_FILE_NAME
     if not path.exists():
-        return {"levels": {}, "lastLabel": None}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"levels": {}, "lastLabel": None}
+        return {"schemaVersion": 1, "sessionDate": session_date, "levels": {}, "lastLabel": None}
+    def reject_constant(value):
+        raise ValueError(f"non-finite JSON constant {value}")
+    state = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+    if not isinstance(state, dict):
+        raise ValueError("intraday monitor state must be a JSON object")
+    if state.get("schemaVersion") not in (None, 1):
+        raise ValueError("unsupported intraday monitor state schemaVersion")
+    if session_date is not None and state.get("sessionDate") != session_date:
+        return {"schemaVersion": 1, "sessionDate": session_date, "levels": {}, "lastLabel": None}
+    state.setdefault("schemaVersion", 1)
+    state.setdefault("sessionDate", session_date)
+    return state
 
 
 def save_state(out_dir, state):
     path = Path(out_dir) / STATE_FILE_NAME
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, state)
 
 
 def annotate_level_tests(signal, state, pulled_at):
@@ -813,10 +1148,16 @@ def format_telegram_message(snapshot):
     failed = sum(1 for c in checks if c.get("ok") is False)
     first_scenario = scenarios[0] if scenarios else {}
     first_spread = spread_plan[0] if spread_plan else {}
+    hard_gates = snapshot.get("hardGates") or {}
+    gate_names = "/".join(
+        str(item.get("gate")) for item in hard_gates.get("triggered") or [] if item.get("gate")
+    ) or "none"
     lines = [
         f"QQQ 15m monitor · {snapshot['pulledAt']}",
-        f"Signal: {s['label']} · score {s['score']}/{s['maxScore']} · QQQ {fmt_num(s.get('last'))}",
+        f"Tape signal: {s['label']} · score {s['score']}/{s['maxScore']} · QQQ {fmt_num(s.get('last'))}",
+        "Trade authorization: NO · position, sizing, liquidity, event-expiry and max-loss gates remain external",
         f"Data: {snapshot.get('dataMode')} · last bar {five.get('lastTime') or one.get('lastTime')}",
+        f"Hard gates: {gate_names} · prohibit_allow {bool(hard_gates.get('prohibit_allow'))}",
         "",
         "重心定义: 日线EMA21 + 5m VWAP/EMA21 + 15m FMA/斜率 + 45m no-new-low + 30m位置 + 量能。",
         f"Checks: pass {passed} / fail {failed}",
@@ -874,7 +1215,7 @@ def resolve_telegram_chat_id(token, explicit_chat_id, out_dir, auto_discover):
         return None
     chat_id = discover_telegram_chat_id(token)
     if chat_id:
-        cache.write_text(chat_id + "\n")
+        atomic_write_text(cache, chat_id + "\n")
     return chat_id
 
 
@@ -899,7 +1240,6 @@ def send_telegram_message_from_config(text):
 
 def append_telegram_log(out_dir, snapshot, ok, detail):
     path = out_dir / "telegram_push_log.csv"
-    first = not path.exists()
     fields = ["pushedAt", "pulledAt", "label", "last", "ok", "detail"]
     row = {
         "pushedAt": dt.datetime.now(tz=PT).isoformat(timespec="seconds"),
@@ -909,27 +1249,15 @@ def append_telegram_log(out_dir, snapshot, ok, detail):
         "ok": ok,
         "detail": detail,
     }
-    with path.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if first:
-            w.writeheader()
-        w.writerow(row)
+    append_csv_row_private(path, row, fields)
 
 
 def write_csv(path, rows):
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
     fields = ["time", "open", "high", "low", "close", "volume", "ema5", "ema8", "ema13", "ema21", "ema34", "vwap"]
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: row.get(k) for k in fields})
+    atomic_write_csv(path, ({k: row.get(k) for k in fields} for row in rows), fields)
 
 
 def append_history(path, snapshot):
-    first = not path.exists()
     fields = [
         "pulledAt", "label", "score", "maxScore", "last", "dailyEma21",
         "fiveClose", "fiveVwap", "fiveEma21", "fifteenClose", "fifteenEma8",
@@ -960,53 +1288,93 @@ def append_history(path, snapshot):
         "noNewLow45m": one.get("noNewLow45m"),
         "action": s["action"],
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if first:
-            w.writeheader()
-        w.writerow(row)
+    append_csv_row_private(path, row, fields)
 
 
-def run_once(symbol, out_dir):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pulled_at = dt.datetime.now(tz=PT).isoformat(timespec="seconds")
-    intraday = fetch_intraday(symbol)
-    daily = fetch_daily_context(symbol)
+def _run_once_unlocked(symbol, out_dir, now=None, events_file=DEFAULT_EVENTS):
+    ensure_private_directory(out_dir)
+    current = (now or dt.datetime.now(tz=ET)).astimezone(ET)
+    pulled_at = current.astimezone(PT).isoformat(timespec="seconds")
+    downloaded = fetch_intraday(symbol)
+    intraday = {
+        interval: closed_interval_rows(rows, interval, now=current)
+        for interval, rows in downloaded.items()
+    }
+    daily = fetch_daily_context(symbol, now=current)
     signal = evaluate_signal(intraday, daily)
-    state = load_state(out_dir)
-    state = annotate_level_tests(signal, state, pulled_at)
+    freshness = market_data_freshness(intraday, now=current)
+    hard_gates = build_hard_gates(signal, freshness, current, events_file=events_file)
+    signal = enforce_hard_gates(signal, hard_gates)
+    if signal.get("label") == "BLOCK_DATA":
+        signal["score"] = 0
+    state = load_state(out_dir, session_date=current.date().isoformat())
+    if freshness["fresh"]:
+        state = annotate_level_tests(signal, state, pulled_at)
+    else:
+        state["lastPulledAt"] = pulled_at
+        state["lastDataFresh"] = False
     save_state(out_dir, state)
     for interval, rows in intraday.items():
         write_csv(out_dir / f"{symbol}_{interval}.csv", rows)
     snapshot = {
         "symbol": symbol,
         "pulledAt": pulled_at,
-        "dataMode": "Yahoo Finance intraday candles",
+        "dataMode": "Yahoo Finance adjusted-to-current-scale closed intraday candles",
+        "dataFreshness": freshness,
+        "hardGates": hard_gates,
         "daily": daily,
         "signal": signal,
     }
-    (out_dir / "latest_signal.json").write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+    atomic_write_text(out_dir / "latest_signal.json", json.dumps(snapshot, indent=2, ensure_ascii=False))
     append_history(out_dir / "signal_history.csv", snapshot)
     return snapshot
 
 
+def run_once(symbol, out_dir, now=None, events_file=DEFAULT_EVENTS):
+    symbol = safe_symbol_component(symbol)
+    out_dir = Path(out_dir)
+    lock = acquire_lock(out_dir / ".monitor.lock")
+    if lock is None:
+        raise RuntimeError("another QQQ intraday monitor run is active")
+    try:
+        return _run_once_unlocked(symbol, out_dir, now=now, events_file=events_file)
+    finally:
+        release_lock(lock)
+
+
 def seconds_until_close(now=None):
-    now = now or dt.datetime.now(tz=PT)
-    close = now.replace(hour=13, minute=5, second=0, microsecond=0)
-    return (close - now).total_seconds()
+    current = (now or dt.datetime.now(tz=PT)).astimezone(ET)
+    try:
+        from scripts.intraday_tape_sensor import market_session
+    except ModuleNotFoundError:
+        from intraday_tape_sensor import market_session
+    session = market_session(current.date())
+    if not session.get("open"):
+        return 0.0
+    close = dt.datetime.fromisoformat(session["closeAt"]) + dt.timedelta(minutes=5)
+    return (close - current).total_seconds()
 
 
 def is_market_monitor_window(now=None):
-    now = now or dt.datetime.now(tz=PT)
-    minute = now.hour * 60 + now.minute
-    return now.weekday() < 5 and (6 * 60 + 30) <= minute <= (13 * 60 + 5)
+    current = (now or dt.datetime.now(tz=PT)).astimezone(ET)
+    try:
+        from scripts.intraday_tape_sensor import market_session
+    except ModuleNotFoundError:
+        from intraday_tape_sensor import market_session
+    session = market_session(current.date())
+    if not session.get("open"):
+        return False
+    opened = dt.datetime.fromisoformat(session["openAt"])
+    close_grace = dt.datetime.fromisoformat(session["closeAt"]) + dt.timedelta(minutes=5)
+    return opened <= current <= close_grace
 
 
 def main():
     ap = argparse.ArgumentParser(description="Pull QQQ 1m/5m/15m/30m candles and score intraday stability.")
     ap.add_argument("--symbol", default="QQQ")
     ap.add_argument("--out-dir", default=str(DEFAULT_OUT))
+    ap.add_argument("--events-file", default=str(DEFAULT_EVENTS),
+                    help="schemaVersion 1 event calendar; missing/expired data blocks new entries")
     ap.add_argument("--loop", action="store_true", help="run every --poll-seconds until stopped")
     ap.add_argument("--poll-seconds", type=int, default=900)
     ap.add_argument("--until-close", action="store_true", help="stop after 13:05 PT")
@@ -1022,11 +1390,15 @@ def main():
     out_dir = Path(args.out_dir)
     if args.market_hours_only and not is_market_monitor_window():
         print(f"{dt.datetime.now(tz=PT).isoformat(timespec='seconds')} skip outside monitor window", flush=True)
-        return
+        return 0
+    had_failure = False
     while True:
+        snap = None
         try:
-            snap = run_once(args.symbol, out_dir)
+            snap = run_once(args.symbol, out_dir, events_file=args.events_file)
             s = snap["signal"]
+            if s.get("label") == "BLOCK_DATA":
+                raise RuntimeError(s.get("action") or "intraday market data failed freshness checks")
             print(f"{snap['pulledAt']} {args.symbol} {s['label']} score={s['score']}/{s['maxScore']} last={s['last']} action={s['action']}", flush=True)
             if args.telegram:
                 token = os.environ.get(args.telegram_token_env)
@@ -1043,9 +1415,14 @@ def main():
                     append_telegram_log(out_dir, snap, True, "sent-config")
                     print(f"{snap['pulledAt']} telegram sent via config", flush=True)
         except Exception as exc:
-            print(f"{dt.datetime.now(tz=PT).isoformat(timespec='seconds')} ERROR {exc}", file=sys.stderr, flush=True)
+            had_failure = True
+            detail = f"{type(exc).__name__}: {exc}"
+            secret = os.environ.get(args.telegram_token_env)
+            if secret:
+                detail = detail.replace(secret, "[redacted-token]")
+            print(f"{dt.datetime.now(tz=PT).isoformat(timespec='seconds')} ERROR {detail}", file=sys.stderr, flush=True)
             try:
-                append_telegram_log(out_dir, snap if "snap" in locals() else {"pulledAt": None, "signal": {}}, False, str(exc))
+                append_telegram_log(out_dir, snap or {"pulledAt": None, "signal": {}}, False, detail)
             except Exception:
                 pass
         if not args.loop:
@@ -1057,7 +1434,8 @@ def main():
         if args.until_close:
             sleep_for = max(1, min(sleep_for, int(seconds_until_close())))
         time.sleep(sleep_for)
+    return 1 if had_failure else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

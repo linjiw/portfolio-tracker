@@ -170,6 +170,33 @@ hardDataFlags[]
 Each flag carries ticker, company name, severity, rule and detail so the audit
 panel can be inspected without opening the raw JSON.
 
+## v0.4 USD Comparability And Point-in-Time Guardrails
+
+Version 0.4 rejects missing, boolean, non-finite, negative, and above-100
+structural factors. The curated priors still lack complete row-level source
+lineage and a point-in-time fundamental history, so the model card marks them
+non-decision-grade and requires manual review after new filings or guidance.
+
+All technical inputs for a non-USD primary listing now use a USD series:
+
+```text
+local adjusted close × historical FX       # EUR/GBP-style quote
+local adjusted close ÷ historical FX       # KRW/TWD/JPY/HKD/CNY-style quote
+```
+
+FX is forward-filled only from an earlier available FX date; missing or stale
+FX is a data-quality fuse. London pence (`GBp`/`GBX`) receives the required
+0.01 price-unit conversion, while Yahoo market cap remains in pounds. The
+cross-market beta is still a non-synchronous-close approximation and is labeled
+non-decision-grade.
+
+Yahoo profile market cap is timestamped separately from prices. If it was
+fetched after an older dashboard decision date, it stays visible for review but
+is excluded from size/torque scoring. Rows with hard data review or no
+USD-comparable tactical series no longer receive final/tactical percentiles;
+their structural percentile remains available as a clearly separate curated
+view.
+
 ## Research Gates
 
 `ALLOW_PLAN` means the name can enter staged plan review. It is not an automatic

@@ -6,9 +6,12 @@ target scripts/). Reference values are computed against the standard
 definitions (EMA seeded from first value, Wilder-smoothed RSI).
 """
 import math
+import csv
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -67,8 +70,7 @@ class RsiTests(unittest.TestCase):
     def test_all_gains_pins_high(self):
         vals = [float(100 + i) for i in range(40)]
         out = _rsi(vals)
-        # No losses => RS capped via al==0 -> rs=999 -> RSI ~99.9
-        self.assertGreater(out[-1], 99.0)
+        self.assertEqual(out[-1], 100.0)
 
     def test_all_losses_pins_low(self):
         vals = [float(200 - i) for i in range(40)]
@@ -91,24 +93,23 @@ class RsiTests(unittest.TestCase):
         ag = sum(d for d in deltas[:n] if d > 0) / n
         al = sum(-d for d in deltas[:n] if d < 0) / n
         ref = [None] * len(vals)
-        ref[n] = 100 - 100 / (1 + (ag / al if al > 0 else 999))
+        ref[n] = 100 - 100 / (1 + ag / al)
         for i in range(n + 1, len(vals)):
             d = deltas[i - 1]
             ag = (ag * (n - 1) + max(d, 0)) / n
             al = (al * (n - 1) + max(-d, 0)) / n
-            ref[i] = 100 - 100 / (1 + (ag / al if al > 0 else 999))
+            ref[i] = 100 - 100 / (1 + ag / al)
         out = _rsi(vals, n)
         for i in range(n, len(vals)):
             self.assertAlmostEqual(out[i], ref[i], places=10)
-        # warm-up region is backfilled with the first real value
+        # Warm-up values are neutral and never borrow the future day-n RSI.
         for i in range(n):
-            self.assertAlmostEqual(out[i], out[n], places=12)
+            self.assertEqual(out[i], 50.0)
 
     def test_flat_series_neutral(self):
-        # zero losses on a flat tail: al==0 path (rs=999) must not crash
         vals = [100.0] * 20
         out = _rsi(vals)
-        self.assertEqual(len(out), 20)
+        self.assertEqual(out, [50.0] * 20)
 
 
 class ComputeFibTests(unittest.TestCase):
@@ -148,6 +149,237 @@ class ComputeFibTests(unittest.TestCase):
         self.assertEqual(fib["now"]["state"], "down")
         self.assertEqual(fib["now"]["label"], "空头趋势")
         self.assertLess(fib["now"]["mom"], 0)
+
+    def test_resonance_cannot_fire_during_rsi_warmup(self):
+        dates = _dates(60)
+        px = [100 + i * 0.6 + 4 * math.sin(i / 2.0) for i in range(60)]
+        fib = compute_fib(list(zip(dates, px)))
+        index = {day: i for i, day in enumerate(dates)}
+
+        self.assertTrue(all(index[event["date"]] >= 14
+                            for event in fib["resonance"]))
+
+
+class ValuationGuardrailTests(unittest.TestCase):
+    def test_price_on_never_uses_a_future_close(self):
+        prices = {"AAA": {"2026-01-05": 10.0, "2026-01-07": 12.0}}
+
+        self.assertIsNone(generate.price_on(prices, "AAA", "2026-01-04"))
+        self.assertEqual(generate.price_on(prices, "AAA", "2026-01-05"), 10.0)
+        self.assertEqual(generate.price_on(prices, "AAA", "2026-01-06"), 10.0)
+
+    def test_price_on_never_carries_an_arbitrarily_stale_close(self):
+        prices = {"AAA": {"2020-01-02": 100.0}}
+
+        self.assertIsNone(generate.price_on(prices, "AAA", "2026-07-09"))
+
+    def test_price_on_exact_mode_rejects_a_market_data_hole(self):
+        prices = {"AAA": {"2026-01-05": 10.0}}
+
+        self.assertIsNone(generate.price_on(
+            prices, "AAA", "2026-01-06", max_age_calendar_days=0))
+
+    def test_trade_inactivity_does_not_truncate_history(self):
+        txns = {"AAA": [
+            {"date": "2026-01-02"},
+            {"date": "2026-04-15"},
+        ]}
+
+        self.assertEqual(generate.resolve_history_start(txns), "2026-01-02")
+        start, gaps = generate.continuous_start(txns)
+        self.assertEqual(start, "2026-01-02")
+        self.assertEqual(gaps, [("2026-01-02", "2026-04-15")])
+
+    def test_explicit_history_start_is_validated(self):
+        txns = {"AAA": [{"date": "2026-01-02"}, {"date": "2026-04-15"}]}
+
+        self.assertEqual(generate.resolve_history_start(txns, "2026-02-01"), "2026-02-01")
+        self.assertEqual(generate.resolve_history_start(txns, "2025-12-01"), "2025-12-01")
+        with self.assertRaisesRegex(ValueError, "later than"):
+            generate.resolve_history_start(txns, "2026-05-01")
+        with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+            generate.resolve_history_start(txns, "02/01/2026")
+
+
+class PortfolioSnapshotParserTests(unittest.TestCase):
+    HEADER = [
+        "Symbol", "Description", "Quantity", "Last Price", "Current Value",
+        "Total Gain/Loss Dollar", "Cost Basis Total", "Account Number", "Type",
+    ]
+
+    def _write_snapshot(self, rows):
+        tmp = tempfile.TemporaryDirectory()
+        path = Path(tmp.name) / "Portfolio_Positions.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["Broker positions export"])
+            writer.writerow(self.HEADER)
+            writer.writerows(rows)
+            writer.writerow(["Date downloaded Jul-09-2026 4:40 p.m ET"])
+        self.addCleanup(tmp.cleanup)
+        return path
+
+    def test_header_driven_parser_handles_reordered_columns_and_all_row_types(self):
+        path = self._write_snapshot([
+            ["QQQ", "Invesco QQQ", "10", "$500", "$5,000", "$1,000",
+             "$4,000", "acct-01 / IRA", "Cash"],
+            ["SPAXX**", "Money market", "1000", "$1", "$1,000", "--",
+             "$1,000", "acct-01 / IRA", "Cash"],
+            ["QQQ260717C600", "QQQ Jul call", "-1", "$1.25", "-$125", "$75",
+             "$200", "acct-01 / IRA", "Margin"],
+            ["Pending Activity", "Pending", "--", "--", "-$50", "--", "--",
+             "acct-01 / IRA", "Cash"],
+        ])
+
+        positions = generate.parse_portfolio(path)
+        extras = generate.parse_account_extras(path)
+
+        self.assertEqual(set(positions), {"QQQ"})
+        self.assertEqual(positions["QQQ"]["shares"], 10.0)
+        self.assertEqual(positions["QQQ"]["value"], 5000.0)
+        self.assertEqual(positions["QQQ"]["cost"], 4000.0)
+        self.assertEqual(extras["cashTotal"], 1000.0)
+        self.assertEqual(extras["pending"], -50.0)
+        self.assertEqual(extras["optMarkNet"], -125.0)
+        self.assertEqual(extras["optMarkGross"], 125.0)
+        self.assertEqual(extras["equitySharesByAccount"],
+                         {"acct-01 / IRA": {"QQQ": 10.0}})
+        self.assertEqual(extras["optLegs"][0]["sym"], "-QQQ260717C600")
+        self.assertEqual(extras["asOf"], "Jul-09-2026 4:40 p.m ET")
+
+    def test_malformed_required_position_value_fails_closed(self):
+        path = self._write_snapshot([
+            ["QQQ", "Invesco QQQ", "10", "$500", "not-a-number", "$1,000",
+             "$4,000", "acct-01", "Cash"],
+        ])
+
+        with self.assertRaisesRegex(ValueError, "invalid position current value"):
+            generate.parse_portfolio(path)
+        with self.assertRaisesRegex(ValueError, "invalid position current value"):
+            generate.parse_account_extras(path)
+
+    def test_multi_account_symbol_uses_aggregate_value_per_share(self):
+        path = self._write_snapshot([
+            ["QQQ", "Invesco QQQ", "10", "$500", "$5,000", "$1,000",
+             "$4,000", "acct-01", "Cash"],
+            ["QQQ", "Invesco QQQ", "2", "$550", "$1,100", "$200",
+             "$900", "acct-02", "Cash"],
+        ])
+
+        position = generate.parse_portfolio(path)["QQQ"]
+
+        self.assertEqual(position["shares"], 12.0)
+        self.assertEqual(position["value"], 6100.0)
+        self.assertAlmostEqual(position["price"], 6100.0 / 12.0)
+
+    def test_missing_required_column_is_rejected(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "positions.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["Account Number", "Symbol", "Quantity", "Current Value"])
+            writer.writerow(["acct-01", "QQQ", "10", "$5,000"])
+
+        with self.assertRaisesRegex(ValueError, "missing portfolio columns"):
+            generate.parse_portfolio(path)
+
+    def test_executable_or_malformed_position_symbol_is_rejected(self):
+        path = self._write_snapshot([
+            ["BAD' onclick='alert(1)", "Hostile", "10", "$1", "$10", "$0",
+             "$10", "acct-01", "Cash"],
+        ])
+
+        with self.assertRaisesRegex(ValueError, "invalid equity symbol"):
+            generate.parse_portfolio(path)
+        with self.assertRaisesRegex(ValueError, "invalid equity symbol"):
+            generate.parse_account_extras(path)
+
+    def test_share_class_symbol_is_normalized_without_losing_separator(self):
+        path = self._write_snapshot([
+            ["brk/b", "Berkshire class B", "2", "$500", "$1,000", "$100",
+             "$900", "acct-01", "Cash"],
+        ])
+
+        positions = generate.parse_portfolio(path)
+
+        self.assertEqual(set(positions), {"BRK/B"})
+
+
+class RiskContributionCoverageTests(unittest.TestCase):
+    def test_missing_benchmark_is_unavailable_not_fabricated_flat(self):
+        dates = _dates(30)
+        series = [{"date": d, "ret": i * 0.12 + (0.2 if i % 3 == 0 else 0),
+                   "sp500": None}
+                  for i, d in enumerate(dates)]
+        stocks = [{"sym": "AAA", "held": True, "value": 1000.0,
+                   "prices": [(d, 100 + i) for i, d in enumerate(dates)]}]
+
+        risk = generate.compute_risk(series, stocks)
+
+        self.assertEqual(risk["benchmarkQuality"], "unavailable")
+        self.assertIsNone(risk["spAnnVol"])
+        self.assertIsNone(risk["beta"])
+        self.assertTrue(all(row["spuw"] is None for row in risk["uwSeries"]))
+        self.assertTrue(all(row["spvol"] is None for row in risk["volSeries"]))
+
+    def test_low_coverage_slice_is_withheld_instead_of_renormalized(self):
+        dates = _dates(30)
+        series = []
+        for i, d in enumerate(dates):
+            series.append({"date": d, "ret": i * 0.1, "sp500": i * 0.08})
+        aaa = [(d, 100 + i) for i, d in enumerate(dates)]
+        bbb = [(d, 50 + i * 0.5) for i, d in enumerate(dates) if i != 10]
+        stocks = [
+            {"sym": "AAA", "held": True, "value": 1000.0, "prices": aaa},
+            {"sym": "BBB", "held": True, "value": 1000.0, "prices": bbb},
+        ]
+
+        risk = generate.compute_risk(series, stocks)
+
+        self.assertEqual(risk["contrib"], [])
+        self.assertEqual(risk["excluded"], ["AAA", "BBB"])
+        self.assertEqual(risk["contribQuality"]["status"],
+                         "unavailable-low-market-value-coverage")
+        self.assertEqual(risk["contribQuality"]["coverageWeightPct"], 50.0)
+        self.assertEqual(risk["contribQuality"]["incompleteSymbols"], ["BBB"])
+
+    def test_high_coverage_exact_slice_is_published_with_explicit_basis(self):
+        dates = _dates(35)
+        series = [{"date": d, "ret": i * 0.1 + (0.2 if i % 4 == 0 else 0),
+                   "sp500": i * 0.08 + (0.1 if i % 5 == 0 else 0)}
+                  for i, d in enumerate(dates)]
+        stocks = [
+            {"sym": "AAA", "held": True, "value": 4900.0,
+             "prices": [(d, 100 + i + (1 if i % 3 == 0 else 0)) for i, d in enumerate(dates)]},
+            {"sym": "BBB", "held": True, "value": 4900.0,
+             "prices": [(d, 80 + i * 0.7 + (0.8 if i % 4 == 0 else 0)) for i, d in enumerate(dates)]},
+            {"sym": "NEW", "held": True, "value": 200.0,
+             "prices": [(d, 20 + i) for i, d in enumerate(dates[-10:])]},
+        ]
+
+        risk = generate.compute_risk(series, stocks)
+
+        self.assertEqual("partial-covered-equity-slice", risk["contribQuality"]["status"])
+        self.assertEqual(98.0, risk["contribQuality"]["coverageWeightPct"])
+        self.assertEqual(["NEW"], risk["excluded"])
+        self.assertEqual({"AAA", "BBB"}, {row["sym"] for row in risk["contrib"]})
+        self.assertAlmostEqual(100.0, sum(row["riskPct"] for row in risk["contrib"]), places=1)
+        self.assertTrue(all("portfolioWeightPct" in row for row in risk["contrib"]))
+
+
+class MoneyWeightedReturnTests(unittest.TestCase):
+    def test_xirr_does_not_reject_valid_high_annualized_short_period_return(self):
+        import datetime
+        start = datetime.date(2026, 1, 1)
+        end = start + datetime.timedelta(days=30)
+
+        rate = generate.xirr([(start, -100.0), (end, 150.0)])
+
+        self.assertIsNotNone(rate)
+        self.assertGreater(rate, 10.0)
+        period_return = (1.0 + rate) ** (30 / 365.0) - 1.0
+        self.assertAlmostEqual(period_return, 0.5, places=6)
 
     def test_flat_series_is_range(self):
         # constant series: all EMAs equal (no strict stack), band = 0 < 0.8%

@@ -17,14 +17,18 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import math
-import os
-import re
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+    from scripts.dashboard_payload import read_dashboard_payload as _read_dashboard_payload
+except ModuleNotFoundError:  # direct ``python scripts/ai_semi_quant.py``
+    from artifact_io import atomic_write_json, atomic_write_text
+    from dashboard_payload import read_dashboard_payload as _read_dashboard_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +62,7 @@ FX_SPECS = {
     "USD": (None, "identity"),
     "EUR": ("EURUSD=X", "multiply"),
     "GBP": ("GBPUSD=X", "multiply"),
+    "GBX": ("GBPUSD=X", "multiply"),
     "KRW": ("KRW=X", "divide"),
     "TWD": ("TWD=X", "divide"),
     "JPY": ("JPY=X", "divide"),
@@ -69,6 +74,7 @@ CURRENCY_SYMBOLS = {
     "USD": "$",
     "EUR": "€",
     "GBP": "£",
+    "GBX": "GBp ",
     "KRW": "₩",
     "TWD": "NT$",
     "JPY": "¥",
@@ -77,9 +83,28 @@ CURRENCY_SYMBOLS = {
 }
 
 GATE_ORDER = ("ALLOW_PLAN", "ALLOW_DD", "WATCH", "WATCH_RESET", "PORTFOLIO_BLOCK", "BLOCK", "DATA_REVIEW")
-MODEL_VERSION = "0.3.1"
+MODEL_VERSION = "0.4.0"
 RISK_FLOOR = 35
 MAX_SINGLE_POSITION_WEIGHT = 20.0
+
+TICKER_CURRENCY_SUFFIXES = (
+    (".KS", "KRW"),
+    (".KQ", "KRW"),
+    (".TW", "TWD"),
+    (".TWO", "TWD"),
+    (".T", "JPY"),
+    (".DE", "EUR"),
+    (".PA", "EUR"),
+    (".AS", "EUR"),
+    (".BR", "EUR"),
+    (".MI", "EUR"),
+    (".L", "GBX"),
+    (".HK", "HKD"),
+    (".SS", "CNY"),
+    (".SZ", "CNY"),
+)
+
+CURRENCY_UNIT_SCALES = {"GBX": 0.01}
 
 
 @dataclass(frozen=True)
@@ -477,10 +502,44 @@ def finite(value) -> bool:
         return False
 
 
+def validated_factor(value, label: str) -> float:
+    """Return a finite 0..100 factor or fail instead of silently neutralizing it."""
+    if isinstance(value, bool) or not finite(value):
+        raise ValueError(f"{label} must be a finite number in [0, 100]")
+    score = float(value)
+    if not 0.0 <= score <= 100.0:
+        raise ValueError(f"{label}={score:g} is outside [0, 100]")
+    return score
+
+
+def infer_ticker_currency(ticker: Optional[str]) -> str:
+    symbol = str(ticker or "").upper()
+    for suffix, currency in TICKER_CURRENCY_SUFFIXES:
+        if symbol.endswith(suffix):
+            return currency
+    return "USD"
+
+
+def normalize_currency(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if raw in ("GBp", "GBX", "GBx"):
+        return "GBX"
+    return raw.upper()
+
+
+def normalize_market_cap_value(value, quote_currency: Optional[str], source: Optional[str]) -> Tuple[Optional[float], float]:
+    """Normalize provider market cap into the major currency unit."""
+    currency = normalize_currency(quote_currency)
+    scale = 0.01 if currency == "GBX" and source == "yahoo_fast_info" else 1.0
+    if not finite(value) or float(value) <= 0:
+        return None, scale
+    return float(value) * scale, scale
+
+
 def fmt_local_money(value: Optional[float], currency: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    currency = (currency or "USD").upper()
+    currency = normalize_currency(currency) or "USD"
     symbol = CURRENCY_SYMBOLS.get(currency, f"{currency} ")
     try:
         v = float(value)
@@ -498,7 +557,7 @@ def pct_rank(value: Optional[float], values: Iterable[Optional[float]]) -> float
     v = float(value)
     below = sum(1 for x in vals if x < v)
     equal = sum(1 for x in vals if x == v)
-    return ((below + 0.5 * max(equal, 1)) / len(vals)) * 100.0
+    return ((below + 0.5 * equal) / len(vals)) * 100.0
 
 
 def percentile_int(value: Optional[float], values: Iterable[Optional[float]]) -> Optional[int]:
@@ -532,7 +591,10 @@ def rsi(series, n: int = 14):
 
 
 def structural_score(factors: Dict[str, int]) -> int:
-    total = sum(factors.get(k, 50) * w for k, w in STRUCTURAL_FACTOR_WEIGHTS.items())
+    missing = [key for key in STRUCTURAL_FACTOR_WEIGHTS if key not in factors]
+    if missing:
+        raise ValueError(f"missing structural factors: {', '.join(missing)}")
+    total = sum(validated_factor(factors[k], k) * w for k, w in STRUCTURAL_FACTOR_WEIGHTS.items())
     return int(round(clamp(total)))
 
 
@@ -628,7 +690,7 @@ def torque_overlay(company: Company, factors: Dict[str, int], metrics: Dict[str,
     """
     base = structural_score(factors)
     torque = factors.get("sizeGrowthTorque", 50)
-    cap_usd = metrics.get("marketCapUsd")
+    cap_usd = metrics.get("scoringMarketCapUsd")
     quality = (
         factors.get("pricingPower", 50)
         + factors.get("profitElasticity", 50)
@@ -652,13 +714,31 @@ def torque_overlay(company: Company, factors: Dict[str, int], metrics: Dict[str,
 def market_profile_fields(profile: Optional[dict]) -> Dict[str, Optional[float]]:
     profile = profile or {}
     cap_usd = profile.get("marketCapUsd")
+    price_currency = normalize_currency(profile.get("currency")) or None
+    cap_currency = normalize_currency(profile.get("marketCapCurrency")) or ("GBP" if price_currency == "GBX" else price_currency)
+    point_in_time = profile.get("marketCapPointInTimeCompatible")
+    scoring_cap_usd = cap_usd if point_in_time is not False else None
     return {
         "marketCap": rn(profile.get("marketCap"), 0),
-        "marketCapCurrency": profile.get("currency"),
+        "marketCapRaw": rn(profile.get("marketCapRaw"), 0),
+        "marketCapUnitScale": rn(profile.get("marketCapUnitScale"), 4),
+        "marketCapSource": profile.get("marketCapSource"),
+        "marketCapCurrency": cap_currency,
+        "priceCurrency": price_currency,
         "marketCapUsd": rn(cap_usd, 0),
+        "scoringMarketCapUsd": rn(scoring_cap_usd, 0),
         "marketCapBucket": market_cap_bucket(cap_usd),
         "marketCapFxRate": rn(profile.get("fxRate"), 6),
         "marketCapFxSource": profile.get("fxSource"),
+        "marketCapFxAsOf": profile.get("fxAsOf"),
+        "marketCapAsOf": profile.get("marketCapAsOf"),
+        "marketCapAsOfSource": profile.get("marketCapAsOfSource"),
+        "marketCapQuoteAsOf": profile.get("marketCapQuoteAsOf"),
+        "marketCapDecisionAsOf": profile.get("marketCapDecisionAsOf"),
+        "marketCapAlignmentReason": profile.get("marketCapAlignmentReason"),
+        "marketCapFetchedAt": profile.get("marketCapFetchedAt"),
+        "marketCapPointInTimeCompatible": point_in_time,
+        "shareCountPointInTimeVerified": profile.get("shareCountPointInTimeVerified"),
         "fxMode": profile.get("fxMode"),
     }
 
@@ -666,40 +746,145 @@ def market_profile_fields(profile: Optional[dict]) -> Dict[str, Optional[float]]
 def convert_amount_to_usd(value: Optional[float], currency: Optional[str], fx_rate: Optional[float], fx_mode: Optional[str]) -> Optional[float]:
     if value is None:
         return None
-    currency = (currency or "USD").upper()
+    currency = normalize_currency(currency) or "USD"
+    value = float(value) * CURRENCY_UNIT_SCALES.get(currency, 1.0)
     if currency == "USD":
-        return float(value)
+        return value
     if not fx_rate:
         return None
     if fx_mode == "multiply":
-        return float(value) * float(fx_rate)
+        return value * float(fx_rate)
     if fx_mode == "divide":
-        return float(value) / float(fx_rate)
+        return value / float(fx_rate)
     return None
 
 
-def market_metrics(series, benchmark=None, profile: Optional[dict] = None) -> Dict[str, Optional[float]]:
-    """Return technical/risk metrics for one adjusted-close series."""
+def _date_value(value) -> Optional[dt.date]:
+    try:
+        if hasattr(value, "date"):
+            return value.date()
+        return dt.date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def usd_adjusted_series(series, currency: str, fx_series=None, fx_mode: Optional[str] = None):
+    """Convert an adjusted-close history to USD with backward-looking FX only."""
+    s = series.dropna().sort_index()
+    if currency == "USD":
+        return s, None, None
+    if fx_series is None:
+        return None, None, None
+    fx = fx_series.dropna().sort_index()
+    if len(fx) == 0:
+        return None, None, None
+    try:
+        aligned_fx = fx.reindex(s.index, method="ffill")
+        if fx_mode == "multiply":
+            converted = s * aligned_fx
+        elif fx_mode == "divide":
+            converted = s / aligned_fx
+        else:
+            return None, None, None
+        converted = converted.replace([math.inf, -math.inf], float("nan")).dropna()
+        if len(converted) == 0:
+            return None, None, None
+        last_rate = aligned_fx.loc[converted.index[-1]]
+        source_dates = [index for index in fx.index if index <= converted.index[-1]]
+        fx_date = _date_value(source_dates[-1]) if source_dates else None
+        return converted, float(last_rate), fx_date
+    except Exception:
+        return None, None, None
+
+
+def market_metrics(
+    series,
+    benchmark=None,
+    profile: Optional[dict] = None,
+    fx_series=None,
+    reference_date: Optional[str] = None,
+    reference_index=None,
+) -> Dict[str, Optional[float]]:
+    """Return USD-based technical/risk metrics plus local-price display fields."""
     profile_fields = market_profile_fields(profile)
     s = series.dropna()
     if len(s) < 30:
         return {"available": False, **profile_fields}
-    last = float(s.iloc[-1])
-    currency = (profile_fields.get("marketCapCurrency") or "USD").upper()
-    price_usd = convert_amount_to_usd(last, currency, profile_fields.get("marketCapFxRate"), profile_fields.get("fxMode"))
-    sma50 = float(s.rolling(50).mean().iloc[-1]) if len(s) >= 50 else None
-    sma200 = float(s.rolling(200).mean().iloc[-1]) if len(s) >= 200 else None
-    hi52 = float(s.tail(252).max()) if len(s) >= 20 else float(s.max())
-    low52 = float(s.tail(252).min()) if len(s) >= 20 else float(s.min())
-    median252 = float(s.tail(252).median()) if len(s) >= 30 else None
-    drawdown = float((s / s.cummax() - 1.0).min() * 100.0)
-    ret = s.pct_change(fill_method=None).dropna()
+    last_local = float(s.iloc[-1])
+    currency = normalize_currency(profile_fields.get("priceCurrency")) or "USD"
+    fx_mode = profile_fields.get("fxMode") or (FX_SPECS.get(currency) or (None, None))[1]
+    scaled_series = s * CURRENCY_UNIT_SCALES.get(currency, 1.0)
+    analysis, price_fx_rate, price_fx_date = usd_adjusted_series(scaled_series, currency, fx_series, fx_mode)
+    analysis_available = analysis is not None and len(analysis) >= 30
+    local_date = _date_value(s.index[-1])
+    ref_date = _date_value(reference_date)
+    lag_days = (ref_date - local_date).days if ref_date and local_date else None
+    fx_lag_days = (local_date - price_fx_date).days if local_date and price_fx_date else None
+    stale_bars = None
+    if reference_index is not None and local_date:
+        reference_dates = {_date_value(index) for index in reference_index}
+        stale_bars = sum(1 for date in reference_dates if date and date > local_date and (not ref_date or date <= ref_date))
+    base = {
+        "available": True,
+        "analysisAvailable": analysis_available,
+        "date": local_date.isoformat() if local_date else str(s.index[-1])[:10],
+        "referenceDate": ref_date.isoformat() if ref_date else None,
+        "priceDateLagDays": lag_days,
+        "staleTradingBars": stale_bars,
+        "futurePriceDate": bool(lag_days is not None and lag_days < 0),
+        "historyBars": len(analysis) if analysis is not None else len(s),
+        "rangeLookbackBars": min(len(analysis), 252) if analysis is not None else None,
+        "medianLookbackBars": min(len(analysis), 252) if analysis is not None else None,
+        "price": rn(last_local, 2),
+        "priceLocal": rn(last_local, 2),
+        "currency": currency,
+        "priceUsd": rn(float(analysis.iloc[-1]), 2) if analysis_available else None,
+        "displayPrice": fmt_local_money(last_local, currency),
+        "analysisCurrency": "USD" if analysis_available else None,
+        "returnBasis": ("USD adjusted close" if currency == "USD" else "USD adjusted close including FX") if analysis_available else None,
+        "fxAdjustedReturns": bool(analysis_available and currency != "USD"),
+        "priceFxRate": rn(price_fx_rate, 6),
+        "priceFxSource": (FX_SPECS.get(currency) or (None, None))[0],
+        "priceFxAsOf": price_fx_date.isoformat() if price_fx_date else None,
+        "priceFxLagDays": fx_lag_days,
+        "ret1d": None,
+        "ret5d": None,
+        "ret1m": None,
+        "ret3m": None,
+        "ret6m": None,
+        "ret1y": None,
+        "sma50": None,
+        "sma200": None,
+        "vs50": None,
+        "vs200": None,
+        "high52": None,
+        "low52": None,
+        "median252": None,
+        "priceTo252dMedian": None,
+        "below52High": None,
+        "drawdownMax": None,
+        "vol1y": None,
+        "betaToSox": None,
+        "rsi14": None,
+        **profile_fields,
+    }
+    if not analysis_available:
+        return base
+    a = analysis
+    last = float(a.iloc[-1])
+    sma50 = float(a.rolling(50).mean().iloc[-1]) if len(a) >= 50 else None
+    sma200 = float(a.rolling(200).mean().iloc[-1]) if len(a) >= 200 else None
+    hi52 = float(a.tail(252).max()) if len(a) >= 20 else float(a.max())
+    low52 = float(a.tail(252).min()) if len(a) >= 20 else float(a.min())
+    median252 = float(a.tail(252).median()) if len(a) >= 30 else None
+    drawdown = float((a / a.cummax() - 1.0).min() * 100.0)
+    ret = a.pct_change(fill_method=None).dropna()
     vol = float(ret.tail(252).std() * math.sqrt(252) * 100.0) if len(ret) > 20 else None
     beta = None
     if benchmark is not None:
         b = benchmark.dropna()
         aligned = (
-            s.pct_change(fill_method=None)
+            a.pct_change(fill_method=None)
             .rename("asset")
             .to_frame()
             .join(b.pct_change(fill_method=None).rename("bench"), how="inner")
@@ -709,21 +894,15 @@ def market_metrics(series, benchmark=None, profile: Optional[dict] = None) -> Di
         if len(aligned) > 30:
             var = float(aligned["bench"].var())
             beta = float(aligned["asset"].cov(aligned["bench"]) / var) if var else None
-    rsi14 = float(rsi(s).iloc[-1]) if len(s) >= 15 else None
+    rsi14 = float(rsi(a).iloc[-1]) if len(a) >= 15 else None
     return {
-        "available": True,
-        "date": str(s.index[-1].date()) if hasattr(s.index[-1], "date") else str(s.index[-1])[:10],
-        "price": rn(last, 2),
-        "priceLocal": rn(last, 2),
-        "currency": currency,
-        "priceUsd": rn(price_usd, 2),
-        "displayPrice": fmt_local_money(last, currency),
-        "ret1d": rn(pct_change(s, 1), 2),
-        "ret5d": rn(pct_change(s, 5), 2),
-        "ret1m": rn(pct_change(s, 21), 2),
-        "ret3m": rn(pct_change(s, 63), 2),
-        "ret6m": rn(pct_change(s, 126), 2),
-        "ret1y": rn(pct_change(s, 252), 2),
+        **base,
+        "ret1d": rn(pct_change(a, 1), 2),
+        "ret5d": rn(pct_change(a, 5), 2),
+        "ret1m": rn(pct_change(a, 21), 2),
+        "ret3m": rn(pct_change(a, 63), 2),
+        "ret6m": rn(pct_change(a, 126), 2),
+        "ret1y": rn(pct_change(a, 252), 2),
         "sma50": rn(sma50, 2),
         "sma200": rn(sma200, 2),
         "vs50": rn((last / sma50 - 1) * 100.0, 2) if sma50 else None,
@@ -736,8 +915,10 @@ def market_metrics(series, benchmark=None, profile: Optional[dict] = None) -> Di
         "drawdownMax": rn(drawdown, 2),
         "vol1y": rn(vol, 2),
         "betaToSox": rn(beta, 2),
+        "betaMethod": "OLS covariance of aligned USD daily adjusted-close returns over up to 252 observations",
+        "betaDecisionGrade": False,
+        "crossMarketCloseTimingCaveat": currency != "USD",
         "rsi14": rn(rsi14, 1),
-        **profile_fields,
     }
 
 
@@ -755,15 +936,21 @@ def overextension_penalty(metrics: Dict[str, Optional[float]]) -> int:
 
 
 def relative_momentum_score(metrics: Dict[str, Optional[float]], peer_metrics: List[dict]) -> int:
-    if not metrics.get("available"):
+    if not metrics.get("available") or metrics.get("analysisAvailable") is False:
         return 35
     ret3_rank = pct_rank(metrics.get("ret3m"), [m.get("ret3m") for m in peer_metrics])
     ret6_rank = pct_rank(metrics.get("ret6m"), [m.get("ret6m") for m in peer_metrics])
     ret1_rank = pct_rank(metrics.get("ret1y"), [m.get("ret1y") for m in peer_metrics])
-    vs50 = metrics.get("vs50") or 0.0
-    vs200 = metrics.get("vs200") or 0.0
+    vs50 = metrics.get("vs50")
+    vs200 = metrics.get("vs200")
     dd = abs(metrics.get("drawdownMax") or 35.0)
-    if vs50 >= 0 and vs200 >= 0:
+    if vs50 is None and vs200 is None:
+        regime = 45
+    elif vs200 is None:
+        regime = 62 if float(vs50) >= 0 else 35
+    elif vs50 is None:
+        regime = 58 if float(vs200) >= 0 else 35
+    elif vs50 >= 0 and vs200 >= 0:
         regime = 82
     elif vs50 >= 0:
         regime = 62
@@ -778,7 +965,7 @@ def relative_momentum_score(metrics: Dict[str, Optional[float]], peer_metrics: L
 
 def market_overlay(metrics: Dict[str, Optional[float]], peer_metrics: Optional[List[dict]] = None) -> Tuple[int, int, int, int]:
     """Return trend_score, risk_score, tactical_score, risk_penalty."""
-    if not metrics.get("available"):
+    if not metrics.get("available") or metrics.get("analysisAvailable") is False:
         return 35, 45, 40, 8
     vs50 = metrics.get("vs50") or 0.0
     vol = metrics.get("vol1y") or 45.0
@@ -814,7 +1001,7 @@ def risk_breakdown(company: Company, metrics: Dict[str, Optional[float]], portfo
     if not metrics.get("available"):
         technical = "unknown"
     cycle = "high" if any(x in company.node for x in ("HBM", "DRAM", "Memory")) or "memory" in " ".join(company.riskFlags).lower() else "medium"
-    valuation = "high" if (metrics.get("marketCapUsd") or 0) > 1.5e12 else ("medium-high" if (metrics.get("vs50") or 0) > 25 else "medium")
+    valuation = "high" if (metrics.get("scoringMarketCapUsd") or 0) > 1.5e12 else ("medium-high" if (metrics.get("vs50") or 0) > 25 else "medium")
     geo = "high" if company.region == "Taiwan" else ("medium-high" if company.region == "South Korea" else "medium")
     customer = "medium-high" if any("customer" in x.lower() or "concentration" in x.lower() for x in company.riskFlags) else "medium"
     weight = portfolio.get("weightPct") or 0.0
@@ -834,6 +1021,33 @@ def data_quality(metrics: Dict[str, Optional[float]]) -> Tuple[int, List[dict]]:
     reasons = []
     if not metrics.get("available"):
         return 35, [{"rule": "missing_price_history", "detail": "Price history is unavailable or shorter than required."}]
+    if metrics.get("futurePriceDate"):
+        return 0, [{"rule": "future_price_date", "detail": "Price date is later than the portfolio decision date."}]
+    stale_bars = metrics.get("staleTradingBars")
+    if finite(stale_bars) and float(stale_bars) >= 3:
+        score -= 55
+        reasons.append({"rule": "stale_price_history", "detail": f"Price history trails the reference market by {int(float(stale_bars))} trading bars."})
+    elif finite(stale_bars) and float(stale_bars) >= 2:
+        score -= 20
+        reasons.append({"rule": "lagged_price_history", "detail": f"Price history trails the reference market by {int(float(stale_bars))} trading bars."})
+    if metrics.get("marketCapPointInTimeCompatible") is False:
+        score -= 25
+        alignment = metrics.get("marketCapAlignmentReason") or "point-in-time provenance is incomplete"
+        reasons.append({
+            "rule": "market_cap_future_as_of",
+            "detail": f"Market cap is excluded from scoring because it is not point-in-time compatible ({alignment}).",
+        })
+    history_bars = metrics.get("historyBars")
+    if finite(history_bars) and float(history_bars) < 50:
+        score -= 20
+        reasons.append({"rule": "limited_price_history", "detail": f"Only {int(float(history_bars))} adjusted-close bars are available; 50/200DMA entry checks are incomplete."})
+    fx_lag_days = metrics.get("priceFxLagDays")
+    if (metrics.get("currency") or "USD") != "USD" and finite(fx_lag_days) and float(fx_lag_days) > 4:
+        score -= 55
+        reasons.append({"rule": "stale_fx_history", "detail": f"FX conversion trails the local price by {int(float(fx_lag_days))} calendar days."})
+    elif (metrics.get("currency") or "USD") != "USD" and finite(fx_lag_days) and float(fx_lag_days) > 2:
+        score -= 20
+        reasons.append({"rule": "lagged_fx_history", "detail": f"FX conversion trails the local price by {int(float(fx_lag_days))} calendar days."})
     if metrics.get("marketCapUsd") is None:
         score -= 20
         reasons.append({"rule": "market_cap_missing", "detail": "Market cap could not be normalized to USD."})
@@ -919,7 +1133,7 @@ def research_gate(
         reasons.extend(penalty_reasons)
     if overext >= 18 and base_score >= 76:
         return "WATCH_RESET", "caution", "Structure is attractive, but the move is too stretched; wait for reset.", reasons[:3]
-    if final_score >= 82 and trend_score >= 60 and factors.get("valuationGrowth", 0) >= 45 and vs50 < 28 and rsi14 < 76 and not penalty_reasons:
+    if final_score >= 82 and trend_score >= 60 and factors.get("valuationGrowth", 0) >= 45 and finite(metrics.get("vs50")) and finite(metrics.get("vs200")) and vs50 < 28 and rsi14 < 76 and not penalty_reasons:
         reasons.append({"rule": "plan_pass", "detail": f"Adjusted score {final_score}, strategic score {base_score}, trend {trend_score}, risk {risk_score}."})
         return "ALLOW_PLAN", "good", "Strong structure and current setup can enter a staged plan review.", reasons[:3]
     if base_score >= 82 and final_score >= 68:
@@ -942,9 +1156,7 @@ def read_dashboard_payload(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
     try:
-        text = path.read_text(encoding="utf-8")
-        match = re.search(r"const DATA = (\{.*?\});", text, re.S)
-        return json.loads(match.group(1)) if match else None
+        return _read_dashboard_payload(path)
     except Exception:
         return None
 
@@ -1007,6 +1219,33 @@ def load_market_data(tickers: Iterable[str], period: str, no_fetch: bool = False
     return None
 
 
+def dashboard_market_as_of(payload: Optional[dict]) -> Optional[str]:
+    summary = (payload or {}).get("summary") or {}
+    value = summary.get("priceAsOf") or ((summary.get("dateRange") or [None, None])[-1])
+    try:
+        return dt.date.fromisoformat(str(value)[:10]).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def truncate_market_data(raw, as_of: Optional[str]):
+    """Exclude closes later than the dashboard's US-market decision date.
+
+    Global Yahoo downloads can include a forming next-calendar-day Asian bar
+    after the US close.  Mixing that bar into a July-09 portfolio snapshot both
+    creates cross-market look-ahead and makes artifact freshness incomparable.
+    """
+    if raw is None or getattr(raw, "empty", True) or not as_of:
+        return raw
+    try:
+        cutoff = dt.date.fromisoformat(as_of)
+        mask = [getattr(index, "date", lambda: dt.date.fromisoformat(str(index)[:10]))() <= cutoff
+                for index in raw.index]
+        return raw.loc[mask]
+    except (TypeError, ValueError, AttributeError):
+        return raw
+
+
 def _last_close(raw, symbol: str) -> Optional[float]:
     try:
         if raw is None or raw.empty:
@@ -1020,6 +1259,26 @@ def _last_close(raw, symbol: str) -> Optional[float]:
         return float(close.iloc[-1]) if len(close) else None
     except Exception:
         return None
+
+
+def _last_close_record(raw, symbol: str) -> Tuple[Optional[float], Optional[str]]:
+    try:
+        if raw is None or raw.empty:
+            return None, None
+        if hasattr(raw, "columns") and getattr(raw.columns, "nlevels", 1) > 1:
+            close = raw["Close"][symbol].dropna()
+        elif "Close" in raw:
+            close = raw["Close"].dropna()
+        elif symbol in getattr(raw, "columns", []):
+            close = raw[symbol].dropna()
+        else:
+            close = raw.dropna()
+        if len(close) == 0:
+            return None, None
+        as_of = _date_value(close.index[-1])
+        return float(close.iloc[-1]), as_of.isoformat() if as_of else None
+    except Exception:
+        return None, None
 
 
 def load_fx_rates(currencies: Iterable[str], yf) -> Dict[str, dict]:
@@ -1039,13 +1298,14 @@ def load_fx_rates(currencies: Iterable[str], yf) -> Dict[str, dict]:
         if mode == "identity":
             out[currency] = {"rate": 1.0, "source": "identity"}
             continue
-        px = _last_close(raw, pair) if pair else None
+        px, fx_as_of = _last_close_record(raw, pair) if pair else (None, None)
         if not px:
             continue
         out[currency] = {
             "rate": px,
             "source": pair,
             "mode": mode,
+            "asOf": fx_as_of,
         }
     return out
 
@@ -1053,7 +1313,10 @@ def load_fx_rates(currencies: Iterable[str], yf) -> Dict[str, dict]:
 def convert_market_cap_to_usd(market_cap: Optional[float], currency: Optional[str], fx: Dict[str, dict]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     if not market_cap:
         return None, None, None
-    currency = (currency or "USD").upper()
+    currency = normalize_currency(currency) or "USD"
+    if currency == "GBX":
+        currency = "GBP"  # Yahoo marketCap is already pounds even when the quote is pence.
+    scaled_market_cap = float(market_cap)
     rec = fx.get(currency)
     if not rec:
         return None, None, None
@@ -1062,13 +1325,17 @@ def convert_market_cap_to_usd(market_cap: Optional[float], currency: Optional[st
     if not rate:
         return None, None, rec.get("source")
     if mode == "multiply":
-        return market_cap * rate, rate, rec.get("source")
+        return scaled_market_cap * rate, rate, rec.get("source")
     if mode == "divide":
-        return market_cap / rate, rate, rec.get("source")
-    return market_cap, rate, rec.get("source")
+        return scaled_market_cap / rate, rate, rec.get("source")
+    return scaled_market_cap, rate, rec.get("source")
 
 
-def load_market_profiles(tickers: Iterable[str], no_fetch: bool = False) -> Dict[str, dict]:
+def load_market_profiles(
+    tickers: Iterable[str],
+    no_fetch: bool = False,
+    market_data_as_of: Optional[str] = None,
+) -> Dict[str, dict]:
     if no_fetch:
         return {}
     try:
@@ -1081,57 +1348,191 @@ def load_market_profiles(tickers: Iterable[str], no_fetch: bool = False) -> Dict
         return {}
     raw_profiles = {}
     currencies = set()
+    fetched_at = dt.datetime.now().astimezone()
+    fetched_date = fetched_at.date()
+    try:
+        decision_date = dt.date.fromisoformat(str(market_data_as_of)[:10]) if market_data_as_of else None
+    except ValueError:
+        decision_date = None
     for ticker in sorted(set(tickers)):
         try:
             yft = yf.Ticker(ticker)
             fast = dict(yft.fast_info or {})
             market_cap = fast.get("market_cap") or fast.get("marketCap")
-            currency = (fast.get("currency") or fast.get("last_price_currency") or "").upper()
+            market_cap_source = "yahoo_fast_info" if market_cap else None
+            currency = normalize_currency(fast.get("currency") or fast.get("last_price_currency"))
             if (not market_cap or not currency) and hasattr(yft, "get_info"):
                 info = yft.get_info() or {}
-                market_cap = market_cap or info.get("marketCap")
-                currency = currency or (info.get("currency") or "").upper()
-            if market_cap:
-                currency = currency or "USD"
-                raw_profiles[ticker] = {"marketCap": float(market_cap), "currency": currency}
-                currencies.add(currency)
+                if not market_cap and info.get("marketCap"):
+                    market_cap = info.get("marketCap")
+                    market_cap_source = "yahoo_quote_summary"
+                currency = currency or normalize_currency(info.get("currency"))
+            currency = currency or infer_ticker_currency(ticker)
+            normalized_market_cap, market_cap_unit_scale = normalize_market_cap_value(
+                market_cap, currency, market_cap_source
+            )
+            raw_profiles[ticker] = {
+                "ticker": ticker,
+                "marketCap": normalized_market_cap,
+                "marketCapRaw": float(market_cap) if market_cap and finite(market_cap) else None,
+                "marketCapUnitScale": market_cap_unit_scale,
+                "marketCapSource": market_cap_source,
+                "currency": currency,
+                "marketCapCurrency": "GBP" if currency == "GBX" else currency,
+            }
+            currencies.update((currency, "GBP" if currency == "GBX" else currency))
         except Exception:
-            continue
+            currency = infer_ticker_currency(ticker)
+            raw_profiles[ticker] = {
+                "ticker": ticker,
+                "marketCap": None,
+                "marketCapRaw": None,
+                "marketCapUnitScale": None,
+                "marketCapSource": "missing",
+                "currency": currency,
+                "marketCapCurrency": "GBP" if currency == "GBX" else currency,
+            }
+            currencies.update((currency, "GBP" if currency == "GBX" else currency))
     fx = load_fx_rates(currencies, yf)
     out = {}
     for ticker, rec in raw_profiles.items():
-        usd, rate, source = convert_market_cap_to_usd(rec.get("marketCap"), rec.get("currency"), fx)
+        cap_currency = rec.get("marketCapCurrency") or rec.get("currency")
+        usd, rate, source = convert_market_cap_to_usd(rec.get("marketCap"), cap_currency, fx)
         out[ticker] = {
             **rec,
             "marketCapUsd": usd,
             "fxRate": rate,
             "fxSource": source,
             "fxMode": (fx.get(rec.get("currency")) or {}).get("mode", "identity"),
+            "fxAsOf": (fx.get(cap_currency) or {}).get("asOf"),
+            "marketCapAsOf": fetched_date.isoformat(),
+            "marketCapAsOfSource": "fetch_date_fallback",
+            "marketCapFetchedAt": fetched_at.isoformat(timespec="seconds"),
+            "marketCapPointInTimeCompatible": decision_date is None or fetched_date <= decision_date,
+            "shareCountPointInTimeVerified": False,
         }
     print(f"· market caps: {len(out)}/{len(set(tickers))} profiles", file=sys.stderr)
     return out
 
 
+def required_fx_tickers(profiles: Dict[str, dict], tickers: Iterable[str]) -> List[str]:
+    pairs = set()
+    for ticker in tickers:
+        currency = ((profiles.get(ticker) or {}).get("currency") or infer_ticker_currency(ticker)).upper()
+        pair = (FX_SPECS.get(currency) or (None, None))[0]
+        if pair:
+            pairs.add(pair)
+    return sorted(pairs)
+
+
+def align_market_profile_as_of(profiles: Dict[str, dict], prices, decision_as_of: Optional[str]) -> Dict[str, dict]:
+    """Audit current market-cap provenance against a decision date.
+
+    A downloaded close can date the quote observation, but it cannot date the
+    provider's current share count.  In particular, never relabel a market cap
+    fetched today as a historical market cap merely because historical prices
+    are available.  A backdated profile is usable only when its own cap date is
+    not in the future and a post-decision fetch explicitly verifies historical
+    shares.
+    """
+    decision_date = _date_value(decision_as_of)
+    for ticker, profile in profiles.items():
+        series = _series_column(prices, ticker)
+        quote_date = None
+        if series is not None:
+            clean = series.dropna()
+            quote_date = _date_value(clean.index[-1]) if len(clean) else None
+        cap_date = _date_value(profile.get("marketCapAsOf"))
+        fetched_date = _date_value(profile.get("marketCapFetchedAt")) or cap_date
+        fx_date = _date_value(profile.get("fxAsOf"))
+        currency = normalize_currency(profile.get("currency")) or "USD"
+        if quote_date:
+            profile["marketCapQuoteAsOf"] = quote_date.isoformat()
+        profile["marketCapDecisionAsOf"] = decision_date.isoformat() if decision_date else None
+
+        if decision_date is None:
+            compatible = cap_date is not None and quote_date is not None
+            if currency != "USD":
+                compatible = compatible and fx_date is not None
+            reason = "current_profile_dates_observed" if compatible else "profile_provenance_incomplete"
+        else:
+            cap_compatible = cap_date is not None and cap_date <= decision_date
+            quote_compatible = quote_date is not None and quote_date <= decision_date
+            fx_compatible = currency == "USD" or (fx_date is not None and fx_date <= decision_date)
+            post_decision_fetch = fetched_date is not None and fetched_date > decision_date
+            historical_shares_verified = profile.get("shareCountPointInTimeVerified") is True
+            shares_compatible = not post_decision_fetch or historical_shares_verified
+            compatible = bool(cap_compatible and quote_compatible and fx_compatible and shares_compatible)
+
+            reasons = []
+            if not cap_compatible:
+                reasons.append("market_cap_as_of_after_decision_or_missing")
+            if not quote_compatible:
+                reasons.append("quote_as_of_after_decision_or_missing")
+            if not fx_compatible:
+                reasons.append("fx_as_of_after_decision_or_missing")
+            if not shares_compatible:
+                reasons.append("historical_share_count_unverified")
+            reason = "point_in_time_compatible" if compatible else ";".join(reasons)
+
+        profile["marketCapAlignmentReason"] = reason
+        profile["marketCapPointInTimeCompatible"] = bool(compatible)
+    return profiles
+
+
+def _series_column(prices, symbol: Optional[str]):
+    try:
+        if symbol and prices is not None and symbol in getattr(prices, "columns", []):
+            return prices[symbol]
+    except Exception:
+        pass
+    return None
+
+
+def _reference_date_from_prices(prices, benchmark_symbol: str) -> Optional[str]:
+    series = _series_column(prices, benchmark_symbol)
+    if series is None:
+        try:
+            if prices is None or prices.empty:
+                return None
+            valid_dates = [date for date in (_date_value(index) for index in prices.index) if date]
+            return max(valid_dates).isoformat() if valid_dates else None
+        except Exception:
+            return None
+    clean = series.dropna()
+    if len(clean) == 0:
+        return None
+    value = _date_value(clean.index[-1])
+    return value.isoformat() if value else None
+
+
 def annotate_percentiles(rows: List[dict]) -> None:
-    final_scores = [r.get("finalScore") for r in rows]
+    ranked_rows = [
+        r for r in rows
+        if r.get("gate") != "DATA_REVIEW" and r.get("dataQualitySeverity") != "hard_review"
+        and (r.get("market") or {}).get("analysisAvailable") is not False
+    ]
+    final_scores = [r.get("finalScore") for r in ranked_rows]
     strategic_scores = [r.get("strategicRankScore") for r in rows]
-    tactical_scores = [r.get("tacticalScore") for r in rows]
+    tactical_scores = [r.get("tacticalScore") for r in ranked_rows]
     by_peer: Dict[str, List[dict]] = {}
     for row in rows:
         by_peer.setdefault(row.get("peerGroup") or "Other", []).append(row)
     for row in rows:
         peers = by_peer.get(row.get("peerGroup") or "Other", [])
-        peer_count = len(peers)
-        peer_pct = percentile_int(row.get("finalScore"), [p.get("finalScore") for p in peers])
+        ranked_peers = [p for p in peers if p in ranked_rows]
+        peer_count = len(ranked_peers)
+        is_ranked = row in ranked_rows
+        peer_pct = percentile_int(row.get("finalScore"), [p.get("finalScore") for p in ranked_peers]) if is_ranked else None
         peer_strategic_pct = percentile_int(row.get("strategicRankScore"), [p.get("strategicRankScore") for p in peers])
-        row["universePercentile"] = percentile_int(row.get("finalScore"), final_scores)
+        row["universePercentile"] = percentile_int(row.get("finalScore"), final_scores) if is_ranked else None
         row["strategicPercentile"] = percentile_int(row.get("strategicRankScore"), strategic_scores)
-        row["tacticalPercentile"] = percentile_int(row.get("tacticalScore"), tactical_scores)
+        row["tacticalPercentile"] = percentile_int(row.get("tacticalScore"), tactical_scores) if is_ranked else None
         row["peerGroupSize"] = peer_count
         row["peerPercentile"] = peer_pct
         row["peerStrategicPercentile"] = peer_strategic_pct
-        row["peerPercentileDisplay"] = peer_percentile_display(peer_pct, peer_count)
-        row["peerStrategicPercentileDisplay"] = peer_percentile_display(peer_strategic_pct, peer_count)
+        row["peerPercentileDisplay"] = "DATA_REVIEW · not ranked" if not is_ranked else peer_percentile_display(peer_pct, peer_count)
+        row["peerStrategicPercentileDisplay"] = peer_percentile_display(peer_strategic_pct, len(peers))
         if row.get("gate") == "ALLOW_DD":
             row["gateReasons"] = allow_dd_gate_reasons(row)
 
@@ -1165,18 +1566,38 @@ def allow_dd_gate_reasons(row: dict) -> List[dict]:
     return [reason, *existing[:2]]
 
 
-def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], Optional[str]]:
+def build_scores(
+    prices,
+    exposures: Dict[str, dict],
+    profiles: Optional[Dict[str, dict]] = None,
+    reference_date: Optional[str] = None,
+) -> Tuple[List[dict], Optional[str]]:
     profiles = profiles or {}
     bench = None
     if prices is not None and "SOXX" in getattr(prices, "columns", []):
         bench = prices["SOXX"]
+    reference_date = reference_date or _reference_date_from_prices(prices, "SOXX")
+    reference_index = getattr(bench, "index", None) if bench is not None else getattr(prices, "index", None)
     latest_date = None
     metrics_by_company = {}
     for company in UNIVERSE:
-        profile = profiles.get(company.ticker) or {}
+        profile = {
+            "ticker": company.ticker,
+            "currency": infer_ticker_currency(company.ticker),
+            **(profiles.get(company.ticker) or {}),
+        }
         metrics = {"available": False, **market_profile_fields(profile)}
         if prices is not None and company.ticker in getattr(prices, "columns", []):
-            metrics = market_metrics(prices[company.ticker], benchmark=bench, profile=profile)
+            currency = (profile.get("currency") or infer_ticker_currency(company.ticker)).upper()
+            fx_ticker = (FX_SPECS.get(currency) or (None, None))[0]
+            metrics = market_metrics(
+                prices[company.ticker],
+                benchmark=bench,
+                profile=profile,
+                fx_series=_series_column(prices, fx_ticker),
+                reference_date=reference_date,
+                reference_index=reference_index,
+            )
             latest_date = max(latest_date or metrics.get("date"), metrics.get("date") or latest_date)
         metrics_by_company[company.companyId] = metrics
 
@@ -1185,7 +1606,7 @@ def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str
     for company in UNIVERSE:
         metrics = metrics_by_company[company.companyId]
         factors = dict(company.factors)
-        factors["sizeGrowthTorque"] = size_growth_torque(company, metrics.get("marketCapUsd"))
+        factors["sizeGrowthTorque"] = size_growth_torque(company, metrics.get("scoringMarketCapUsd"))
         structural_base = structural_score(factors)
         torque_adjusted, torque_bonus, fragility_penalty = torque_overlay(company, factors, metrics)
         exp = {}
@@ -1217,7 +1638,7 @@ def build_scores(prices, exposures: Dict[str, dict], profiles: Optional[Dict[str
             **asdict(company),
             "factors": factors,
             "peerGroup": peer_group(company),
-            "sizeScore": market_cap_size_score(metrics.get("marketCapUsd")),
+            "sizeScore": market_cap_size_score(metrics.get("scoringMarketCapUsd")),
             "structuralBaseScore": structural_base,
             "torqueAdjustedScore": torque_adjusted,
             "torqueBonus": torque_bonus,
@@ -1300,6 +1721,10 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
     hard_flags = [a for a in anomalies if a.get("severity") == "hard_review"]
     return {
         "modelVersion": MODEL_VERSION,
+        "decisionGrade": False,
+        "structuralPriorStatus": "curated priors without row-level source lineage or point-in-time fundamental history",
+        "structuralPriorAsOf": None,
+        "structuralPriorRequiresManualReview": True,
         "dataDate": latest_date,
         "universeSize": len(rows),
         "missingPriceCount": missing_price,
@@ -1307,6 +1732,19 @@ def model_card(rows: List[dict], latest_date: Optional[str]) -> dict:
         "dataReviewCount": data_review,
         "softDataReviewCount": soft_data_review,
         "momentumScoreAt100Count": saturated_momentum,
+        "usdFxAdjustedReturnCount": sum(1 for r in rows if (r.get("market") or {}).get("fxAdjustedReturns")),
+        "missingUsdReturnConversionCount": sum(
+            1 for r in rows
+            if (r.get("market") or {}).get("available")
+            and (r.get("market") or {}).get("analysisAvailable") is False
+        ),
+        "stalePriceCount": sum(1 for r in rows if ((r.get("market") or {}).get("staleTradingBars") or 0) >= 2),
+        "pointInTimeIncompatibleMarketCapCount": sum(
+            1 for r in rows if (r.get("market") or {}).get("marketCapPointInTimeCompatible") is False
+        ),
+        "pointInTimeVerifiedShareCountCount": sum(
+            1 for r in rows if (r.get("market") or {}).get("shareCountPointInTimeVerified") is True
+        ),
         "factorWeights": FACTOR_WEIGHTS,
         "torqueOverlay": TORQUE_OVERLAY,
         "thresholds": {
@@ -1452,7 +1890,9 @@ def render_report(doc: dict) -> str:
             "## Method Notes",
             "",
             "- Structural factors are curated priors from the attached AI-SemiQuant research notes and should be reviewed after earnings, capex guides, or market-share changes.",
-            "- Market overlay uses Yahoo Finance adjusted daily closes when available.",
+            "- The artifact has no row-level point-in-time fundamental history, so structural priors and curated supply-chain edges are not decision-grade on their own.",
+            "- Market overlay uses Yahoo Finance adjusted daily closes; non-USD listings are converted through backward-looking daily FX before returns, trend, volatility, drawdown, and beta are calculated.",
+            "- Current Yahoo profile market caps fetched after an older dashboard decision date remain display-only and are excluded from size/torque scoring.",
             "- Portfolio exposure is read from `output/portfolio_dashboard.html` when present.",
         ]
     )
@@ -1496,17 +1936,33 @@ def fmt_pct(value: Optional[float]) -> str:
 
 def build_document(args) -> dict:
     company_tickers = [c.ticker for c in UNIVERSE]
-    tickers = company_tickers + ["SOXX"]
-    prices = load_market_data(tickers, args.period, no_fetch=args.no_fetch)
-    profiles = load_market_profiles(company_tickers, no_fetch=args.no_fetch)
     payload = read_dashboard_payload(Path(args.dashboard)) if args.dashboard else None
+    target_as_of = dashboard_market_as_of(payload)
+    profiles = load_market_profiles(
+        company_tickers,
+        no_fetch=args.no_fetch,
+        market_data_as_of=target_as_of,
+    )
+    tickers = company_tickers + ["SOXX", *required_fx_tickers(profiles, company_tickers)]
+    raw_prices = load_market_data(tickers, args.period, no_fetch=args.no_fetch)
+    profiles = align_market_profile_as_of(profiles, raw_prices, target_as_of)
+    raw_rows = len(raw_prices) if raw_prices is not None else 0
+    prices = truncate_market_data(raw_prices, target_as_of)
+    aligned_rows = len(prices) if prices is not None else 0
     exposures = portfolio_exposure(payload)
-    scores, latest_date = build_scores(prices, exposures, profiles)
+    scores, latest_date = build_scores(prices, exposures, profiles, reference_date=target_as_of)
     generated_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     return {
         "schemaVersion": 3,
+        "researchOnly": True,
+        "decisionGrade": False,
         "generatedAt": generated_at,
         "marketDataAsOf": latest_date,
+        "dataAlignment": {
+            "portfolioPriceAsOf": target_as_of,
+            "futureCalendarRowsExcluded": max(0, raw_rows - aligned_rows),
+            "policy": "market overlays do not use closes after the dashboard price date; non-USD technical returns include backward-filled daily FX",
+        },
         "title": "AI-SemiQuant",
         "subtitle": "AI 半导体全产业链量化评分与资金流分析系统",
         "method": "Curated structural AI semiconductor factors + Yahoo Finance market/market-cap overlay + portfolio exposure overlay.",
@@ -1535,10 +1991,8 @@ def main() -> None:
     doc = build_document(args)
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_md.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    out_md.write_text(render_report(doc), encoding="utf-8")
+    atomic_write_json(out_json, doc)
+    atomic_write_text(out_md, render_report(doc))
     print(f"✓ wrote {out_json}")
     print(f"✓ wrote {out_md}")
     print(

@@ -15,6 +15,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import atomic_write_bytes
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "refresh_latest_prices.py"
@@ -63,15 +68,15 @@ def launchctl(*parts):
 
 def install(args):
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
-    OUT.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    OUT.chmod(0o700)
     uid = os.getuid()
     python_exe = str(Path(sys.executable).resolve())
     written = []
     for trigger, when in JOBS.items():
         path = plist_path(trigger)
         obj = build_plist(trigger, when["hour"], when["minute"], python_exe, args.input_dir, args.no_fetch)
-        with path.open("wb") as f:
-            plistlib.dump(obj, f)
+        atomic_write_bytes(path, plistlib.dumps(obj))
         written.append(path)
         launchctl("bootout", f"gui/{uid}", str(path))
         boot = launchctl("bootstrap", f"gui/{uid}", str(path))

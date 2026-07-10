@@ -1,4 +1,6 @@
-yfinance>=0.2
-pandas>=2.0
-numpy>=1.24
-pytest>=8.0
+yfinance>=0.2,<2
+pandas>=2.0,<3
+numpy>=1.24,<3
+requests>=2.31,<3
+Pillow>=10,<13
+pytest>=8.0,<10

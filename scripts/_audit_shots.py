@@ -22,7 +22,9 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(HERE, "output", "portfolio_dashboard.html")
 OUT = os.path.join(HERE, "output", "audit_shots")
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-os.makedirs(OUT, exist_ok=True)
+os.umask(0o077)
+os.makedirs(OUT, mode=0o700, exist_ok=True)
+os.chmod(OUT, 0o700)
 
 html = open(SRC, encoding="utf-8").read()
 assert "</body></html>" in html, "unexpected template tail"

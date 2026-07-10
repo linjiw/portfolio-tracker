@@ -117,6 +117,54 @@ class CounterfactualReplayTests(unittest.TestCase):
         self.assertEqual(cf["aggregate"]["winRate"], 100.0)
         self.assertEqual(cf["aggregate"]["scoredCount"], 1)
 
+    def test_missing_new_holding_price_is_not_future_backfilled(self):
+        txns = {
+            "AAA": [tx("2026-01-02", "AAA", "SELL", 10, 100, 1000)],
+            "BBB": [tx("2026-01-02", "BBB", "BUY", 10, 100, -1000)],
+        }
+        cur = {"AAA": {"shares": 0}, "BBB": {"shares": 10}}
+        prices = {
+            "^GSPC": {"2026-01-01": 100, "2026-01-02": 100, "2026-01-03": 100},
+            "AAA": {"2026-01-01": 100, "2026-01-02": 100, "2026-01-03": 100},
+            # First BBB observation is after the trade. It must not value Jan 2.
+            "BBB": {"2026-01-03": 110},
+        }
+
+        cf = generate.build_counterfactual_replays(
+            txns, cur, prices, "2026-01-01", "2026-01-03", 1000)
+
+        self.assertEqual(cf["detectedCount"], 1)
+        self.assertEqual(cf["events"], [])
+        self.assertEqual(cf["unavailableCount"], 1)
+        self.assertEqual(cf["aggregate"]["scoredCount"], 0)
+
+    def test_price_coverage_truncation_is_not_scored(self):
+        txns = {
+            "AAA": [tx("2026-01-02", "AAA", "SELL", 10, 100, 1000)],
+            "BBB": [tx("2026-01-02", "BBB", "BUY", 10, 100, -1000)],
+            "CCC": [tx("2026-01-04", "CCC", "BUY", 1, 50, -50)],
+        }
+        cur = {"AAA": {"shares": 0}, "BBB": {"shares": 10}, "CCC": {"shares": 1}}
+        prices = {
+            "^GSPC": {d: 100 for d in ("2026-01-01", "2026-01-02", "2026-01-03",
+                                               "2026-01-04", "2026-01-05")},
+            "AAA": {d: 100 for d in ("2026-01-01", "2026-01-02", "2026-01-03",
+                                             "2026-01-04", "2026-01-05")},
+            "BBB": {d: 100 for d in ("2026-01-01", "2026-01-02", "2026-01-03",
+                                             "2026-01-04", "2026-01-05")},
+            "CCC": {"2026-01-05": 50},
+        }
+
+        cf = generate.build_counterfactual_replays(
+            txns, cur, prices, "2026-01-01", "2026-01-05", 1000)
+
+        event = cf["events"][0]
+        self.assertFalse(event["summary"]["priceCoverageComplete"])
+        self.assertTrue(event["summary"]["isTruncated"])
+        self.assertIsNone(event["score"]["score"])
+        self.assertEqual(event["score"]["confidence"], "price-coverage-failed")
+        self.assertEqual(cf["aggregate"]["scoredCount"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

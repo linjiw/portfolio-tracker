@@ -7,11 +7,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import atomic_write_bytes
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_intraday_tape_codex.py"
+OUT = ROOT / "output" / "intraday_tape"
 LAUNCH_DIR = Path.home() / "Library" / "LaunchAgents"
 LABEL = "org.portfolio.tracker.intraday-tape-codex"
+SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 def plist_path():
@@ -28,24 +35,25 @@ def build_plist():
         "ProgramArguments": [sys.executable, str(RUNNER)],
         "WorkingDirectory": str(ROOT),
         "EnvironmentVariables": {
-            "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "PATH": SAFE_PATH,
             "PYTHONUNBUFFERED": "1",
+            "HOME": str(Path.home()),
         },
         "StartInterval": 900,
         "RunAtLoad": True,
-        "StandardOutPath": "/tmp/intraday-tape-codex.out.log",
-        "StandardErrorPath": "/tmp/intraday-tape-codex.err.log",
+        "StandardOutPath": str(OUT / "launchd.out.log"),
+        "StandardErrorPath": str(OUT / "launchd.err.log"),
     }
 
 
 def install():
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    OUT.chmod(0o700)
     RUNNER.chmod(0o755)
     path = plist_path()
     uid = os.getuid()
-    with path.open("wb") as f:
-        plistlib.dump(build_plist(), f)
-    path.chmod(0o600)
+    atomic_write_bytes(path, plistlib.dumps(build_plist()))
     launchctl("bootout", f"gui/{uid}", str(path))
     boot = launchctl("bootstrap", f"gui/{uid}", str(path))
     if boot.returncode != 0:

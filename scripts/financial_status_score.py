@@ -19,12 +19,12 @@ secUserAgent in the same config file.
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -32,6 +32,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    from scripts.artifact_io import atomic_write_csv, atomic_write_json, atomic_write_text
+    from scripts.dashboard_payload import read_dashboard_payload as _read_dashboard_payload
+except ModuleNotFoundError:  # direct ``python scripts/financial_status_score.py``
+    from artifact_io import atomic_write_csv, atomic_write_json, atomic_write_text
+    from dashboard_payload import read_dashboard_payload as _read_dashboard_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +51,7 @@ DEFAULT_CONFIG = Path.home() / ".config" / "ptrak" / "fmp.json"
 FMP_BASE = "https://financialmodelingprep.com/stable"
 SEC_BASE = "https://data.sec.gov"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-MODEL_VERSION = "0.2.0"
+MODEL_VERSION = "0.4.0"
 
 SOURCE_DOCS = [
     "https://site.financialmodelingprep.com/developer/docs/stable/financial-scores",
@@ -76,9 +83,7 @@ FINAL_WEIGHTS = {
 }
 
 ETF_SYMBOLS = {"QQQ", "VOO", "SPMO", "SOXQ", "HBMX", "RAM"}
-NON_COMPANY_SYMBOLS = {
-    "SPCX": "private/non-listed company exposure; public FMP fundamentals are not expected",
-}
+NON_COMPANY_SYMBOLS = {}
 ETF_NAME_HINTS = (
     " ETF",
     "EXCHANGE-TRADED",
@@ -126,24 +131,39 @@ def num(value: Any) -> Optional[float]:
     return value
 
 
-def pct_ratio(value: Any) -> Optional[float]:
-    """Return a decimal ratio, accepting either 0.25 or 25-style percentages."""
+def pct_ratio(value: Any, *, unit: str) -> Optional[float]:
+    """Normalize an explicitly declared ratio unit to decimal form.
+
+    Guessing from magnitude is unsafe: 3.5 can legitimately mean either 350%
+    or 3.5%.  Every upstream adapter in this module emits decimal ratios, while
+    callers handling a percent-valued field must say ``unit="percent"``.
+    """
     x = num(value)
     if x is None:
         return None
-    if abs(x) > 3:
+    if unit == "percent":
         return x / 100.0
-    return x
+    if unit == "decimal":
+        return x
+    raise ValueError(f"unsupported ratio unit: {unit!r}")
 
 
-def first_num(row: Optional[dict], *keys: str, ratio: bool = False) -> Optional[float]:
+def first_num(row: Optional[dict], *keys: str, ratio_unit: Optional[str] = None) -> Optional[float]:
     if not isinstance(row, dict):
         return None
     for key in keys:
         if key in row:
-            value = pct_ratio(row.get(key)) if ratio else num(row.get(key))
+            value = pct_ratio(row.get(key), unit=ratio_unit) if ratio_unit else num(row.get(key))
             if value is not None:
                 return value
+    return None
+
+
+def first_not_none(*values: Any) -> Any:
+    """Return the first non-None value without treating zero as missing."""
+    for value in values:
+        if value is not None:
+            return value
     return None
 
 
@@ -218,11 +238,18 @@ def banded_low_score(value: Optional[float], good_ceiling: float, bad_ceiling: f
 
 
 def extract_dashboard_payload(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
-    match = re.search(r"const DATA = (.*?);\nconst fmt=", text, re.S)
-    if not match:
-        raise ValueError(f"could not find embedded DATA payload in {path}")
-    return json.loads(match.group(1))
+    return _read_dashboard_payload(path)
+
+
+def validate_private_config(config: Path) -> None:
+    """Require a current-user-owned regular 0600 file before reading secrets."""
+    info = config.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise PermissionError("FMP config must be a regular, non-symlink file")
+    if info.st_uid != os.getuid():
+        raise PermissionError("FMP config must be owned by the current user")
+    if info.st_mode & 0o077:
+        raise PermissionError("FMP config permissions must be 0600")
 
 
 def load_api_key(config: Path) -> Optional[str]:
@@ -231,6 +258,7 @@ def load_api_key(config: Path) -> Optional[str]:
         return env_key.strip()
     if not config.exists():
         return None
+    validate_private_config(config)
     raw = json.loads(config.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         return None
@@ -241,6 +269,7 @@ def load_api_key(config: Path) -> Optional[str]:
 def load_config(config: Path) -> dict:
     if not config.exists():
         return {}
+    validate_private_config(config)
     try:
         raw = json.loads(config.read_text(encoding="utf-8"))
         return raw if isinstance(raw, dict) else {}
@@ -313,6 +342,8 @@ class FmpClient:
         self.source_calls: Dict[str, int] = {}
         self.source_cache_hits: Dict[str, int] = {}
         self.errors: List[str] = []
+        self.fmp_global_circuit_status: Optional[int] = None
+        self.fmp_blocked_endpoints = set()
         self.cache: Dict[str, Any] = {"entries": {}}
         if cache_path.exists():
             try:
@@ -336,11 +367,15 @@ class FmpClient:
         if fetched_at:
             try:
                 age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
-                fresh = age.total_seconds() <= self.cache_ttl_hours * 3600
+                fresh = 0 <= age.total_seconds() <= self.cache_ttl_hours * 3600
             except ValueError:
                 fresh = False
-        if fresh or self.no_fetch:
+        if fresh:
             return entry.get("payload"), str(entry.get("status") or "cache")
+        if self.no_fetch:
+            original = str(entry.get("status") or "cache")
+            status = "stale_cache_error" if "error" in original else "stale_cache"
+            return entry.get("payload"), status
         return None, None
 
     def put_cache(self, key: str, endpoint: str, params: dict, status: str, payload: Any) -> None:
@@ -365,11 +400,19 @@ class FmpClient:
         cached_payload, cached_status = self.cache_entry(key)
         if cached_status is not None:
             self.bump_cache_hit("fmp")
-            return cached_payload, cached_status if "error" in cached_status else "cache"
+            return cached_payload, (
+                cached_status if ("error" in cached_status or cached_status.startswith("stale_"))
+                else "cache"
+            )
         if self.no_fetch:
             return None, "missing_cache"
         if not self.api_key:
             return None, "missing_key"
+        if self.fmp_global_circuit_status is not None:
+            return {"error": f"FMP circuit open after HTTP {self.fmp_global_circuit_status}",
+                    "httpStatus": self.fmp_global_circuit_status}, "circuit_open"
+        if endpoint in self.fmp_blocked_endpoints:
+            return {"error": "FMP endpoint unavailable under the current plan", "httpStatus": 402}, "circuit_open"
 
         query = dict(params)
         query["apikey"] = self.api_key
@@ -382,6 +425,10 @@ class FmpClient:
             detail = exc.read().decode("utf-8", errors="ignore")[:160]
             self.errors.append(f"{endpoint} {params.get('symbol','')}: HTTP {exc.code} {detail}")
             payload = {"error": detail, "httpStatus": exc.code}
+            if exc.code == 402:
+                self.fmp_blocked_endpoints.add(endpoint)
+            elif exc.code in (401, 403, 429):
+                self.fmp_global_circuit_status = exc.code
             self.put_cache(key, endpoint, {k: v for k, v in params.items() if k.lower() != "apikey"}, "http_error", payload)
             return payload, "http_error"
         except Exception as exc:  # network and JSON failures are soft per-symbol errors
@@ -401,7 +448,10 @@ class FmpClient:
         cached_payload, cached_status = self.cache_entry(key)
         if cached_status is not None:
             self.bump_cache_hit(source)
-            return cached_payload, cached_status if "error" in cached_status else "cache"
+            return cached_payload, (
+                cached_status if ("error" in cached_status or cached_status.startswith("stale_"))
+                else "cache"
+            )
         if self.no_fetch:
             return None, "missing_cache"
         try:
@@ -427,9 +477,8 @@ class FmpClient:
         return payload, "fresh"
 
     def save(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.cache["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(self.cache_path, self.cache)
 
 
 def classify_omission(stock: dict) -> Optional[str]:
@@ -446,15 +495,24 @@ def classify_omission(stock: dict) -> Optional[str]:
 
 
 def portfolio_rows(payload: dict, forced_symbols: Optional[List[str]] = None) -> Tuple[List[dict], List[dict]]:
-    stocks = [s for s in payload.get("stocks", []) if isinstance(s, dict) and s.get("held")]
+    all_stocks = [s for s in payload.get("stocks", []) if isinstance(s, dict) and s.get("held")]
+    # Exposure always uses the complete held-equity denominator.  Filtering a
+    # report to one or two tickers must not make those names look like 100% of
+    # the portfolio.
+    market_value = sum(num(s.get("value")) or 0.0 for s in all_stocks)
+    stocks = all_stocks
     if forced_symbols:
         wanted = {s.upper() for s in forced_symbols}
         stocks = [s for s in stocks if str(s.get("sym") or "").upper() in wanted]
-    market_value = sum(float(s.get("value") or 0) for s in stocks) or 1.0
     scored, omitted = [], []
     for stock in stocks:
         row = dict(stock)
-        row["portfolioWeightPct"] = round(float(row.get("value") or 0) / market_value * 100.0, 4)
+        value = num(row.get("value"))
+        row["portfolioWeightPct"] = (
+            round((value or 0.0) / market_value * 100.0, 4)
+            if market_value > 0
+            else None
+        )
         reason = classify_omission(row)
         if reason:
             omitted.append(
@@ -486,7 +544,8 @@ def endpoint_status(payload: Any, status: str) -> dict:
     err = ""
     if isinstance(payload, dict):
         err = str(payload.get("Error Message") or payload.get("error") or "")[:160]
-    return {"status": status, "rows": len(rows), "ok": bool(rows), "error": err or None}
+    unusable = any(token in str(status) for token in ("error", "missing", "circuit", "stale"))
+    return {"status": status, "rows": len(rows), "ok": bool(rows) and not unusable, "error": err or None}
 
 
 def fetch_calendar(client: FmpClient, today: dt.date, horizon_days: int) -> Tuple[Dict[str, dict], dict]:
@@ -559,11 +618,19 @@ def df_columns(df: Any, limit: int = 4) -> List[Any]:
     return cols[:limit]
 
 
-def df_sum(df: Any, names: Iterable[str], columns: Optional[List[Any]] = None) -> Optional[float]:
+def df_sum(
+    df: Any,
+    names: Iterable[str],
+    columns: Optional[List[Any]] = None,
+    *,
+    required_periods: int = 4,
+) -> Optional[float]:
     row = df_row(df, *names)
     if row is None:
         return None
     cols = columns or df_columns(df, 4)
+    if len(cols) != required_periods:
+        return None
     vals = []
     for col in cols:
         try:
@@ -572,7 +639,7 @@ def df_sum(df: Any, names: Iterable[str], columns: Optional[List[Any]] = None) -
             value = None
         if value is not None:
             vals.append(value)
-    return sum(vals) if vals else None
+    return sum(vals) if len(vals) == required_periods else None
 
 
 def df_latest(df: Any, names: Iterable[str]) -> Optional[float]:
@@ -587,6 +654,107 @@ def df_latest(df: Any, names: Iterable[str]) -> Optional[float]:
         if value is not None:
             return value
     return None
+
+
+def df_value_at_column(df: Any, names: Iterable[str], column: Any) -> Optional[float]:
+    """Return one named balance-sheet value at one exact reporting date."""
+    row = df_row(df, *tuple(names))
+    if row is None:
+        return None
+    try:
+        return num(row[column])
+    except Exception:
+        return None
+
+
+def yahoo_comprehensive_debt(balance: Any) -> Tuple[Optional[float], Optional[str]]:
+    """Use reported total debt or a same-period current + noncurrent sum.
+
+    The fallback intentionally requires both components. Treating a lone
+    current or noncurrent row as total debt materially understates leverage,
+    while adding components to an already comprehensive total double-counts it.
+    """
+    columns = df_columns(balance, 1)
+    if not columns:
+        return None, None
+    column = columns[0]
+    reported_total = df_value_at_column(balance, ("Total Debt",), column)
+    if reported_total is not None:
+        return reported_total, "reported_total_debt"
+    current = df_value_at_column(
+        balance,
+        (
+            "Current Debt",
+            "Current Debt And Capital Lease Obligation",
+            "Current Debt And Finance Lease Obligation",
+        ),
+        column,
+    )
+    noncurrent = df_value_at_column(
+        balance,
+        (
+            "Long Term Debt",
+            "Long Term Debt And Capital Lease Obligation",
+            "Long Term Debt And Finance Lease Obligation",
+            "Long Term Debt Noncurrent",
+        ),
+        column,
+    )
+    if current is None or noncurrent is None:
+        return None, None
+    return current + noncurrent, "same_period_current_plus_noncurrent_debt"
+
+
+def yahoo_average_invested_capital(balance: Any) -> Optional[float]:
+    """Average the latest and approximately year-earlier invested capital."""
+    columns = df_columns(balance, 8)
+    if len(columns) < 2:
+        return None
+    latest_column = columns[0]
+    latest_date = parse_date(latest_column)
+    if latest_date is None:
+        return None
+    candidates = []
+    for column in columns[1:]:
+        column_date = parse_date(column)
+        if column_date is None:
+            continue
+        age_days = (latest_date - column_date).days
+        if 300 <= age_days <= 430:
+            candidates.append((abs(age_days - 365), column))
+    if not candidates:
+        return None
+    _, year_ago_column = min(candidates, key=lambda item: item[0])
+    latest = df_value_at_column(balance, ("Invested Capital",), latest_column)
+    year_ago = df_value_at_column(balance, ("Invested Capital",), year_ago_column)
+    if latest is None or year_ago is None:
+        return None
+    average = (latest + year_ago) / 2.0
+    return average if average > 0 else None
+
+
+def standard_roic(
+    operating_income: Optional[float],
+    tax_provision: Optional[float],
+    pretax_income: Optional[float],
+    average_invested_capital: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return NOPAT / average invested capital and its effective tax rate."""
+    if (
+        operating_income is None
+        or tax_provision is None
+        or pretax_income is None
+        or average_invested_capital is None
+        or pretax_income <= 0
+        or tax_provision < 0
+        or average_invested_capital <= 0
+    ):
+        return None, None
+    effective_tax_rate = tax_provision / pretax_income
+    if not 0 <= effective_tax_rate <= 1:
+        return None, None
+    nopat = operating_income * (1.0 - effective_tax_rate)
+    return nopat / average_invested_capital, effective_tax_rate
 
 
 def df_yoy_growth(df: Any, names: Iterable[str]) -> Optional[float]:
@@ -642,20 +810,28 @@ def build_yahoo_bundle(symbol: str, info: dict, fast_info: dict, income: Any, ba
         cols_i,
     )
     interest_expense = df_sum(income, ("Interest Expense",), cols_i)
+    pretax_income = df_sum(income, ("Pretax Income", "Income Before Tax"), cols_i)
+    tax_provision = df_sum(income, ("Tax Provision", "Income Tax Expense"), cols_i)
 
     assets = df_latest(balance, ("Total Assets",))
     current_assets = df_latest(balance, ("Current Assets",))
     liabilities = df_latest(balance, ("Total Liabilities Net Minority Interest", "Total Liabilities"))
     current_liabilities = df_latest(balance, ("Current Liabilities",))
     equity = df_latest(balance, ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"))
-    total_debt = df_latest(balance, ("Total Debt",))
+    total_debt, debt_definition = yahoo_comprehensive_debt(balance)
     net_debt = df_latest(balance, ("Net Debt",))
-    invested_capital = df_latest(balance, ("Invested Capital",))
+    average_invested_capital = yahoo_average_invested_capital(balance)
+    roic, roic_tax_rate = standard_roic(
+        operating_income,
+        tax_provision,
+        pretax_income,
+        average_invested_capital,
+    )
 
     ocf = df_sum(cashflow, ("Operating Cash Flow", "Cash Flow From Continuing Operating Activities"), cols_c)
     fcf = df_sum(cashflow, ("Free Cash Flow",), cols_c)
     capex = df_sum(cashflow, ("Capital Expenditure",), cols_c)
-    market_cap = info_num(fast_info, "marketCap") or info_num(info, "marketCap")
+    market_cap = first_not_none(info_num(fast_info, "marketCap"), info_num(info, "marketCap"))
 
     ratios = {
         "symbol": symbol,
@@ -672,6 +848,7 @@ def build_yahoo_bundle(symbol: str, info: dict, fast_info: dict, income: Any, ba
         "freeCashFlowOperatingCashFlowRatioTTM": safe_div(fcf, ocf),
         "capitalExpenditureCoverageRatioTTM": safe_div(ocf, abs(capex) if capex is not None else None),
         "operatingCashFlowCoverageRatioTTM": safe_div(ocf, total_debt),
+        "totalDebtDefinition": debt_definition,
         "priceToEarningsRatioTTM": info_num(info, "trailingPE"),
         "priceToEarningsGrowthRatioTTM": info_num(info, "pegRatio"),
         "priceToSalesRatioTTM": info_num(info, "priceToSalesTrailing12Months"),
@@ -685,7 +862,11 @@ def build_yahoo_bundle(symbol: str, info: dict, fast_info: dict, income: Any, ba
         "netDebtToEBITDATTM": safe_div(net_debt, ebitda),
         "returnOnAssetsTTM": safe_div(net_income, assets),
         "returnOnEquityTTM": safe_div(net_income, equity),
-        "returnOnInvestedCapitalTTM": safe_div(operating_income, invested_capital),
+        "returnOnInvestedCapitalTTM": roic,
+        "returnOnInvestedCapitalMethod": (
+            "nopat_ttm_over_average_invested_capital" if roic is not None else None
+        ),
+        "effectiveTaxRateTTMForROIC": roic_tax_rate,
         "freeCashFlowYieldTTM": safe_div(fcf, market_cap),
         "incomeQualityTTM": safe_div(ocf, net_income),
         "evToEBITDATTM": info_num(info, "enterpriseToEbitda"),
@@ -722,10 +903,17 @@ def build_yahoo_bundle(symbol: str, info: dict, fast_info: dict, income: Any, ba
         "marketCap": market_cap,
         "beta": info_num(info, "beta"),
     }
+    has_profile = any(value is not None for key, value in profile.items() if key != "symbol")
+    metadata_keys = {
+        "symbol", "periodBasis", "periodEnd", "totalDebtDefinition",
+        "returnOnInvestedCapitalMethod",
+    }
+    has_ratios = any(value is not None for key, value in ratios.items() if key not in metadata_keys)
+    has_metrics = any(value is not None for key, value in metrics.items() if key not in metadata_keys)
     return {
-        "profile": [json_safe(profile)] if any(v is not None for v in profile.values()) else [],
-        "ratiosTtm": [json_safe(ratios)] if revenue or market_cap else [],
-        "keyMetricsTtm": [json_safe(metrics)] if revenue or market_cap else [],
+        "profile": [json_safe(profile)] if has_profile else [],
+        "ratiosTtm": [json_safe(ratios)] if has_ratios else [],
+        "keyMetricsTtm": [json_safe(metrics)] if has_metrics else [],
         "financialGrowth": [json_safe(growth)] if any(v is not None for k, v in growth.items() if k not in ("symbol", "date")) else [],
         "earnings": json_safe(earnings),
     }
@@ -739,13 +927,48 @@ def fetch_yahoo_bundle(client: FmpClient, symbol: str, enabled: bool = True) -> 
     if cached_status is not None:
         client.bump_cache_hit("yahoo")
         payload = cached_payload or {}
-        return payload, {"yahoo": source_status({"status": cached_status if "error" in cached_status else "cache", "rows": 1 if payload else 0, "ok": bool(payload), "error": None}, "yahoo")}
+        rows = sum(
+            1
+            for key_name in ("ratiosTtm", "keyMetricsTtm", "financialGrowth", "earnings")
+            if as_list(payload.get(key_name))
+        )
+        errors = []
+        if isinstance(payload, dict) and payload.get("error"):
+            errors.append(str(payload.get("error")))
+        errors.extend(str(item) for item in (payload.get("componentErrors") or []) if item)
+        error = "; ".join(errors) or None
+        if cached_status.startswith("stale_"):
+            status = "stale_cache_error" if error else "stale_cache"
+        else:
+            status = "cache_error" if error and not rows else ("cache_partial" if error else "cache")
+        return payload, {
+            "yahoo": source_status(
+                {"status": status, "rows": rows,
+                 "ok": rows > 0 and not status.startswith("stale_") and "error" not in status,
+                 "error": error},
+                "yahoo",
+            )
+        }
     if client.no_fetch:
         return {}, {"yahoo": source_status({"status": "missing_cache", "rows": 0, "ok": False, "error": None}, "yahoo")}
     try:
         import yfinance as yf
 
+        cache_dir = ROOT / "output" / "yfinance_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if hasattr(yf, "set_tz_cache_location"):
+            yf.set_tz_cache_location(str(cache_dir))
+
         ticker = yf.Ticker(symbol)
+        component_errors = []
+        def component(name, getter, default):
+            try:
+                return getter()
+            except Exception as exc:
+                detail = f"{name} {type(exc).__name__}: {str(exc)[:120]}"
+                component_errors.append(detail)
+                client.errors.append(f"yahoo {symbol}: {detail}")
+                return default
         try:
             info = ticker.info or {}
         except Exception:
@@ -758,11 +981,12 @@ def fetch_yahoo_bundle(client: FmpClient, symbol: str, enabled: bool = True) -> 
             symbol,
             info,
             fast,
-            ticker.quarterly_income_stmt,
-            ticker.quarterly_balance_sheet,
-            ticker.quarterly_cashflow,
-            ticker.earnings_dates,
+            component("quarterly_income_stmt", lambda: ticker.quarterly_income_stmt, None),
+            component("quarterly_balance_sheet", lambda: ticker.quarterly_balance_sheet, None),
+            component("quarterly_cashflow", lambda: ticker.quarterly_cashflow, None),
+            component("earnings_dates", lambda: ticker.earnings_dates, None),
         )
+        payload["componentErrors"] = component_errors
     except Exception as exc:
         client.bump_call("yahoo")
         detail = f"{type(exc).__name__}: {str(exc)[:140]}"
@@ -772,8 +996,11 @@ def fetch_yahoo_bundle(client: FmpClient, symbol: str, enabled: bool = True) -> 
         return {}, {"yahoo": source_status({"status": "error", "rows": 0, "ok": False, "error": detail}, "yahoo")}
     client.bump_call("yahoo")
     client.put_cache(key, "yahoo:bundle", {"symbol": symbol}, "fresh", payload)
-    rows = sum(1 for key_name in ("profile", "ratiosTtm", "keyMetricsTtm", "financialGrowth", "earnings") if as_list(payload.get(key_name)))
-    return payload, {"yahoo": source_status({"status": "fresh", "rows": rows, "ok": rows > 0, "error": None}, "yahoo")}
+    rows = sum(1 for key_name in ("ratiosTtm", "keyMetricsTtm", "financialGrowth", "earnings") if as_list(payload.get(key_name)))
+    component_error = "; ".join(payload.get("componentErrors") or []) or None
+    return payload, {"yahoo": source_status({"status": "fresh_partial" if component_error else "fresh",
+                                               "rows": rows, "ok": rows > 0,
+                                               "error": component_error}, "yahoo")}
 
 
 def first_fact_values(facts: dict, tags: Iterable[str], unit: str = "USD") -> List[dict]:
@@ -797,6 +1024,119 @@ def latest_fact(facts: dict, tags: Iterable[str], forms: Tuple[str, ...] = ("10-
     return num(rows[0].get("val"))
 
 
+def latest_annual_fact_row(facts: dict, tags: Iterable[str]) -> Optional[dict]:
+    """Return the latest coherent fiscal-year duration fact.
+
+    SEC companyfacts mixes quarter-only, year-to-date, and annual durations in
+    the same tag.  Selecting merely by latest end date can therefore label a
+    Q1 or six-month value as TTM.  The SEC fallback deliberately uses the most
+    recent filed fiscal year until a filing-vintage TTM assembler exists.
+    """
+    rows = [
+        row
+        for row in first_fact_values(facts, tags)
+        if row.get("form") in ("10-K", "20-F", "40-F")
+        and (row.get("fp") == "FY" or str(row.get("frame", "")).startswith("CY"))
+        and parse_date(row.get("end"))
+    ]
+    if not rows:
+        return None
+    rows.sort(
+        key=lambda row: (
+            parse_date(row.get("end")) or dt.date.min,
+            parse_date(row.get("filed")) or dt.date.min,
+        ),
+        reverse=True,
+    )
+    return rows[0]
+
+
+def latest_annual_fact(facts: dict, tags: Iterable[str]) -> Optional[float]:
+    row = latest_annual_fact_row(facts, tags)
+    return num(row.get("val")) if row else None
+
+
+def annual_fact_at_end(facts: dict, tags: Iterable[str], period_end: Optional[str]) -> Optional[float]:
+    if not period_end:
+        return latest_annual_fact(facts, tags)
+    rows = [
+        row for row in first_fact_values(facts, tags)
+        if row.get("form") in ("10-K", "20-F", "40-F")
+        and (row.get("fp") == "FY" or str(row.get("frame", "")).startswith("CY"))
+        and row.get("end") == period_end
+    ]
+    rows.sort(key=lambda row: parse_date(row.get("filed")) or dt.date.min, reverse=True)
+    return num(rows[0].get("val")) if rows else None
+
+
+def instant_fact_at_end(facts: dict, tags: Iterable[str], period_end: Optional[str]) -> Optional[float]:
+    if not period_end:
+        return latest_fact(facts, tags)
+    rows = [
+        row for row in first_fact_values(facts, tags)
+        if row.get("form") in ("10-K", "20-F", "40-F") and row.get("end") == period_end
+    ]
+    rows.sort(key=lambda row: parse_date(row.get("filed")) or dt.date.min, reverse=True)
+    return num(rows[0].get("val")) if rows else None
+
+
+def preferred_instant_fact_at_end(
+    facts: dict,
+    tags: Iterable[str],
+    period_end: Optional[str],
+) -> Optional[float]:
+    """Choose the first available taxonomy concept at one exact period end."""
+    if not period_end:
+        return None
+    for tag in tags:
+        value = instant_fact_at_end(facts, (tag,), period_end)
+        if value is not None:
+            return value
+    return None
+
+
+def sec_comprehensive_debt_at_end(
+    facts: dict,
+    period_end: Optional[str],
+) -> Tuple[Optional[float], Optional[str]]:
+    """Return reported total debt or same-period current + noncurrent debt."""
+    reported_total = preferred_instant_fact_at_end(
+        facts,
+        (
+            "DebtAndFinanceLeaseObligations",
+            "DebtAndCapitalLeaseObligations",
+            "LongTermDebtAndFinanceLeaseObligations",
+            "LongTermDebtAndCapitalLeaseObligations",
+        ),
+        period_end,
+    )
+    if reported_total is not None:
+        return reported_total, "reported_total_debt"
+
+    current = preferred_instant_fact_at_end(
+        facts,
+        (
+            "DebtCurrent",
+            "LongTermDebtAndFinanceLeaseObligationsCurrent",
+            "LongTermDebtAndCapitalLeaseObligationsCurrent",
+            "LongTermDebtCurrent",
+        ),
+        period_end,
+    )
+    noncurrent = preferred_instant_fact_at_end(
+        facts,
+        (
+            "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+            "LongTermDebtAndCapitalLeaseObligationsNoncurrent",
+            "LongTermDebtNoncurrent",
+        ),
+        period_end,
+    )
+    if current is None or noncurrent is None:
+        return None, None
+    return current + noncurrent, "same_period_current_plus_noncurrent_debt"
+
+
 def annual_fact_pair_growth(facts: dict, tags: Iterable[str]) -> Optional[float]:
     rows = [r for r in first_fact_values(facts, tags) if r.get("form") in ("10-K", "20-F", "40-F") and (r.get("fp") == "FY" or str(r.get("frame", "")).startswith("CY")) and parse_date(r.get("end"))]
     rows.sort(key=lambda r: (parse_date(r.get("end")) or dt.date.min, parse_date(r.get("filed")) or dt.date.min), reverse=True)
@@ -817,34 +1157,44 @@ def annual_fact_pair_growth(facts: dict, tags: Iterable[str]) -> Optional[float]
 
 def build_sec_bundle(symbol: str, ticker_meta: dict, companyfacts: dict, market_cap: Optional[float] = None) -> dict:
     us_gaap = ((companyfacts.get("facts") or {}).get("us-gaap") or {})
-    revenue = latest_fact(us_gaap, ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"))
-    gross_profit = latest_fact(us_gaap, ("GrossProfit",))
-    operating_income = latest_fact(us_gaap, ("OperatingIncomeLoss",))
-    net_income = latest_fact(us_gaap, ("NetIncomeLoss", "ProfitLoss"))
-    assets = latest_fact(us_gaap, ("Assets",))
-    current_assets = latest_fact(us_gaap, ("AssetsCurrent",))
-    liabilities = latest_fact(us_gaap, ("Liabilities",))
-    current_liabilities = latest_fact(us_gaap, ("LiabilitiesCurrent",))
-    equity = latest_fact(us_gaap, ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"))
-    debt_total = latest_fact(us_gaap, ("LongTermDebtAndFinanceLeaseObligations", "LongTermDebt", "DebtCurrent"))
-    ocf = latest_fact(us_gaap, ("NetCashProvidedByUsedInOperatingActivities",))
-    capex = latest_fact(us_gaap, ("PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"))
-    fcf = (ocf + capex) if ocf is not None and capex is not None else None
+    revenue_tags = ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet")
+    revenue_row = latest_annual_fact_row(us_gaap, revenue_tags)
+    period_end = str(revenue_row.get("end")) if revenue_row else None
+    revenue = num(revenue_row.get("val")) if revenue_row else None
+    gross_profit = annual_fact_at_end(us_gaap, ("GrossProfit",), period_end)
+    operating_income = annual_fact_at_end(us_gaap, ("OperatingIncomeLoss",), period_end)
+    net_income = annual_fact_at_end(us_gaap, ("NetIncomeLoss", "ProfitLoss"), period_end)
+    assets = instant_fact_at_end(us_gaap, ("Assets",), period_end)
+    current_assets = instant_fact_at_end(us_gaap, ("AssetsCurrent",), period_end)
+    liabilities = instant_fact_at_end(us_gaap, ("Liabilities",), period_end)
+    current_liabilities = instant_fact_at_end(us_gaap, ("LiabilitiesCurrent",), period_end)
+    equity = instant_fact_at_end(us_gaap, ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"), period_end)
+    debt_total, debt_definition = sec_comprehensive_debt_at_end(us_gaap, period_end)
+    ocf = annual_fact_at_end(us_gaap, ("NetCashProvidedByUsedInOperatingActivities",), period_end)
+    capex = annual_fact_at_end(us_gaap, ("PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"), period_end)
+    # SEC PaymentsToAcquire* facts are normally reported as positive cash
+    # outflows, so free cash flow is OCF minus the absolute capex amount.
+    fcf = (ocf - abs(capex)) if ocf is not None and capex is not None else None
 
     ratios = {
         "symbol": symbol,
+        "periodBasis": "latest_fiscal_year_fallback",
+        "periodEnd": period_end,
         "grossProfitMarginTTM": safe_div(gross_profit, revenue),
         "operatingProfitMarginTTM": safe_div(operating_income, revenue),
         "netProfitMarginTTM": safe_div(net_income, revenue),
         "currentRatioTTM": safe_div(current_assets, current_liabilities),
         "debtToEquityRatioTTM": safe_div(debt_total, equity),
         "debtToAssetsRatioTTM": safe_div(debt_total, assets),
+        "totalDebtDefinition": debt_definition,
         "operatingCashFlowSalesRatioTTM": safe_div(ocf, revenue),
         "capitalExpenditureCoverageRatioTTM": safe_div(ocf, abs(capex) if capex is not None else None),
         "priceToFreeCashFlowRatioTTM": safe_div(market_cap, fcf),
     }
     metrics = {
         "symbol": symbol,
+        "periodBasis": "latest_fiscal_year_fallback",
+        "periodEnd": period_end,
         "marketCap": market_cap,
         "currentRatioTTM": ratios["currentRatioTTM"],
         "returnOnAssetsTTM": safe_div(net_income, assets),
@@ -866,10 +1216,16 @@ def build_sec_bundle(symbol: str, ticker_meta: dict, companyfacts: dict, market_
         "companyName": companyfacts.get("entityName") or ticker_meta.get("title"),
         "cik": str(companyfacts.get("cik") or ticker_meta.get("cik_str") or "").zfill(10) if (companyfacts.get("cik") or ticker_meta.get("cik_str")) else None,
     }
+    metadata_keys = {
+        "symbol", "periodBasis", "periodEnd", "totalDebtDefinition",
+        "returnOnInvestedCapitalMethod",
+    }
+    has_ratios = any(value is not None for key, value in ratios.items() if key not in metadata_keys)
+    has_metrics = any(value is not None for key, value in metrics.items() if key not in metadata_keys)
     return {
         "profile": [json_safe(profile)] if profile.get("companyName") else [],
-        "ratiosTtm": [json_safe(ratios)] if revenue or assets else [],
-        "keyMetricsTtm": [json_safe(metrics)] if revenue or assets else [],
+        "ratiosTtm": [json_safe(ratios)] if has_ratios else [],
+        "keyMetricsTtm": [json_safe(metrics)] if has_metrics else [],
         "financialGrowth": [json_safe(growth)] if any(v is not None for k, v in growth.items() if k not in ("symbol", "date")) else [],
     }
 
@@ -897,18 +1253,53 @@ def fetch_sec_bundle(client: FmpClient, symbol: str, sec_user_agent: Optional[st
         return {}, {"sec": source_status(endpoint_status(facts, f_status), "sec")}
     bundle = build_sec_bundle(symbol, meta, facts, market_cap=market_cap)
     rows = sum(1 for key_name in ("profile", "ratiosTtm", "keyMetricsTtm", "financialGrowth") if as_list(bundle.get(key_name)))
-    return bundle, {"sec": source_status({"status": f_status if "error" in f_status else ("cache" if f_status == "cache" else "fresh"), "rows": rows, "ok": rows > 0, "error": None}, "sec")}
+    normalized_status = (
+        f_status if ("error" in f_status or f_status.startswith("stale_"))
+        else ("cache" if f_status == "cache" else "fresh")
+    )
+    return bundle, {"sec": source_status({
+        "status": normalized_status,
+        "rows": rows,
+        "ok": rows > 0 and not normalized_status.startswith("stale_") and "error" not in normalized_status,
+        "error": None,
+    }, "sec")}
 
 
 def merge_row_lists(*rows_by_source: List[dict]) -> List[dict]:
+    """Merge one current row per source, preserving priority and null fallback.
+
+    Sources are passed highest priority first.  A higher-priority null does not
+    erase a usable lower-priority value, while numeric zero remains a real
+    observation and does override the fallback.
+    """
     merged: dict = {}
     found = False
     for rows in reversed(rows_by_source):
         if not rows:
             continue
         found = True
-        merged.update(rows[0])
+        for key, value in rows[0].items():
+            if value is not None:
+                merged[key] = value
     return [merged] if found else []
+
+
+def merge_rows_by_date(*rows_by_source: List[dict]) -> List[dict]:
+    """Null-aware source-priority merge for dated event/period rows."""
+    merged: Dict[str, dict] = {}
+    for rows in reversed(rows_by_source):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            day = parse_date(row.get("date"))
+            key = day.isoformat() if day else "__undated__"
+            target = merged.setdefault(key, {})
+            for field, value in row.items():
+                if value is not None:
+                    target[field] = value
+    result = list(merged.values())
+    result.sort(key=lambda row: parse_date(row.get("date")) or dt.date.min, reverse=True)
+    return result
 
 
 def merge_bundles(fmp: dict, yahoo: dict, sec: dict) -> dict:
@@ -918,19 +1309,15 @@ def merge_bundles(fmp: dict, yahoo: dict, sec: dict) -> dict:
         "ratiosTtm": merge_row_lists(as_list(fmp.get("ratiosTtm")), as_list(yahoo.get("ratiosTtm")), as_list(sec.get("ratiosTtm"))),
         "keyMetricsTtm": merge_row_lists(as_list(fmp.get("keyMetricsTtm")), as_list(yahoo.get("keyMetricsTtm")), as_list(sec.get("keyMetricsTtm"))),
     }
-    growth = as_list(fmp.get("financialGrowth")) + as_list(yahoo.get("financialGrowth")) + as_list(sec.get("financialGrowth"))
-    growth.sort(key=lambda r: parse_date(r.get("date")) or dt.date.min, reverse=True)
-    out["financialGrowth"] = growth
-    earnings = []
-    seen = set()
-    for row in as_list(fmp.get("earnings")) + as_list(yahoo.get("earnings")):
-        key = (row.get("date"), row.get("epsActual"), row.get("epsEstimated"))
-        if key in seen:
-            continue
-        seen.add(key)
-        earnings.append(row)
-    earnings.sort(key=lambda r: parse_date(r.get("date")) or dt.date.min, reverse=True)
-    out["earnings"] = earnings
+    out["financialGrowth"] = merge_rows_by_date(
+        as_list(fmp.get("financialGrowth")),
+        as_list(yahoo.get("financialGrowth")),
+        as_list(sec.get("financialGrowth")),
+    )
+    out["earnings"] = merge_rows_by_date(
+        as_list(fmp.get("earnings")),
+        as_list(yahoo.get("earnings")),
+    )
     return out
 
 
@@ -938,7 +1325,7 @@ def avg_growth(rows: List[dict], *keys: str) -> Optional[float]:
     vals: List[float] = []
     for row in rows[:4]:
         for key in keys:
-            value = pct_ratio(row.get(key))
+            value = pct_ratio(row.get(key), unit="decimal")
             if value is not None:
                 vals.append(value)
                 break
@@ -954,14 +1341,14 @@ def compute_components(bundle: dict, statuses: dict) -> Tuple[dict, dict]:
     metrics = latest_by_date(as_list(bundle.get("keyMetricsTtm"))) or {}
     growth_rows = sorted(as_list(bundle.get("financialGrowth")), key=lambda r: parse_date(r.get("date")) or dt.date.min, reverse=True)
 
-    gross_margin = first_num(ratios, "grossProfitMarginTTM", ratio=True)
-    operating_margin = first_num(ratios, "operatingProfitMarginTTM", "ebitMarginTTM", ratio=True)
-    net_margin = first_num(ratios, "netProfitMarginTTM", "bottomLineProfitMarginTTM", ratio=True)
-    roe = first_num(metrics, "returnOnEquityTTM", ratio=True)
-    roa = first_num(metrics, "returnOnAssetsTTM", ratio=True)
-    roic = first_num(metrics, "returnOnInvestedCapitalTTM", ratio=True)
+    gross_margin = first_num(ratios, "grossProfitMarginTTM", ratio_unit="decimal")
+    operating_margin = first_num(ratios, "operatingProfitMarginTTM", "ebitMarginTTM", ratio_unit="decimal")
+    net_margin = first_num(ratios, "netProfitMarginTTM", "bottomLineProfitMarginTTM", ratio_unit="decimal")
+    roe = first_num(metrics, "returnOnEquityTTM", ratio_unit="decimal")
+    roa = first_num(metrics, "returnOnAssetsTTM", ratio_unit="decimal")
+    roic = first_num(metrics, "returnOnInvestedCapitalTTM", ratio_unit="decimal")
 
-    current_ratio = first_num(ratios, "currentRatioTTM") or first_num(metrics, "currentRatioTTM")
+    current_ratio = first_not_none(first_num(ratios, "currentRatioTTM"), first_num(metrics, "currentRatioTTM"))
     quick_ratio = first_num(ratios, "quickRatioTTM")
     debt_equity = first_num(ratios, "debtToEquityRatioTTM")
     interest_coverage = first_num(ratios, "interestCoverageRatioTTM")
@@ -969,10 +1356,10 @@ def compute_components(bundle: dict, statuses: dict) -> Tuple[dict, dict]:
     altman = first_num(score_row, "altmanZScore")
     piotroski = first_num(score_row, "piotroskiScore")
 
-    ocf_margin = first_num(ratios, "operatingCashFlowSalesRatioTTM", ratio=True)
-    fcf_conversion = first_num(ratios, "freeCashFlowOperatingCashFlowRatioTTM", ratio=True)
+    ocf_margin = first_num(ratios, "operatingCashFlowSalesRatioTTM", ratio_unit="decimal")
+    fcf_conversion = first_num(ratios, "freeCashFlowOperatingCashFlowRatioTTM", ratio_unit="decimal")
     capex_coverage = first_num(ratios, "capitalExpenditureCoverageRatioTTM")
-    fcf_yield = first_num(metrics, "freeCashFlowYieldTTM", ratio=True)
+    fcf_yield = first_num(metrics, "freeCashFlowYieldTTM", ratio_unit="decimal")
     income_quality = first_num(metrics, "incomeQualityTTM")
     cash_flow_debt = first_num(ratios, "operatingCashFlowCoverageRatioTTM", "cashFlowToDebtRatioTTM")
 
@@ -986,7 +1373,7 @@ def compute_components(bundle: dict, statuses: dict) -> Tuple[dict, dict]:
     peg = first_num(ratios, "priceToEarningsGrowthRatioTTM", "forwardPriceToEarningsGrowthRatioTTM")
     ps = first_num(ratios, "priceToSalesRatioTTM")
     pfcf = first_num(ratios, "priceToFreeCashFlowRatioTTM")
-    ev_ebitda = first_num(metrics, "evToEBITDATTM") or first_num(ratios, "enterpriseValueMultipleTTM")
+    ev_ebitda = first_not_none(first_num(metrics, "evToEBITDATTM"), first_num(ratios, "enterpriseValueMultipleTTM"))
 
     endpoint_ok = sum(1 for status in statuses.values() if status.get("ok"))
     source_ok = {status.get("source") for status in statuses.values() if status.get("ok") and status.get("source")}
@@ -1094,7 +1481,7 @@ def compute_components(bundle: dict, statuses: dict) -> Tuple[dict, dict]:
         "companyName": first_str(profile, "companyName", "companyNameFull", "name"),
         "sector": first_str(profile, "sector"),
         "industry": first_str(profile, "industry"),
-        "marketCap": rn(first_num(profile, "marketCap") or first_num(metrics, "marketCap"), 0),
+        "marketCap": rn(first_not_none(first_num(profile, "marketCap"), first_num(metrics, "marketCap")), 0),
         "beta": rn(first_num(profile, "beta"), 2),
         "grossMarginTTM": rn(gross_margin, 4),
         "operatingMarginTTM": rn(operating_margin, 4),
@@ -1148,7 +1535,9 @@ def compute_earnings(bundle: dict, calendar_row: Optional[dict], today: dt.date)
         day = parse_date(row.get("date"))
         if not day:
             continue
-        if day <= today:
+        has_actual = (num(row.get("epsActual")) is not None
+                      or num(row.get("revenueActual")) is not None)
+        if day < today or (day == today and has_actual):
             past.append(row)
         else:
             future.append(row)
@@ -1162,6 +1551,11 @@ def compute_earnings(bundle: dict, calendar_row: Optional[dict], today: dt.date)
         future.sort(key=lambda r: parse_date(r.get("date")) or dt.date.max)
 
     last_rows = [r for r in past if num(r.get("epsActual")) is not None and num(r.get("epsEstimated")) is not None][:8]
+    revenue_rows = [
+        r
+        for r in past
+        if num(r.get("revenueActual")) is not None and num(r.get("revenueEstimated")) is not None
+    ][:8]
     beats = []
     surprises = []
     rev_beats = []
@@ -1172,10 +1566,10 @@ def compute_earnings(bundle: dict, calendar_row: Optional[dict], today: dt.date)
             beats.append(1 if actual >= est else 0)
             denom = abs(est) if abs(est) > 1e-9 else max(abs(actual), 1.0)
             surprises.append((actual - est) / denom * 100.0)
+    for row in revenue_rows:
         rev_actual = num(row.get("revenueActual"))
         rev_est = num(row.get("revenueEstimated"))
-        if rev_actual is not None and rev_est is not None:
-            rev_beats.append(1 if rev_actual >= rev_est else 0)
+        rev_beats.append(1 if rev_actual >= rev_est else 0)
 
     beat_rate = sum(beats) / len(beats) if beats else None
     rev_beat_rate = sum(rev_beats) / len(rev_beats) if rev_beats else None
@@ -1210,6 +1604,7 @@ def compute_earnings(bundle: dict, calendar_row: Optional[dict], today: dt.date)
         "epsBeatRate": rn(beat_rate * 100.0, 1) if beat_rate is not None else None,
         "revenueBeatRate": rn(rev_beat_rate * 100.0, 1) if rev_beat_rate is not None else None,
         "rowsUsed": len(last_rows),
+        "revenueRowsUsed": len(revenue_rows),
     }
 
 
@@ -1250,7 +1645,7 @@ def assign_gate(final_score: float, financial: float, earnings: float, event_ris
         reasons.append({"rule": "ALTMAN_Z", "detail": f"Altman Z-score is {altman}."})
     if reasons:
         return "FINANCIAL_REVIEW", reasons
-    if event_risk >= 72 or (days is not None and days <= 14):
+    if days is None or event_risk >= 72 or days <= 14:
         detail = "next earnings date is unknown" if days is None else f"next earnings is in {days} day(s)"
         reasons.append({"rule": "EARNINGS_WINDOW", "detail": f"{detail}; event-risk index {event_risk:.0f}/100."})
         return "EARNINGS_WATCH", reasons
@@ -1270,12 +1665,12 @@ def assign_gate(final_score: float, financial: float, earnings: float, event_ris
 def score_company(stock: dict, bundle: dict, statuses: dict, calendar_row: Optional[dict], today: dt.date) -> dict:
     component_doc, raw = compute_components(bundle, statuses)
     earnings_meta = compute_earnings(bundle, calendar_row, today)
-    financial = float(component_doc["financialStatusScore"] or 45.0)
-    earnings_score = float(earnings_meta["earningsReportScore"] or 50.0)
-    data_conf = float(component_doc["components"]["dataConfidence"] or 45.0)
+    financial = float(first_not_none(component_doc["financialStatusScore"], 45.0))
+    earnings_score = float(first_not_none(earnings_meta["earningsReportScore"], 50.0))
+    data_conf = float(first_not_none(component_doc["components"]["dataConfidence"], 45.0))
     event_risk = days_risk(earnings_meta.get("daysToNext"))
 
-    valuation_score = component_doc["components"].get("valuation") or 50.0
+    valuation_score = first_not_none(component_doc["components"].get("valuation"), 50.0)
     beta = component_doc["metrics"].get("beta")
     if valuation_score < 45:
         event_risk += 8.0
@@ -1297,6 +1692,16 @@ def score_company(stock: dict, bundle: dict, statuses: dict, calendar_row: Optio
         fallback=50.0,
     )
     gate, reasons = assign_gate(final_score, financial, earnings_score, event_risk, data_conf, component_doc["metrics"], earnings_meta)
+    stale_sources = sorted(
+        key for key, status in statuses.items()
+        if str(status.get("status") or "").startswith("stale_")
+    )
+    if stale_sources:
+        gate = "DATA_REVIEW"
+        reasons = [{
+            "rule": "STALE_SOURCE_CACHE",
+            "detail": "Offline cache is past its configured TTL: " + ", ".join(stale_sources),
+        }] + reasons
     profile_name = component_doc["metrics"].get("companyName")
     source_status = {k: statuses.get(k, {}) for k in sorted(statuses)}
     source_families = sorted({v.get("source") for v in source_status.values() if v.get("ok") and v.get("source")})
@@ -1322,6 +1727,7 @@ def score_company(stock: dict, bundle: dict, statuses: dict, calendar_row: Optio
         "earnings": earnings_meta,
         "sourceFamilies": source_families,
         "sourceStatus": source_status,
+        "staleSourceCaches": stale_sources,
     }
 
 
@@ -1368,7 +1774,6 @@ def summarize(scores: List[dict], omitted: List[dict], calendar_status: dict, cl
 
 
 def write_csv(path: Path, scores: List[dict], omitted: List[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "ticker",
         "name",
@@ -1391,12 +1796,10 @@ def write_csv(path: Path, scores: List[dict], omitted: List[dict]) -> None:
         "freeCashFlowYieldTTM",
         "omitReason",
     ]
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in scores:
-            writer.writerow(
-                {
+    export_rows = []
+    for row in scores:
+        export_rows.append(
+            {
                     "ticker": row["ticker"],
                     "name": row["name"],
                     "gate": row["gate"],
@@ -1417,18 +1820,19 @@ def write_csv(path: Path, scores: List[dict], omitted: List[dict]) -> None:
                     "netMarginTTM": row["metrics"].get("netMarginTTM"),
                     "freeCashFlowYieldTTM": row["metrics"].get("freeCashFlowYieldTTM"),
                     "omitReason": "",
-                }
-            )
-        for row in omitted:
-            writer.writerow(
-                {
+            }
+        )
+    for row in omitted:
+        export_rows.append(
+            {
                     "ticker": row["ticker"],
                     "name": row["name"],
                     "portfolioWeightPct": row["portfolioWeightPct"],
                     "value": row["value"],
                     "omitReason": row["reason"],
-                }
-            )
+            }
+        )
+    atomic_write_csv(path, export_rows, fields)
 
 
 def pct_fmt(value: Optional[float], digits: int = 1) -> str:
@@ -1444,8 +1848,12 @@ def write_report(path: Path, doc: dict) -> None:
         "# Financial Status Lens",
         "",
         f"- Generated: {doc['generatedAt']}",
+        f"- Temporal integrity: {doc['temporalIntegrity']['mode']} "
+        f"(point-in-time fundamentals: {doc['temporalIntegrity']['fundamentalsPointInTime']})",
         f"- Portfolio price date: {doc['portfolioAsOf'].get('priceAsOf') or '-'}",
         f"- Scored companies: {doc['counts']['scored']} / held positions: {doc['counts']['held']}",
+        f"- Selection: {doc['selection']['mode']}; selected exposure "
+        f"{doc['selection']['selectedPortfolioWeightPct']}% of the full held-equity denominator",
         f"- Average final / financial / earnings / event-risk: {summary.get('avgFinalScore')} / {summary.get('avgFinancialStatusScore')} / {summary.get('avgEarningsReportScore')} / {summary.get('avgNextEarningsRiskIndex')}",
         f"- API calls this run: {summary.get('apiCalls')} fresh, {summary.get('cacheHits')} cache hits",
         f"- Source coverage: {summary.get('sourceFamilyCounts') or {}}",
@@ -1475,11 +1883,48 @@ def write_report(path: Path, doc: dict) -> None:
     else:
         lines.append("- None")
     lines.extend(["", doc["disclaimer"], ""])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines))
+
+
+def temporal_integrity(as_of: Optional[dt.date], run_date: dt.date, allow_non_point_in_time: bool = False) -> dict:
+    """Describe or reject the relationship between scoring date and source data.
+
+    FMP TTM, Yahoo summary, and this module's SEC adapter are current/as-known
+    feeds.  They are not filing-vintage snapshots suitable for historical
+    backtests.  Historical runs therefore fail closed unless the caller opts
+    into a prominently labeled, non-point-in-time research artifact.
+    """
+    effective = as_of or run_date
+    if effective > run_date:
+        raise SystemExit(f"--as-of {effective} is in the future (run date {run_date})")
+    historical = effective < run_date
+    if historical and not allow_non_point_in_time:
+        raise SystemExit(
+            f"historical --as-of {effective} cannot use current fundamentals safely; "
+            "omit --as-of, use today's date, or explicitly pass --allow-non-point-in-time"
+        )
+    return {
+        "requestedAsOf": effective.isoformat(),
+        "runDate": run_date.isoformat(),
+        "mode": "CURRENT_AS_KNOWN" if not historical else "HISTORICAL_DATE_WITH_CURRENT_FUNDAMENTALS",
+        "fundamentalsPointInTime": not historical,
+        "backtestEligible": not historical,
+        "overrideUsed": bool(historical and allow_non_point_in_time),
+        "warning": (
+            None
+            if not historical
+            else "Current/as-known fundamentals were scored against a historical date; do not use this artifact for backtesting."
+        ),
+    }
 
 
 def build_document(args: argparse.Namespace) -> dict:
+    if args.cache_ttl_hours <= 0:
+        raise SystemExit("--cache-ttl-hours must be positive")
+    if args.earnings_horizon_days <= 0:
+        raise SystemExit("--earnings-horizon-days must be positive")
+    if args.max_symbols < 0:
+        raise SystemExit("--max-symbols cannot be negative")
     payload = extract_dashboard_payload(args.dashboard)
     forced = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
     companies, omitted = portfolio_rows(payload, forced)
@@ -1507,7 +1952,13 @@ def build_document(args: argparse.Namespace) -> dict:
         refresh_cache=args.refresh_cache,
         cache_ttl_hours=args.cache_ttl_hours,
     )
-    today = args.as_of or dt.date.today()
+    run_date = dt.date.today()
+    temporal = temporal_integrity(
+        args.as_of,
+        run_date,
+        allow_non_point_in_time=getattr(args, "allow_non_point_in_time", False),
+    )
+    today = args.as_of or run_date
     if "fmp" in effective_sources:
         calendar, calendar_status = fetch_calendar(client, today, args.earnings_horizon_days)
     else:
@@ -1536,7 +1987,13 @@ def build_document(args: argparse.Namespace) -> dict:
         statuses.update({f"sec:{k}": v for k, v in sec_statuses.items()})
         scores.append(score_company(stock, bundle, statuses, calendar.get(symbol), today))
     client.save()
-    scores.sort(key=lambda r: (r.get("finalScore") or -1, r.get("portfolioWeightPct") or 0), reverse=True)
+    scores.sort(
+        key=lambda r: (
+            first_not_none(r.get("finalScore"), -1),
+            first_not_none(r.get("portfolioWeightPct"), 0),
+        ),
+        reverse=True,
+    )
     counts = {
         "held": len([s for s in payload.get("stocks", []) if isinstance(s, dict) and s.get("held")]),
         "scored": len(scores),
@@ -1545,11 +2002,15 @@ def build_document(args: argparse.Namespace) -> dict:
         "earningsWatch": sum(1 for s in scores if s.get("gate") == "EARNINGS_WATCH"),
     }
     summary = summarize(scores, omitted, calendar_status, client)
+    selected_weight = sum(first_not_none(num(r.get("portfolioWeightPct")), 0.0) for r in scores + omitted)
     return {
         "schemaVersion": 1,
+        "researchOnly": True,
+        "decisionGrade": False,
         "modelVersion": MODEL_VERSION,
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "asOfDate": today.isoformat(),
+        "temporalIntegrity": temporal,
         "source": "FMP + Yahoo Finance/yfinance + SEC EDGAR companyfacts, merged by source priority",
         "sourcesRequested": sorted(sources),
         "sourcesEnabled": sorted(effective_sources),
@@ -1561,6 +2022,13 @@ def build_document(args: argparse.Namespace) -> dict:
             "dateRange": payload.get("summary", {}).get("dateRange"),
             "marketValue": payload.get("summary", {}).get("marketValue"),
         },
+        "selection": {
+            "mode": "subset" if forced or args.max_symbols else "all-held",
+            "requestedSymbols": forced or [],
+            "maxSymbols": args.max_symbols or None,
+            "selectedPortfolioWeightPct": rn(selected_weight, 3),
+            "weightDenominator": "all held equity positions before --symbols/--max-symbols filtering",
+        },
         "weights": {
             "financialStatusComponents": COMPONENT_WEIGHTS,
             "finalScore": FINAL_WEIGHTS,
@@ -1570,7 +2038,7 @@ def build_document(args: argparse.Namespace) -> dict:
         "summary": summary,
         "scores": scores,
         "omitted": omitted,
-        "disclaimer": "Research and portfolio-risk lens only. Scores are deterministic heuristics from FMP data plus current portfolio exposure; not investment advice or an earnings prediction.",
+        "disclaimer": "Research and portfolio-risk lens only. Scores are deterministic heuristics from current/as-known FMP, Yahoo, and SEC data plus full-portfolio exposure; not investment advice, an earnings prediction, or a point-in-time backtest unless temporalIntegrity.backtestEligible is true.",
     }
 
 
@@ -1593,14 +2061,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--cache-ttl-hours", type=float, default=18.0)
     ap.add_argument("--earnings-horizon-days", type=int, default=210)
     ap.add_argument("--as-of", type=lambda s: dt.date.fromisoformat(s), default=None)
+    ap.add_argument(
+        "--allow-non-point-in-time",
+        action="store_true",
+        help="Allow historical --as-of with current/as-known fundamentals; artifact is labeled non-point-in-time and backtest-ineligible.",
+    )
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     doc = build_document(args)
-    args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    args.out_json.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(args.out_json, doc)
     write_csv(args.out_csv, doc["scores"], doc["omitted"])
     write_report(args.out_md, doc)
     print(f"✓ wrote {args.out_json} ({doc['counts']['scored']} companies, {doc['counts']['omitted']} omitted)")

@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Momentum Top-3 sleeve: signals + 8y backtest + dashboard artifact.
 
-Implements the three winning strategies from the July-2026 40-variant sweep
+Implements three strategies selected from the July-2026 40-variant sweep
 (see ~/.hermes skill quant-momentum-research / references/findings-2026-07.md):
 
   1. RET_11M_top3  — 11-month total return, top-3 equal weight (flagship)
   2. RET_9M_top3   —  9-month total return, top-3 equal weight (balanced)
-  3. RET_5M_top5   —  5-month total return, top-5 equal weight (best Sharpe)
+  3. RET_5M_top5   —  5-month total return, top-5 equal weight (breadth variant)
 
-Design rules (no lookahead): signals are computed at month-end close and the
-portfolio is held from the next trading day. Per-side transaction costs are
-charged on turnover. Benchmarks SPY/QQQ ride along.
+Design rules (no lookahead): signals are computed at month-end close and filled
+at the next session's close. The prior portfolio earns the signal-to-fill close
+return; only then are turnover and per-side costs applied. Benchmarks SPY/QQQ
+ride along.
 
-HONESTY NOTE (survivorship bias): the universe is *today's* index membership,
-so absolute backtest numbers are upper bounds. Cross-strategy ranking is the
-valid signal. This is decision support, not trading advice.
+HONESTY NOTE: the universe is *today's* index membership and these variants
+were chosen in-sample from a 40-variant sweep. Neither absolute performance nor
+cross-strategy ranking is decision-grade or out-of-sample evidence. This is a
+research diagnostic, not a trading signal.
 
 Outputs (under --out-dir, default output/momentum_top3/):
   momentum_top3.json  — metrics, weekly equity curves, current signals
@@ -28,20 +30,30 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import io
 import json
 import math
+import os
 import sys
+import time
+from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+try:
+    from scripts.artifact_io import atomic_write_json, atomic_write_text
+except ModuleNotFoundError:  # direct ``python scripts/momentum_top3.py`` execution
+    from artifact_io import atomic_write_json, atomic_write_text
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "data" / "momentum_config.json"
 DEFAULT_OUT = ROOT / "output" / "momentum_top3"
 PRICE_CACHE = ROOT / "output" / "momentum_prices.csv.gz"
+CACHE_LOCK = ROOT / "output" / ".momentum_prices.lock"
 try:
     pd.tseries.frequencies.to_offset("ME")
     MONTH_END_FREQ = "ME"
@@ -144,34 +156,248 @@ def fetch_universe(indices):
     return sorted(t for t in tickers if t and t != "nan")
 
 
+def normalize_price_frame(prices):
+    """Normalize provider/cache output without inventing any price observations."""
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame()
+    if not isinstance(prices, pd.DataFrame):
+        return pd.DataFrame()
+    attrs = dict(prices.attrs)
+    frame = prices.copy()
+    frame.columns = [str(column).strip() for column in frame.columns]
+    frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame.loc[~frame.index.isna()]
+    if getattr(frame.index, "tz", None) is not None:
+        frame.index = frame.index.tz_convert(None)
+    frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+    frame = frame.apply(pd.to_numeric, errors="coerce")
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    frame = frame.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    frame.attrs.update(attrs)
+    return frame
+
+
+def read_price_cache(path=None):
+    path = PRICE_CACHE if path is None else Path(path)
+    return normalize_price_frame(
+        pd.read_csv(path, index_col=0, parse_dates=True, compression="gzip")
+    )
+
+
+def price_frame_errors(prices, cfg, expected_tickers=None, enforce_cache_floor=False):
+    """Return reasons a price frame is unsafe for signals/cache publication."""
+    px = normalize_price_frame(prices)
+    errors = []
+    if px.empty or len(px.index) < 2:
+        return ["price frame is empty or has fewer than two observations"]
+    if px.columns.duplicated().any():
+        errors.append("duplicate ticker columns")
+        return errors
+    if not px.index.is_monotonic_increasing or px.index.has_duplicates:
+        errors.append("price index is not strictly ordered and unique")
+
+    benchmarks = [str(ticker) for ticker in cfg["backtest"]["benchmarks"]]
+    end = px.index[-1]
+    min_span_days = max(30, int(float(cfg["backtest"]["years"]) * 365.25 * 0.90))
+    for benchmark in benchmarks:
+        if benchmark not in px.columns:
+            errors.append(f"missing benchmark {benchmark}")
+            continue
+        series = px[benchmark].dropna()
+        if series.empty:
+            errors.append(f"benchmark {benchmark} has no prices")
+            continue
+        if series.last_valid_index() != end:
+            errors.append(f"benchmark {benchmark} is stale at frame end {end.date()}")
+        if (series <= 0).any():
+            errors.append(f"benchmark {benchmark} contains non-positive prices")
+        if (series.index[-1] - series.index[0]).days < min_span_days:
+            errors.append(f"benchmark {benchmark} history is shorter than the configured window")
+
+    universe = [column for column in px.columns if column not in set(benchmarks)]
+    if enforce_cache_floor:
+        minimum = int(cfg["universe"].get("min_cache_members", 25))
+        if len(universe) < minimum:
+            errors.append(f"universe has {len(universe)} members; requires at least {minimum}")
+
+    if expected_tickers:
+        expected = {str(ticker) for ticker in expected_tickers}
+        present = {column for column in px.columns if px[column].notna().any()}
+        fresh = {column for column in present if px[column].last_valid_index() == end}
+        minimum_download = float(cfg["universe"].get("min_download_fraction", 0.90))
+        minimum_fresh = float(cfg["universe"].get("min_fresh_fraction", 0.80))
+        download_ratio = len(present & expected) / max(len(expected), 1)
+        fresh_ratio = len(fresh & expected) / max(len(expected), 1)
+        if download_ratio < minimum_download:
+            errors.append(
+                f"download coverage {download_ratio:.1%} is below {minimum_download:.1%}"
+            )
+        if fresh_ratio < minimum_fresh:
+            errors.append(f"fresh-symbol coverage {fresh_ratio:.1%} is below {minimum_fresh:.1%}")
+
+    fresh_universe = [
+        ticker for ticker in universe
+        if px[ticker].last_valid_index() == end
+    ]
+    maximum_top_n = max((int(s["top_n"]) for s in cfg.get("strategies", [])), default=1)
+    if len(fresh_universe) < maximum_top_n:
+        errors.append(
+            f"only {len(fresh_universe)} current universe members; strategy requires {maximum_top_n}"
+        )
+    return errors
+
+
+def _validated_cache(cfg, path=None):
+    path = PRICE_CACHE if path is None else Path(path)
+    if not path.exists():
+        return None, "cache missing"
+    try:
+        cached = read_price_cache(path)
+    except Exception as exc:
+        return None, f"cache unreadable: {type(exc).__name__}: {exc}"
+    errors = price_frame_errors(cached, cfg, enforce_cache_floor=True)
+    if errors:
+        return None, "; ".join(errors)
+    return cached, None
+
+
+@contextmanager
+def cache_publish_lock(path=CACHE_LOCK):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def publish_price_cache(prices, cfg, expected_tickers, path=None, lock_path=None):
+    """Validate, round-trip, and atomically publish without downgrading newer data."""
+    path = PRICE_CACHE if path is None else Path(path)
+    lock_path = Path(lock_path) if lock_path else path.with_name(f".{path.name}.lock")
+    candidate = normalize_price_frame(prices)
+    errors = price_frame_errors(
+        candidate,
+        cfg,
+        expected_tickers=expected_tickers,
+        enforce_cache_floor=True,
+    )
+    if errors:
+        raise ValueError("price cache candidate rejected: " + "; ".join(errors))
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        candidate.to_csv(temporary, compression="gzip")
+        round_trip = read_price_cache(temporary)
+        round_trip_errors = price_frame_errors(
+            round_trip,
+            cfg,
+            expected_tickers=expected_tickers,
+            enforce_cache_floor=True,
+        )
+        if round_trip_errors:
+            raise ValueError("round-trip cache validation failed: " + "; ".join(round_trip_errors))
+        temporary.chmod(0o600)
+        with cache_publish_lock(lock_path):
+            existing, _ = _validated_cache(cfg, path)
+            if existing is not None and existing.index[-1] > round_trip.index[-1]:
+                existing.attrs["universeSource"] = "newer_price_cache"
+                existing.attrs["universeWarning"] = "newer validated cache preserved over older download"
+                return existing
+            os.replace(temporary, path)
+        return round_trip
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _fallback_cache(cached, reason):
+    if cached is None:
+        raise RuntimeError(reason)
+    cached.attrs["universeSource"] = "price_cache_fallback"
+    cached.attrs["universeWarning"] = reason
+    print(f"· {reason}; preserved validated last-known-good cache", file=sys.stderr)
+    return cached
+
+
 def load_prices(cfg, no_fetch=False):
+    cached, cache_error = _validated_cache(cfg)
     if no_fetch:
-        if not PRICE_CACHE.exists():
-            sys.exit(f"--no-fetch but no cache at {PRICE_CACHE}")
-        return pd.read_csv(PRICE_CACHE, index_col=0, parse_dates=True)
+        if cached is None:
+            raise RuntimeError(f"--no-fetch requires a validated cache at {PRICE_CACHE}: {cache_error}")
+        cached.attrs["universeSource"] = "price_cache"
+        cached.attrs["universeWarning"] = None
+        return cached
+
     import yfinance as yf
 
-    tickers = fetch_universe(cfg["universe"]["indices"])
+    universe_source = "live_index_constituents"
+    universe_warning = None
+    try:
+        tickers = fetch_universe(cfg["universe"]["indices"])
+    except Exception as exc:
+        if cached is None:
+            raise RuntimeError(
+                f"constituent refresh failed ({exc}) and no validated cache is available ({cache_error})"
+            ) from exc
+        benchmarks = set(cfg["backtest"]["benchmarks"])
+        tickers = [str(column) for column in cached.columns if str(column) not in benchmarks]
+        universe_source = "cached_constituents_live_prices"
+        universe_warning = f"constituent refresh failed; reused cached universe: {exc}"
+        print(f"· {universe_warning}", file=sys.stderr)
     tickers = sorted(set(tickers) | set(cfg["backtest"]["benchmarks"]))
     end = dt.date.today() + dt.timedelta(days=1)
     start = end - dt.timedelta(days=int(365.25 * (cfg["backtest"]["years"] + 3.2)))
-    px = yf.download(tickers, start=str(start), end=str(end), auto_adjust=True,
-                     threads=True, progress=False)["Close"]
-    if isinstance(px, pd.Series):
-        px = px.to_frame()
-    px = px.dropna(axis=1, how="all").sort_index()
-    PRICE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    px.to_csv(PRICE_CACHE, compression="gzip")
-    return px
+    try:
+        downloaded = yf.download(
+            tickers,
+            start=str(start),
+            end=str(end),
+            auto_adjust=True,
+            threads=True,
+            progress=False,
+        )
+        px = normalize_price_frame(downloaded["Close"])
+    except Exception as exc:
+        return _fallback_cache(cached, f"price download failed: {type(exc).__name__}: {exc}")
+
+    errors = price_frame_errors(
+        px,
+        cfg,
+        expected_tickers=tickers,
+        enforce_cache_floor=True,
+    )
+    if errors:
+        return _fallback_cache(cached, "price download rejected: " + "; ".join(errors))
+
+    px.attrs["universeSource"] = universe_source
+    px.attrs["universeWarning"] = universe_warning
+    published = publish_price_cache(px, cfg, tickers)
+    if published.attrs.get("universeSource") == "newer_price_cache":
+        return published
+    published.attrs["universeSource"] = universe_source
+    published.attrs["universeWarning"] = universe_warning
+    return published
 
 
 # ------------------------------------------------------------- signal layer
 def asof_price(hist, months):
     ts = hist.index[-1] - pd.DateOffset(months=months)
-    idx = hist.index[hist.index >= ts]
+    # Use the last observable close on or before the calendar anchor. Choosing
+    # the first close after a weekend/holiday silently shortens the lookback.
+    idx = hist.index[hist.index <= ts]
     if not len(idx):
         return hist.iloc[0] * np.nan
-    return hist.loc[idx[0]]
+    return hist.loc[idx[-1]]
 
 
 def valid_columns(hist, months=13, coverage=0.95):
@@ -190,56 +416,212 @@ def month_end_index(px):
     return px.groupby(px.index.to_period("M")).tail(1).index
 
 
+def latest_completed_month_signal_date(px):
+    """Return the last observed close in a month strictly before the data month."""
+    if px.empty:
+        return None
+    end_period = px.index[-1].to_period("M")
+    candidates = month_end_index(px)
+    candidates = candidates[candidates.to_period("M") < end_period]
+    return candidates[-1] if len(candidates) else None
+
+
+def weekday_age(end, today=None):
+    today = pd.Timestamp(today or dt.date.today()).date()
+    start = pd.Timestamp(end).date()
+    if start > today:
+        return -1
+    age = 0
+    cursor = start + dt.timedelta(days=1)
+    while cursor <= today:
+        age += cursor.weekday() < 5
+        cursor += dt.timedelta(days=1)
+    return age
+
+
 def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
-                 coverage=0.95, exclude=()):
-    """Monthly rebalance, equal weight top_n. Returns (equity, avg_turnover)."""
-    me = month_end_index(px)
-    me = me[(me >= start - pd.DateOffset(days=40)) & (me <= end)]
-    daily_ret = px.pct_change(fill_method=None)
-    equity, dates = [1.0], []
-    prev_w = pd.Series(dtype=float)
-    turnover_sum, months = 0.0, 0
-    for i in range(len(me) - 1):
-        t0, t1 = me[i], me[i + 1]
-        if t0 < start - pd.DateOffset(days=35):
+                 coverage=0.95, exclude=(), return_diagnostics=False):
+    """Monthly close-to-close simulation with conservative next-close fills.
+
+    A month-end signal is not executable at the close that created it. The
+    existing portfolio earns the next session's close-to-close return, drifts
+    with that return, and is rebalanced at that next close. Turnover and costs
+    are calculated from those pre-trade drifted weights. The returned equity
+    curve includes a 1.0 initial-capital anchor.
+    """
+    px = normalize_price_frame(px)
+    window = px.index[(px.index >= pd.Timestamp(start)) & (px.index <= pd.Timestamp(end))]
+    diagnostics = {
+        "anchorDate": None,
+        "signalTiming": "month-end close",
+        "fillTiming": "next session close",
+        "fillDayExposure": "prior weights through fill close",
+        "returnContinuity": (
+            "held positions use cumulative returns from their last observed close after a price gap; "
+            "rebalances require valid closes for every held and target symbol"
+        ),
+        "fills": [],
+        "skippedFills": [],
+        "priceGapObservations": [],
+        "cumulativeGapReturns": [],
+        "unresolvedPriceGaps": [],
+    }
+    if not len(window):
+        empty = pd.Series(dtype=float)
+        return (empty, 0.0, diagnostics) if return_diagnostics else (empty, 0.0)
+
+    anchor = window[0]
+    last_date = window[-1]
+    diagnostics["anchorDate"] = str(anchor.date())
+    signal_dates = month_end_index(px)
+    signal_dates = signal_dates[(signal_dates >= anchor) & (signal_dates <= last_date)]
+    fill_schedule = {}
+    for signal_date in signal_dates:
+        future = px.index[(px.index > signal_date) & (px.index <= last_date)]
+        if not len(future):
             continue
-        scores = momentum_scores(px.loc[:t0], lookback_months,
-                                 coverage=coverage, exclude=exclude)
-        top = scores.sort_values(ascending=False).head(top_n)
-        w = (pd.Series(1 / len(top), index=top.index)
-             if len(top) else pd.Series(dtype=float))
-        both = w.index.union(prev_w.index)
-        turn = (w.reindex(both, fill_value=0)
-                - prev_w.reindex(both, fill_value=0)).abs().sum() / 2
-        turnover_sum += turn
-        months += 1
-        seg = daily_ret.loc[(daily_ret.index > t0) & (daily_ret.index <= t1),
-                            w.index] if len(w) else pd.DataFrame()
-        eq = equity[-1] * (1 - turn * 2 * cost_per_side)
-        if len(w):
-            port = seg.fillna(0) @ w.values
-            for d, r in port.items():
-                eq *= (1 + r)
-                equity.append(eq)
-                dates.append(d)
-            growth = (1 + seg.fillna(0)).prod()
-            drifted = w * growth
-            prev_w = drifted / max(drifted.sum(), 1e-12)
-        else:
-            prev_w = pd.Series(dtype=float)
-    ser = pd.Series(equity[1:], index=pd.DatetimeIndex(dates))
-    return ser[~ser.index.duplicated(keep="last")], turnover_sum / max(months, 1)
+        fill_date = future[0]
+        scores = momentum_scores(
+            px.loc[:signal_date], lookback_months,
+            coverage=coverage, exclude=exclude,
+        )
+        top = scores.sort_values(ascending=False, kind="mergesort").head(top_n)
+        target = (pd.Series(1 / len(top), index=top.index, dtype=float)
+                  if len(top) else pd.Series(dtype=float))
+        fill_schedule[fill_date] = {"signalDate": signal_date, "target": target}
+
+    equity_value = 1.0
+    equity_values = [equity_value]
+    equity_dates = [anchor]
+    current_w = pd.Series(dtype=float)
+    last_mark_prices = pd.Series(dtype=float)
+    last_mark_dates = {}
+    open_gaps = {}
+    turnover_sum = 0.0
+    executed = 0
+    for day in window[1:]:
+        if len(current_w):
+            held_returns = pd.Series(0.0, index=current_w.index, dtype=float)
+            for symbol in current_w.index:
+                current_close = px.at[day, symbol] if symbol in px.columns else np.nan
+                observed = pd.notna(current_close) and np.isfinite(current_close) and float(current_close) > 0
+                if not observed:
+                    if symbol not in open_gaps:
+                        open_gaps[symbol] = {
+                            "symbol": str(symbol),
+                            "lastObservedDate": (
+                                str(last_mark_dates[symbol].date()) if symbol in last_mark_dates else None
+                            ),
+                            "firstMissingDate": str(day.date()),
+                        }
+                    diagnostics["priceGapObservations"].append({
+                        "symbol": str(symbol),
+                        "date": str(day.date()),
+                        "lastObservedDate": open_gaps[symbol]["lastObservedDate"],
+                    })
+                    continue
+
+                prior_close = last_mark_prices.get(symbol)
+                if pd.isna(prior_close) or not np.isfinite(prior_close) or float(prior_close) <= 0:
+                    raise ValueError(f"missing valid prior mark for held symbol {symbol} on {day.date()}")
+                cumulative_return = float(current_close) / float(prior_close) - 1.0
+                held_returns.at[symbol] = cumulative_return
+                if symbol in open_gaps:
+                    gap = open_gaps.pop(symbol)
+                    diagnostics["cumulativeGapReturns"].append({
+                        **gap,
+                        "recoveredDate": str(day.date()),
+                        "cumulativeReturnPct": round(cumulative_return * 100.0, 8),
+                    })
+                last_mark_prices.at[symbol] = float(current_close)
+                last_mark_dates[symbol] = day
+
+            portfolio_return = float((current_w * held_returns).sum())
+            equity_value *= 1.0 + portfolio_return
+            grown = current_w * (1.0 + held_returns)
+            gross = float(grown.sum())
+            current_w = grown / gross if gross > 0 else pd.Series(dtype=float)
+
+        scheduled = fill_schedule.get(day)
+        if scheduled is not None:
+            target = scheduled["target"]
+            required_quotes = current_w.index.union(target.index)
+            missing_quotes = sorted(
+                symbol for symbol in required_quotes
+                if (
+                    symbol not in px.columns
+                    or pd.isna(px.at[day, symbol])
+                    or not np.isfinite(px.at[day, symbol])
+                    or float(px.at[day, symbol]) <= 0
+                )
+            )
+            if missing_quotes:
+                diagnostics["skippedFills"].append({
+                    "signalDate": str(scheduled["signalDate"].date()),
+                    "fillDate": str(day.date()),
+                    "reason": "missing close for " + ", ".join(missing_quotes),
+                })
+            else:
+                both = target.index.union(current_w.index)
+                pretrade = current_w.reindex(both, fill_value=0.0)
+                posttrade = target.reindex(both, fill_value=0.0)
+                gross_traded = float((posttrade - pretrade).abs().sum())
+                one_way_turnover = gross_traded / 2.0
+                cost_rate = gross_traded * float(cost_per_side)
+                equity_before_cost = equity_value
+                equity_value *= max(0.0, 1.0 - cost_rate)
+                turnover_sum += one_way_turnover
+                executed += 1
+                diagnostics["fills"].append({
+                    "signalDate": str(scheduled["signalDate"].date()),
+                    "fillDate": str(day.date()),
+                    "preTradeWeights": {str(k): round(float(v), 10) for k, v in pretrade.items()},
+                    "targetWeights": {str(k): round(float(v), 10) for k, v in posttrade.items()},
+                    "oneWayTurnover": one_way_turnover,
+                    "grossTraded": gross_traded,
+                    "costRate": cost_rate,
+                    "equityBeforeCost": equity_before_cost,
+                    "equityAfterCost": equity_value,
+                })
+                current_w = target.copy()
+                last_mark_prices = pd.Series(
+                    {symbol: float(px.at[day, symbol]) for symbol in target.index},
+                    dtype=float,
+                )
+                last_mark_dates = {symbol: day for symbol in target.index}
+                open_gaps = {symbol: gap for symbol, gap in open_gaps.items() if symbol in target.index}
+
+        equity_values.append(equity_value)
+        equity_dates.append(day)
+
+    ser = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates), dtype=float)
+    ser = ser[~ser.index.duplicated(keep="last")]
+    if open_gaps:
+        diagnostics["unresolvedPriceGaps"] = sorted(open_gaps.values(), key=lambda row: row["symbol"])
+        first_unresolved = min(pd.Timestamp(gap["firstMissingDate"]) for gap in open_gaps.values())
+        ser = ser.loc[ser.index < first_unresolved]
+        diagnostics["evaluationTruncatedBefore"] = str(first_unresolved.date())
+    average_turnover = turnover_sum / max(executed, 1)
+    diagnostics["executedRebalances"] = executed
+    diagnostics["averageOneWayTurnover"] = average_turnover
+    if return_diagnostics:
+        return ser, average_turnover, diagnostics
+    return ser, average_turnover
 
 
 def perf_metrics(eq):
     if len(eq) < 2:
         return {"total_x": None, "cagr_pct": None, "max_dd_pct": None, "sharpe": None}
+    eq = eq.dropna().sort_index()
+    if len(eq) < 2 or float(eq.iloc[0]) <= 0:
+        return {"total_x": None, "cagr_pct": None, "max_dd_pct": None, "sharpe": None}
     r = eq.pct_change().dropna()
     yrs = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
-    cagr = float(eq.iloc[-1]) ** (1 / yrs) - 1
+    total_x = float(eq.iloc[-1] / eq.iloc[0])
+    cagr = total_x ** (1 / yrs) - 1
     dd = float((eq / eq.cummax() - 1).min())
     sharpe = float(r.mean() / r.std() * math.sqrt(252)) if r.std() > 0 else None
-    return {"total_x": round(float(eq.iloc[-1]), 2),
+    return {"total_x": round(total_x, 2),
             "cagr_pct": round(cagr * 100, 1),
             "max_dd_pct": round(dd * 100, 1),
             "sharpe": round(sharpe, 2) if sharpe is not None else None}
@@ -312,20 +694,64 @@ def weekly_points(eq):
 
 # ------------------------------------------------------------ artifact layer
 def build_payload(cfg, px):
+    px = normalize_price_frame(px)
+    validation_errors = price_frame_errors(px, cfg)
+    if validation_errors:
+        raise ValueError("price frame rejected: " + "; ".join(validation_errors))
     bench = cfg["backtest"]["benchmarks"]
     end = px.index[-1]
     start = end - pd.DateOffset(years=cfg["backtest"]["years"])
     cost = cfg["backtest"]["cost_per_side"]
     coverage = cfg["universe"].get("min_history_coverage", 0.95)
+    fresh_columns = [col for col in px.columns
+                     if px[col].last_valid_index() is not None and px[col].last_valid_index() == end]
+    stale_columns = sorted(set(px.columns) - set(fresh_columns))
+    data_age_weekdays = weekday_age(end)
+    current_price_status = (
+        "PASS" if 0 <= data_age_weekdays <= 2 else "BLOCK_STALE_OR_FUTURE"
+    )
 
     payload = {
-        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "schemaVersion": 2,
+        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "window": {"start": str(start.date()), "end": str(end.date()),
                    "years": cfg["backtest"]["years"]},
         "universe_size": int(px.shape[1] - len(bench)),
+        "universe_source": px.attrs.get("universeSource", "provided_prices"),
+        "universe_warning": px.attrs.get("universeWarning"),
+        "price_freshness": {"as_of": str(end.date()),
+                            "fresh_count": len(fresh_columns),
+                            "stale_symbols": stale_columns,
+                            "age_weekdays": data_age_weekdays,
+                            "status": current_price_status},
         "cost_per_side": cost,
-        "disclaimer": ("Survivorship bias: universe is today's index membership; "
-                       "absolute returns are upper bounds. Decision support only."),
+        "researchOnly": True,
+        "decisionGrade": False,
+        "decisionGradeReason": (
+            "Current-universe survivorship and in-sample selection from the same "
+            "40-variant sweep prevent decision-grade performance claims."
+        ),
+        "methodology": {
+            "signalTiming": "month-end close",
+            "fillTiming": "next trading session close",
+            "fillDayExposure": "prior weights earn the signal-to-fill close return",
+            "turnoverTiming": "after fill-day return, from drifted pre-trade weights to target weights",
+            "costModel": "gross traded notional multiplied by configured per-side cost at fill close",
+            "missingHeldClosePolicy": "carry the last mark, then book the cumulative return when a valid close resumes",
+            "missingRebalanceClosePolicy": "skip the rebalance when any held or target close is invalid",
+            "unresolvedHeldClosePolicy": "truncate performance before the first unresolved held-price gap",
+            "initialCapitalAnchor": True,
+            "initialization": "cash from the anchor until the first post-anchor signal fills",
+            "adjustedPrices": True,
+            "currentUniverseSurvivorship": True,
+            "inSampleStrategySelection": True,
+            "strategySelection": "three variants selected from a 40-variant sweep using overlapping history",
+            "outOfSampleValidation": False,
+        },
+        "disclaimer": (
+            "Research only. Current-universe survivorship and in-sample strategy "
+            "selection can materially overstate both performance and ranking stability."
+        ),
         "strategies": [], "benchmarks": {},
     }
     for b in bench:
@@ -336,11 +762,32 @@ def build_payload(cfg, px):
                                     "cycle": cycle_stats(eq)}
     eq_by_id = {}
     for s in cfg["strategies"]:
-        eq, turn = run_backtest(px, s["lookback_months"], s["top_n"],
-                                start, end, cost, coverage, exclude=bench)
-        scores = momentum_scores(px, s["lookback_months"],
-                                 coverage=coverage, exclude=bench)
-        top = scores.sort_values(ascending=False).head(s["top_n"])
+        eq, turn, execution = run_backtest(
+            px, s["lookback_months"], s["top_n"], start, end, cost,
+            coverage, exclude=bench, return_diagnostics=True,
+        )
+        signal_px = px[fresh_columns]
+        latest_scores = momentum_scores(
+            signal_px, s["lookback_months"], coverage=coverage, exclude=bench
+        )
+        latest_top = latest_scores.sort_values(ascending=False, kind="mergesort").head(s["top_n"])
+        latest_weight_pct = round(100 / len(latest_top), 1) if len(latest_top) else None
+        completed_signal_date = latest_completed_month_signal_date(px)
+        if completed_signal_date is not None:
+            completed_scores = momentum_scores(
+                px.loc[:completed_signal_date], s["lookback_months"],
+                coverage=coverage, exclude=bench,
+            )
+            active_top = completed_scores.sort_values(
+                ascending=False, kind="mergesort"
+            ).head(s["top_n"])
+            future_dates = px.index[px.index > completed_signal_date]
+            effective_from = future_dates[0] if len(future_dates) else None
+        else:
+            active_top = pd.Series(dtype=float)
+            effective_from = None
+        active_weight_pct = round(100 / len(active_top), 1) if len(active_top) else None
+        active_stale = sorted(set(active_top.index) - set(fresh_columns))
         eq_by_id[s["id"]] = eq
         payload["strategies"].append({
             **{k: s[k] for k in ("id", "label", "lookback_months", "top_n",
@@ -349,11 +796,33 @@ def build_payload(cfg, px):
                         "monthly_turnover": round(float(turn), 2)},
             "equity_weekly": weekly_points(eq),
             "cycle": cycle_stats(eq),
+            "execution": {
+                "anchor_date": execution["anchorDate"],
+                "executed_rebalances": execution["executedRebalances"],
+                "skipped_rebalances": len(execution["skippedFills"]),
+                "first_fill_date": execution["fills"][0]["fillDate"] if execution["fills"] else None,
+                "last_fill_date": execution["fills"][-1]["fillDate"] if execution["fills"] else None,
+            },
             "current_signal": {
-                "as_of": str(end.date()),
+                "as_of": str(completed_signal_date.date()) if completed_signal_date is not None else None,
+                "effective_from": str(effective_from.date()) if effective_from is not None else None,
+                "timing": "last completed month-end close; target becomes active at next session close",
+                "status": (
+                    "BLOCK_NO_COMPLETED_SIGNAL" if active_top.empty
+                    else ("BLOCK_PRICE_STALE" if active_stale else "PASS")
+                ),
+                "stale_target_symbols": active_stale,
                 "holdings": [{"ticker": t, "lookback_return_pct": round(v * 100, 1),
-                              "weight_pct": round(100 / s["top_n"], 1)}
-                             for t, v in top.items()],
+                              "weight_pct": active_weight_pct}
+                             for t, v in active_top.items()],
+            },
+            "latest_rank_snapshot": {
+                "as_of": str(end.date()),
+                "actionable": False,
+                "reason": "Intramonth research ranking; the strategy forms targets only from a completed month-end close and fills next session close.",
+                "holdings": [{"ticker": t, "lookback_return_pct": round(v * 100, 1),
+                              "weight_pct": latest_weight_pct}
+                             for t, v in latest_top.items()],
             },
         })
     lp = cfg.get("live_plan")
@@ -363,8 +832,15 @@ def build_payload(cfg, px):
 
 
 def render_html(payload):
-    # "</" → "<\/": 防止 config 字符串中的 </script> 提前终结内联脚本
-    data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    # The payload lives in executable JavaScript, so escape every character
+    # that can terminate the surrounding script or create HTML markup before
+    # JavaScript gets a chance to render it.
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    data = (data.replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
     return """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>动量 Top-3 策略舱 · Momentum Sleeve</title><style>
@@ -404,7 +880,8 @@ svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
 </style></head><body>
 <h1>动量 Top-3 策略舱</h1>
 <div class="sub" id="sub"></div>
-<div class="warn">⚠️ 幸存者偏差:宇宙为<b>今日</b>指数成分,绝对收益是上界;策略间相对排名有效。研究用途,非投资建议。</div>
+<div class="warn">⚠️ <b>仅研究 / Decision Grade: NO</b>。宇宙使用今日指数成分，且三组参数来自同一段历史上的 40 变体筛选；绝对收益和策略排名都不是样本外证据。</div>
+<div class="warn" id="datawarn"></div>
 <div class="card" id="chartcard"><h2>8年净值曲线(对数轴)</h2><div id="legend"></div><div id="chart"></div></div>
 <div id="planmount"></div>
 <div class="grid" id="cards"></div>
@@ -412,7 +889,9 @@ svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
 <script>
 const D=__DATA__;
 const C={RET_11M_top3:'var(--a1)',RET_9M_top3:'var(--a2)',RET_5M_top5:'var(--a3)',SPY:'var(--b1)',QQQ:'var(--b2)'};
-document.getElementById('sub').textContent=`窗口 ${D.window.start} → ${D.window.end} · 宇宙 ${D.universe_size} 只 (SPX∪NDX∪DJIA) · 月末信号/次日持有 · 单边成本 ${(D.cost_per_side*1e4).toFixed(0)}bp · 生成于 ${D.generated_at}`;
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+document.getElementById('sub').textContent=`窗口 ${D.window.start} → ${D.window.end} · 宇宙 ${D.universe_size} 只 (SPX∪NDX∪DJIA) · 月末收盘信号/下一交易日收盘成交/成交日沿用旧权重 · 单边成本 ${(D.cost_per_side*1e4).toFixed(0)}bp · 生成于 ${D.generated_at}`;
+document.getElementById('datawarn').textContent=`价格数据 ${D.price_freshness.status} · as of ${D.price_freshness.as_of} · 工作日龄 ${D.price_freshness.age_weekdays} · stale symbols ${D.price_freshness.stale_symbols.length}`;
 function fmt(x){return x==null?'—':x}
 function series(){const out=[];for(const s of D.strategies)out.push({id:s.id,pts:s.equity_weekly});
 for(const[b,v]of Object.entries(D.benchmarks))out.push({id:b,pts:v.equity_weekly});return out}
@@ -433,39 +912,40 @@ let paths='';for(const s of S){const p=s.pts.map((q,i)=>(i?'L':'M')+X(q[0]).toFi
 paths+=`<path d="${p}" fill="none" stroke="${C[s.id]||'#999'}" stroke-width="${s.id in D.benchmarks?1.2:2}" opacity="${s.id in D.benchmarks?0.75:1}"/>`}
 document.getElementById('chart').innerHTML=`<svg width="${W}" height="${H}">${g}${paths}</svg>`;
 document.getElementById('legend').innerHTML=S.map(s=>{const lab=(D.strategies.find(t=>t.id===s.id)||{}).label||s.id+' (基准)';
-return `<span><i style="background:${C[s.id]}"></i>${lab} · ${s.pts[s.pts.length-1][1].toFixed(1)}x</span>`}).join('')})();
+return `<span><i style="background:${C[s.id]||'var(--mut)'}"></i>${esc(lab)} · ${s.pts[s.pts.length-1][1].toFixed(1)}x</span>`}).join('')})();
 document.getElementById('cards').innerHTML=D.strategies.map(s=>{const m=s.metrics;
 const cy=s.cycle;let cyc='';
 if(cy){const phC={'早期':'var(--g)','成熟':'var(--a2)','回吐中':'var(--r)','深回撤':'var(--r)'}[cy.phase]||'var(--mut)';
-cyc=`<div class="cycle"><span class="phase" style="border-color:${phC};color:${phC}">${cy.phase}</span>
- MTD ${fmt(cy.mtd_pct)}% · 1m ${fmt(cy.r1m_pct)}% · 3m ${fmt(cy.r3m_pct)}% · 距高点 <b style="color:var(--r)">${cy.dd_from_peak_pct}%</b> (峰值 ${cy.peak_date})</div>
+cyc=`<div class="cycle"><span class="phase" style="border-color:${phC};color:${phC}">${esc(cy.phase)}</span>
+ MTD ${fmt(cy.mtd_pct)}% · 1m ${fmt(cy.r1m_pct)}% · 3m ${fmt(cy.r3m_pct)}% · 距高点 <b style="color:var(--r)">${cy.dd_from_peak_pct}%</b> (峰值 ${esc(cy.peak_date)})</div>
 <div class="bars">${cy.monthly_returns.map(([mo,v])=>{const h=Math.min(Math.abs(v),60)*0.5;
-return `<div class="bar" title="${mo}: ${v}%"><i style="height:${h}px;background:${v>=0?'var(--g)':'var(--r)'};margin-top:${v>=0?30-h:30}px"></i><s>${mo.slice(5)}</s></div>`}).join('')}</div>`}
-return `<div class="card"><h2 style="color:${C[s.id]}">${s.label}</h2>
-<div class="role">${s.id} · 回看 ${s.lookback_months} 月 · Top${s.top_n} 等权 · 月调仓 · ${s.role}</div>
+return `<div class="bar" title="${esc(mo)}: ${v}%"><i style="height:${h}px;background:${v>=0?'var(--g)':'var(--r)'};margin-top:${v>=0?30-h:30}px"></i><s>${esc(String(mo).slice(5))}</s></div>`}).join('')}</div>`}
+return `<div class="card"><h2 style="color:${C[s.id]||'var(--mut)'}">${esc(s.label)}</h2>
+<div class="role">${esc(s.id)} · 回看 ${s.lookback_months} 月 · Top${s.top_n} 等权 · 月调仓 · ${esc(s.role)}</div>
 <div class="kpis">
 <div class="kpi pos"><b>${fmt(m.total_x)}x</b><span>8年总倍数</span></div>
 <div class="kpi pos"><b>${fmt(m.cagr_pct)}%</b><span>CAGR</span></div>
 <div class="kpi neg"><b>${fmt(m.max_dd_pct)}%</b><span>最大回撤</span></div>
 <div class="kpi"><b>${fmt(m.sharpe)}</b><span>Sharpe</span></div></div>
 ${cyc}
-<table><tr><th>当前信号 (${s.current_signal.as_of})</th><th>回看收益</th><th>权重</th></tr>
-${s.current_signal.holdings.map(h=>`<tr><td class="hold">${h.ticker}</td><td>+${h.lookback_return_pct}%</td><td>${h.weight_pct}%</td></tr>`).join('')}</table>
-<div class="thesis">${s.thesis}</div></div>`}).join('');
+	<table><tr><th>已完成月末目标 (${esc(s.current_signal.as_of)})</th><th>回看收益</th><th>权重</th></tr>
+	${s.current_signal.holdings.map(h=>`<tr><td class="hold">${esc(h.ticker)}</td><td>${h.lookback_return_pct>=0?'+':''}${h.lookback_return_pct}%</td><td>${h.weight_pct}%</td></tr>`).join('')}</table>
+	<div class="role">生效: ${esc(s.current_signal.effective_from||'—')} · 数据门禁: ${esc(s.current_signal.status)}</div>
+<div class="thesis">${esc(s.thesis)}</div></div>`}).join('');
 (function plan(){const p=D.live_plan;if(!p)return;
 const nx=p.next_tranche;
 document.getElementById('planmount').innerHTML=`<div class="card" id="plancard">
-<h2>分批建仓进度 · ${p.account_label} (${p.strategy_id})</h2>
-<div class="role">开始 ${p.started} · ${p.note}</div>
+<h2>分批建仓进度 · ${esc(p.account_label)} (${esc(p.strategy_id)})</h2>
+<div class="role">开始 ${esc(p.started)} · ${esc(p.note)}</div>
 <div class="progress"><i style="width:${p.deployed_pct}%"></i></div>
-<div style="font-size:12px;margin-bottom:8px">已部署 <b>${p.deployed_pct}%</b>${nx?` · 下一批: 第${nx.seq}批 目标 <b style="color:var(--a1)">${nx.target_month_end}</b> (${(nx.fraction*100).toFixed(1)}%)`:' · 全部完成'}</div>
+<div style="font-size:12px;margin-bottom:8px">已部署 <b>${p.deployed_pct}%</b>${nx?` · 下一批: 第${nx.seq}批 目标 <b style="color:var(--a1)">${esc(nx.target_month_end)}</b> (${(nx.fraction*100).toFixed(1)}%)`:' · 全部完成'}</div>
 <table><tr><th>批次</th><th>目标月末</th><th>份额</th><th>状态</th><th>实际日期</th></tr>
-${p.tranches.map(t=>`<tr class="${nx&&t.seq===nx.seq?'next':''}"><td>第${t.seq}批</td><td>${t.target_month_end}</td><td>${(t.fraction*100).toFixed(1)}%</td><td>${t.executed?'✅ 已执行':'⏳ 待执行'}</td><td>${t.date||'—'}</td></tr>`).join('')}</table>
+${p.tranches.map(t=>`<tr class="${nx&&t.seq===nx.seq?'next':''}"><td>第${t.seq}批</td><td>${esc(t.target_month_end)}</td><td>${(t.fraction*100).toFixed(1)}%</td><td>${t.executed?'✅ 已执行':'⏳ 待执行'}</td><td>${esc(t.date||'—')}</td></tr>`).join('')}</table>
 <div class="mirror">入场以来策略表现: <b>${fmt(p.since_entry_pct)}%</b>(策略净值镜像,非账户实际;含滑点/时点差)</div></div>`})();
 (function cmp(){const rows=[...D.strategies.map(s=>({n:s.label,m:{...s.metrics}})),
 ...Object.entries(D.benchmarks).map(([b,v])=>({n:b+'(基准)',m:{...v.metrics,monthly_turnover:0}}))];
 document.getElementById('cmp').innerHTML='<tr><th>策略</th><th>总倍数</th><th>CAGR</th><th>最大回撤</th><th>Sharpe</th><th>月换手</th></tr>'+
-rows.map(r=>`<tr><td>${r.n}</td><td>${fmt(r.m.total_x)}x</td><td>${fmt(r.m.cagr_pct)}%</td><td>${fmt(r.m.max_dd_pct)}%</td><td>${fmt(r.m.sharpe)}</td><td>${(r.m.monthly_turnover*100).toFixed(0)}%</td></tr>`).join('')})();
+rows.map(r=>`<tr><td>${esc(r.n)}</td><td>${fmt(r.m.total_x)}x</td><td>${fmt(r.m.cagr_pct)}%</td><td>${fmt(r.m.max_dd_pct)}%</td><td>${fmt(r.m.sharpe)}</td><td>${(r.m.monthly_turnover*100).toFixed(0)}%</td></tr>`).join('')})();
 </script></body></html>""".replace("__DATA__", data)
 
 
@@ -482,10 +962,9 @@ def main():
     payload = build_payload(cfg, px)
 
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "momentum_top3.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=1))
-    (out / "momentum_top3.html").write_text(render_html(payload))
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write_json(out / "momentum_top3.json", payload, indent=1)
+    atomic_write_text(out / "momentum_top3.html", render_html(payload))
     for s in payload["strategies"]:
         h = ", ".join(x["ticker"] for x in s["current_signal"]["holdings"])
         m = s["metrics"]

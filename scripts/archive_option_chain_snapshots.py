@@ -9,15 +9,19 @@ from yfinance so future backtests can replay entry credits from archived data.
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import importlib.util
-import json
 import math
+import re
 import subprocess
 from pathlib import Path
 from statistics import NormalDist
 from zoneinfo import ZoneInfo
+
+try:
+    from scripts.artifact_io import atomic_write_csv, atomic_write_json
+except ImportError:  # direct `python scripts/archive_option_chain_snapshots.py`
+    from artifact_io import atomic_write_csv, atomic_write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +55,27 @@ FIELDS = [
 ]
 
 
+def safe_symbol_component(value):
+    """Validate a Yahoo-style symbol before using it as a path component."""
+    text = str(value or "").strip().upper()
+    if (not re.fullmatch(r"[A-Z0-9^][A-Z0-9._^=-]{0,63}", text)
+            or text in {".", ".."}):
+        raise ValueError(f"unsafe ticker for snapshot path: {value!r}")
+    return text
+
+
+def safe_expiry(value):
+    """Return an exact ISO expiry date safe for API and path use."""
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError(f"invalid option expiry: {value!r}")
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid option expiry: {value!r}") from exc
+    return parsed.isoformat()
+
+
 def rn(value, digits=6):
     value = mmb._to_float(value)
     return None if value is None else round(value, digits)
@@ -65,7 +90,7 @@ def option_type_from_frame_name(name):
 
 
 def dte(snapshot_date, expiry):
-    return max((dt.date.fromisoformat(date_key(expiry)) - dt.date.fromisoformat(date_key(snapshot_date))).days, 0)
+    return max((dt.date.fromisoformat(safe_expiry(expiry)) - dt.date.fromisoformat(date_key(snapshot_date))).days, 0)
 
 
 def bs_greeks(spot, strike, days_to_expiry, sigma, option_type, rate=0.04):
@@ -103,25 +128,28 @@ def bs_greeks(spot, strike, days_to_expiry, sigma, option_type, rate=0.04):
 
 def output_path(out_dir, underlying, snapshot_ts, expiry):
     snap_dt = dt.datetime.fromisoformat(snapshot_ts)
-    root = Path(out_dir) / underlying.upper() / f"{snap_dt.year:04d}" / f"{snap_dt.month:02d}"
+    underlying = safe_symbol_component(underlying)
+    root = Path(out_dir) / underlying / f"{snap_dt.year:04d}" / f"{snap_dt.month:02d}"
     stamp = snap_dt.strftime("%Y-%m-%d_%H%M%S_ET")
-    filename = f"{stamp}_{underlying.upper()}_{date_key(expiry)}.csv"
+    filename = f"{stamp}_{underlying.upper()}_{safe_expiry(expiry)}.csv"
     return root / filename
 
 
 def raw_output_path(out_dir, underlying, snapshot_ts, expiry):
     snap_dt = dt.datetime.fromisoformat(snapshot_ts)
-    root = Path(out_dir) / underlying.upper() / "raw" / snap_dt.strftime("%Y-%m-%d")
+    underlying = safe_symbol_component(underlying)
+    root = Path(out_dir) / underlying / "raw" / snap_dt.strftime("%Y-%m-%d")
     stamp = snap_dt.strftime("%Y-%m-%d_%H%M%S_ET")
-    filename = f"{stamp}_{underlying.upper()}_{date_key(expiry)}_raw.json"
+    filename = f"{stamp}_{underlying.upper()}_{safe_expiry(expiry)}_raw.json"
     return root / filename
 
 
 def metadata_output_path(out_dir, underlying, snapshot_ts, expiry):
     snap_dt = dt.datetime.fromisoformat(snapshot_ts)
-    root = Path(out_dir) / underlying.upper() / "metadata" / snap_dt.strftime("%Y-%m-%d")
+    underlying = safe_symbol_component(underlying)
+    root = Path(out_dir) / underlying / "metadata" / snap_dt.strftime("%Y-%m-%d")
     stamp = snap_dt.strftime("%Y-%m-%d_%H%M%S_ET")
-    filename = f"{stamp}_{underlying.upper()}_{date_key(expiry)}_metadata.json"
+    filename = f"{stamp}_{underlying.upper()}_{safe_expiry(expiry)}_metadata.json"
     return root / filename
 
 
@@ -209,13 +237,22 @@ def gravity_fields(args, state, band, underlying_price, days_to_expiry, option_t
 
 def normalize_option_row(raw, option_type, args, snapshot_ts, underlying, underlying_price, expiry, state, band):
     strike = mmb._to_float(raw.get("strike"))
-    if strike is None:
+    if strike is None or strike <= 0 or option_type not in {"call", "put"}:
         return None
     bid = mmb._to_float(raw.get("bid"))
     ask = mmb._to_float(raw.get("ask"))
-    mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+    # The raw artifact retains vendor rows for audit. The normalized chain is
+    # deliberately executable-quote-shaped: no missing, negative, or crossed
+    # markets enter future replay inputs.
+    if bid is None or ask is None or bid < 0 or ask < 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2.0
     last = mmb._to_float(raw.get("lastPrice") if "lastPrice" in raw else raw.get("last"))
     iv = mmb._to_float(raw.get("impliedVolatility") if "impliedVolatility" in raw else raw.get("implied_volatility"))
+    if last is not None and last < 0:
+        last = None
+    if iv is not None and iv <= 0:
+        iv = None
     days = dte(snapshot_ts, expiry)
     model_iv = iv or (state or {}).get("volatility", {}).get("annual_vol_used") or 0.20
     greeks = bs_greeks(underlying_price, strike, days, model_iv, option_type, rate=args.risk_free_rate)
@@ -224,7 +261,7 @@ def normalize_option_row(raw, option_type, args, snapshot_ts, underlying, underl
         "snapshot_date": date_key(snapshot_ts),
         "underlying": underlying,
         "underlying_price": rn(underlying_price, 6),
-        "expiry": date_key(expiry),
+        "expiry": safe_expiry(expiry),
         "dte": days,
         "option_type": option_type,
         "strike": rn(strike, 4),
@@ -254,13 +291,7 @@ def normalize_option_row(raw, option_type, args, snapshot_ts, underlying, underl
 
 
 def write_csv(path, rows):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    atomic_write_csv(path, rows, FIELDS, extrasaction="ignore")
 
 
 def json_safe(value):
@@ -278,9 +309,7 @@ def json_safe(value):
 
 
 def write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(json_safe(payload), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    atomic_write_json(path, json_safe(payload))
 
 
 def git_sha():
@@ -305,7 +334,7 @@ def snapshot_metadata(args, snapshot_ts, underlying_price, expiry, rows, raw_cou
         "underlying_price": underlying_price,
         "underlying_bid": None,
         "underlying_ask": None,
-        "expiry": date_key(expiry),
+        "expiry": safe_expiry(expiry),
         "normalized_rows": len(rows),
         "raw_rows": raw_count,
         "risk_free_rate_input": args.risk_free_rate,
@@ -332,7 +361,7 @@ def parse_args(argv=None):
     ap.add_argument("--vol-ticker", default="^VXN")
     ap.add_argument("--fallback-vol-ticker", default="^VIX")
     ap.add_argument("--period", default="5y")
-    ap.add_argument("--interval", default="1d")
+    ap.add_argument("--interval", choices=["1d"], default="1d")
     ap.add_argument("--gravity-profile", choices=sorted(mmcs.GRAVITY_PROFILES), default="swing")
     ap.add_argument("--lookback", type=int, default=84)
     ap.add_argument("--half-life", type=float, default=21)
@@ -345,6 +374,17 @@ def parse_args(argv=None):
                     help="Also write raw yfinance chain rows and snapshot metadata JSON.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+    args.ticker = safe_symbol_component(args.ticker)
+    if args.expiry:
+        args.expiry = ",".join(safe_expiry(value) for value in args.expiry.split(",") if value.strip())
+    if args.max_expiries < 0:
+        ap.error("--max-expiries must be non-negative")
+    if args.lookback <= 1 or args.half_life <= 0 or args.horizon_days <= 0:
+        ap.error("lookback must exceed 1 and half-life/horizon-days must be positive")
+    if not 0 < args.boundary_confidence < 1:
+        ap.error("--boundary-confidence must be between 0 and 1")
+    if not math.isfinite(args.risk_free_rate):
+        ap.error("--risk-free-rate must be finite")
     if args.gravity_profile:
         args.lookback, args.half_life = mmcs.GRAVITY_PROFILES[args.gravity_profile]
     return args

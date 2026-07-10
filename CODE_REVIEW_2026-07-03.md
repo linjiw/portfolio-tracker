@@ -1,4 +1,9 @@
 # Portfolio Tracker — Comprehensive Code Review
+
+> Historical snapshot. Superseded by the July 9, 2026 hardening pass and the
+> current tests/methodology; grades and “no blocking bugs” conclusions below no
+> longer describe the repository.
+
 **Date:** July 3, 2026 | **Reviewer:** Hermes Agent  
 **Scope:** generate.py (5,766 lines, 78 functions), architecture, investment logic, UI/UX, test coverage  
 **Method:** Source-verified analysis with line-number references

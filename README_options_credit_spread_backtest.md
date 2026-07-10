@@ -1,11 +1,45 @@
 # Options Credit Spread Backtest
 
 Research/model backtester for weekly defined-risk QQQ credit spreads using
-market-mass gravity signals. It is not a live trade signal and does not use
-historical option-chain fills. Premium is estimated from Black-Scholes with
-entry-date volatility context, then reduced by slippage and commissions.
+market-mass gravity signals. Underlying OHLC history is observed, but option
+economics are either fully synthetic Black-Scholes marks or archived entry
+snapshots followed by modeled exits. It is not a historical option-fill
+backtest or a live trade signal.
 
-## Core Commands
+## Guarded Validity Contract
+
+Use `scripts/options_credit_spread_backtest.py` as the public entry point. It
+delegates calculations to the canonical engine, blocks invalid or ambiguous
+settings before data access, then adds `validation.wrapperAudit` to
+`summary.json` and a matching section to `report.md`.
+
+Every run is permanently labeled `decisionGrade: false` and live `BLOCK`.
+`researchUseLabel: WATCH` means the run is usable for research triage only;
+`BLOCK` means the completed artifacts also contain a detected accounting,
+calendar, overlap, or economics inconsistency. Neither label authorizes a
+trade.
+
+The wrapper makes these limitations explicit:
+
+- Signals use at least one prior completed daily bar by default. A zero-bar lag is blocked because it is same-close sensitivity analysis.
+- Synthetic entries use entry-close spot and theoretical volatility. `--entry-timestamp-policy` changes snapshot matching only; it does not turn synthetic pricing into a next-open fill.
+- Snapshot replay can provide observed entry quotes, but all exits, profit takes, and stops remain modeled. Daily OHLC cannot establish the intraday ordering of touches and exit thresholds.
+- Expiry defaults to the next Friday and falls back to the prior observed session when Friday is absent, matching a holiday-shortened week without drifting into Monday. This still is not an authoritative exchange holiday/option-series calendar; every adjustment is exported.
+- The core blocks new entries through the active trade's exit session by default, so realized future P&L is not reused as capital while a prior position is open. Exported intervals are audited again for strict overlap and same-day capital reuse.
+- Max loss, return on risk, and contract sizing include configured round-trip commissions. Synthetic entry and buy-to-close marks include explicit slippage; market impact, observed exit bid/ask, assignment/exercise fees, margin path, and taxes remain unmodeled.
+- Synthetic valuation is European-style Black-Scholes with an explicit constant dividend yield and separate put/call IV multipliers. At modeled exit closes the base volatility is re-estimated from dated broad volatility/realized inputs when available; this is still not a reconstructed historical option surface.
+- Annualized return spans the eligible evaluation window, not time-weighted deployed capital. Drawdown is measured only at trade exits. Profit factor is `null`, not a numeric sentinel, when no modeled loss exists.
+- Grid candidates retain an initial chronological holdout report in training-rank order; they are not re-ranked on holdout performance. Calendar validation is now nested: each test-year configuration is chosen only from its own preceding training years. Candidate-grid design and repeated research use can still overfit.
+
+The following flags permit an intentionally optimistic sensitivity run, but
+the waiver is recorded and never upgrades its decision grade:
+
+- `--allow-same-close-sensitivity`
+- `--allow-session-expiry-sensitivity`
+- `--allow-overlapping-capital-sensitivity`
+- `--allow-timestamp-mismatch-sensitivity`
+
+## Guarded Commands
 
 Trade QQQ spreads using QQQ mass:
 
@@ -21,6 +55,11 @@ python3 scripts/options_credit_spread_backtest.py \
   --min-center-quality 60 \
   --max-build-up 60 \
   --min-credit-to-risk 0.10 \
+  --expiry-mode weekly_friday \
+  --exit-slippage-per-spread 0.02 \
+  --dividend-yield 0.005 \
+  --put-iv-multiplier 1.05 \
+  --call-iv-multiplier 0.98 \
   --profit-take-pct 0.55 \
   --stop-loss-multiple 2.20 \
   --out-dir output/options_backtest/qqq
@@ -66,7 +105,7 @@ python3 scripts/options_credit_spread_backtest.py \
 Current NDX-gravity iron-condor research candidate:
 
 ```bash
-python3 scripts/market_mass_credit_spread_backtest.py \
+python3 scripts/options_credit_spread_backtest.py \
   --price-ticker QQQ \
   --mass-price-ticker '^NDX' \
   --mass-volume-ticker QQQ \
@@ -94,7 +133,7 @@ python3 scripts/market_mass_credit_spread_backtest.py \
 Defensive HVN variant:
 
 ```bash
-python3 scripts/market_mass_credit_spread_backtest.py \
+python3 scripts/options_credit_spread_backtest.py \
   --price-ticker QQQ \
   --mass-price-ticker '^NDX' \
   --mass-volume-ticker QQQ \
@@ -165,13 +204,17 @@ python3 scripts/options_credit_spread_backtest.py \
 - `--min-gravity-score`: optional filter requiring enough OU/center/vol/thickness support before entry.
 - `--max-levitation-score`: optional filter blocking thin or momentum-dominated states.
 - `--min-short-hvn-distance-em`: optional HVN magnet filter. Rejects short strikes too close to a high-volume node, measured in expected-move units.
-- `--signal-lag-bars`: robustness test that forces signals to come from prior completed bars.
+- `--signal-lag-bars`: forces signals to come from prior completed bars; the default is `1` to avoid a same-close look-ahead assumption. Zero is optimistic sensitivity analysis only.
 - `--credit-haircut-pct`: fill-sensitivity test that reduces modeled entry credit after slippage.
+- `--expiry-mode weekly_friday`: targets the next Friday and uses the prior observed session if Friday is absent. `session_count` is an explicitly labeled sensitivity mode.
+- `--exit-slippage-per-spread`: fixed buy-to-close slippage per vertical wing.
+- `--dividend-yield`: constant annual dividend yield used in synthetic carry; it is not a historical dividend term structure.
+- `--put-iv-multiplier` / `--call-iv-multiplier`: explicit fixed skew sensitivities applied to the point-in-time volatility proxy.
 - `--use-option-snapshots`: replay entry credits from archived point-in-time option-chain CSVs.
 - `--entry-fill-model`: with snapshots, choose `mid`, `natural`, `conservative_mid`, `haircut_mid`, or `bid_ask_slippage`.
 - `--require-snapshot-fills` / `--no-synthetic-fallback`: fail closed in snapshot replay; do not silently use synthetic entry credits.
 - `--min-snapshot-fill-coverage`: report whether replay coverage clears this required percentage of attempted structures.
-- `--max-snapshot-age-minutes`: reject stale option-chain snapshots relative to the entry timestamp policy.
+- `--max-snapshot-age-minutes`: reject stale option-chain snapshots relative to the entry timestamp policy (default 30 minutes); future quotes are always rejected.
 - `--entry-timestamp-policy`: choose `same_day_close`, `same_day_open`, or `next_open` when matching daily signals to archived snapshots.
 - `--boundary-model mass_vol`: default. Uses the proven mass/profile plus realized/implied-volatility blend for final strike boundaries.
 - `--boundary-model ou_hybrid`: research mode. Lets OU mean-reversion influence final profile boundaries after it is measured.
@@ -213,12 +256,13 @@ Additional research diagnostics:
 - `snapshot_replay_rejections.csv/json`: structures rejected by real-chain replay because of missing/stale quotes, missing legs, low credit, low credit/risk, or other execution filters.
 
 - `summary.json`: full assumptions, baseline, trades, grid, and rolling results.
+- `summary.json > validation.wrapperAudit`: decision-grade label, pricing provenance, expiry/calendar checks, economics reconciliation, capital overlap, missing-data evidence, and calibration caveats.
 - `trades.csv`: modeled spread entries/exits, strikes, credit, delta, P&L, mass state.
 - `skipped.csv`: skipped weekly candidates and reasons.
 - `sweep_train.csv`: top in-sample grid candidates.
 - `sweep_walk_forward.csv`: candidates tested on the later holdout slice.
-- `rolling_walk_forward.csv`: rolling calendar-year validation.
-- `rolling_walk_forward_windows.csv`: per-window rolling details.
+- `rolling_walk_forward.csv`: aggregate nested calendar-year validation.
+- `rolling_walk_forward_windows.csv`: each test window's training-only selected configuration and next-year result.
 - `report.md`: compact human-readable report.
 
 ## Interpretation
@@ -266,7 +310,7 @@ can be rebuilt later if parsing, timezone, or Greek assumptions change.
 Replay backtests using archived entry credits:
 
 ```bash
-python3 scripts/market_mass_credit_spread_backtest.py \
+python3 scripts/options_credit_spread_backtest.py \
   --price-ticker QQQ \
   --mass-price-ticker '^NDX' \
   --mass-volume-ticker QQQ \

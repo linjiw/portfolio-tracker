@@ -6,12 +6,19 @@ It uses a market gate (QQQ weather), an asset trend gate (SPMO trend), relative
 strength, and moving take-profit. It is decision support, not trading advice.
 """
 import argparse
-import csv
 import datetime as dt
+import hashlib
 import json
 import math
-import re
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+try:
+    from scripts.artifact_io import append_csv_row_private, atomic_write_json, atomic_write_text, ensure_private_directory
+    from scripts.dashboard_payload import read_dashboard_payload as _read_dashboard_payload
+except ModuleNotFoundError:  # direct ``python scripts/spmo_momentum_sleeve.py``
+    from artifact_io import append_csv_row_private, atomic_write_json, atomic_write_text, ensure_private_directory
+    from dashboard_payload import read_dashboard_payload as _read_dashboard_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +28,8 @@ DEFAULT_SENTINEL = ROOT / "output" / "market_sentinel" / "latest_snapshot.json"
 BENCHMARKS = ("SPY", "QQQ", "VOO")
 BASE_SLEEVE_CAP_PCT = 8.0
 MAX_SLEEVE_CAP_PCT = 12.0
+ET = ZoneInfo("America/New_York")
+MAX_CLOSED_SESSION_LAG_WEEKDAYS = 2
 
 
 def _to_float(value):
@@ -83,11 +92,7 @@ def atr(rows, n=14):
 
 
 def read_dashboard_payload(path=DEFAULT_DASHBOARD):
-    text = Path(path).read_text(encoding="utf-8")
-    match = re.search(r"const DATA = (\{.*?\});", text, re.S)
-    if not match:
-        raise RuntimeError(f"DATA payload not found in {path}")
-    return json.loads(match.group(1))
+    return _read_dashboard_payload(path)
 
 
 def read_json(path):
@@ -100,19 +105,272 @@ def read_json(path):
         return {}
 
 
-def sentinel_context_for_payload(payload, sentinel):
-    """Use the market gate only when it was built from the same dashboard."""
-    if not sentinel:
-        return None, None
+def _parse_date(value):
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_timestamp(value):
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=ET)
+
+
+def _previous_weekday(day):
+    cursor = day - dt.timedelta(days=1)
+    while cursor.weekday() >= 5:
+        cursor -= dt.timedelta(days=1)
+    return cursor
+
+
+def last_closed_session_reference(now=None):
+    now = now or dt.datetime.now(tz=ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    now_et = now.astimezone(ET)
+    day = now_et.date()
+    if day.weekday() >= 5:
+        return _previous_weekday(day)
+    if now_et.time().replace(tzinfo=None) < dt.time(16, 15):
+        return _previous_weekday(day)
+    return day
+
+
+def _weekday_age(start, end):
+    if start > end:
+        return -1
+    age = 0
+    cursor = start + dt.timedelta(days=1)
+    while cursor <= end:
+        age += cursor.weekday() < 5
+        cursor += dt.timedelta(days=1)
+    return age
+
+
+def closed_session_freshness(value, now=None):
+    market_date = _parse_date(value)
+    expected = last_closed_session_reference(now)
+    if market_date is None:
+        return {"fresh": False, "marketDate": None, "expectedLastClosedSession": expected.isoformat(),
+                "ageWeekdays": None, "reason": "date_missing_or_invalid"}
+    age = _weekday_age(market_date, expected)
+    if market_date.weekday() >= 5:
+        reason = "date_not_weekday_session"
+    elif age < 0:
+        reason = "date_after_last_closed_session"
+    elif age > MAX_CLOSED_SESSION_LAG_WEEKDAYS:
+        reason = "last_closed_session_stale"
+    else:
+        reason = None
+    return {
+        "fresh": reason is None,
+        "marketDate": market_date.isoformat(),
+        "expectedLastClosedSession": expected.isoformat(),
+        "ageWeekdays": age,
+        "reason": reason,
+    }
+
+
+def _position_is_active(document):
+    position = (document or {}).get("position") or {}
+    shares = _to_float(position.get("shares"))
+    return bool(shares is not None and shares > 0)
+
+
+def _new_lifecycle_id(result, reason):
+    position = (result or {}).get("position") or {}
+    seed = "|".join(
+        str(value)
+        for value in (
+            "SPMO",
+            (result or {}).get("asOf"),
+            position.get("shares"),
+            position.get("avg"),
+            reason,
+        )
+    )
+    return "spmo-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+
+
+def apply_persisted_moving_stop(result, previous=None, *, reset_stop=False, reset_reason=None):
+    """Ratchet the saved 3xATR stop upward and flag a close through it.
+
+    The freshly calculated ATR stop is still retained for auditability, but an
+    existing position is managed with the higher of the new calculation and
+    the last valid saved stop.  This prevents a volatility expansion or price
+    decline from quietly loosening risk after the stop was committed.  Stop
+    persistence is scoped to an observed position lifecycle: flat -> active or
+    an explicit reset starts a new lifecycle rather than inheriting an old
+    position's stop.
+    """
+    result = result if isinstance(result, dict) else {}
+    previous = previous if isinstance(previous, dict) else {}
+    if reset_stop and not str(reset_reason or "").strip():
+        raise ValueError("reset_stop requires a non-empty reset_reason")
+
+    levels = result.setdefault("levels", {})
+    previous_levels = previous.get("levels") or {}
+    raw_stop = _to_float(levels.get("movingStop3Atr"))
+    prior_stop = _to_float(previous_levels.get("movingStop3Atr"))
+    current_active = _position_is_active(result)
+    previous_active = _position_is_active(previous)
+    previous_lifecycle = previous.get("positionLifecycle") or {}
+    previous_id = previous_lifecycle.get("id")
+
+    reset_applied = False
+    lifecycle_reason = None
+    if not current_active:
+        status = "FLAT"
+        lifecycle_id = None
+        reset_applied = bool(previous_active or previous_id)
+        lifecycle_reason = "position_not_held"
+    elif reset_stop:
+        status = "MANUAL_RESET"
+        lifecycle_reason = str(reset_reason).strip()
+        lifecycle_id = _new_lifecycle_id(result, lifecycle_reason)
+        reset_applied = True
+    elif not previous_active:
+        status = "OPENED_OR_RESTARTED"
+        lifecycle_reason = "first_active_snapshot" if not previous else "reopened_after_flat_snapshot"
+        lifecycle_id = _new_lifecycle_id(result, lifecycle_reason)
+        reset_applied = bool(previous)
+    else:
+        status = "CONTINUING"
+        lifecycle_reason = "continuous_active_snapshots"
+        lifecycle_id = previous_id or _new_lifecycle_id(previous, "legacy_active_snapshot")
+
+    eligible_prior = prior_stop if current_active and status == "CONTINUING" else None
+    valid = (
+        [value for value in (raw_stop, eligible_prior) if value is not None and value > 0]
+        if current_active
+        else []
+    )
+    effective_stop = max(valid) if valid else None
+    price = _to_float(result.get("price"))
+    breached = bool(current_active and effective_stop is not None and price is not None and price <= effective_stop)
+
+    levels["movingStop3AtrRaw"] = _round(raw_stop)
+    levels["priorMovingStop3Atr"] = _round(prior_stop) if previous_active else None
+    levels["movingStop3Atr"] = _round(effective_stop)
+    if not current_active:
+        levels["movingStopSource"] = "inactive_no_position"
+    elif status != "CONTINUING":
+        levels["movingStopSource"] = "current_3atr_lifecycle_start"
+    elif eligible_prior is not None and (raw_stop is None or eligible_prior > raw_stop):
+        levels["movingStopSource"] = "prior_saved_floor"
+    else:
+        levels["movingStopSource"] = "current_3atr"
+    levels["movingStopBreached"] = breached
+    levels["movingStopBreachedAsOf"] = result.get("asOf") if breached else None
+
+    position = result.get("position") or {}
+    result["positionLifecycle"] = {
+        "active": current_active,
+        "status": status,
+        "id": lifecycle_id,
+        "previousId": previous_id,
+        "resetApplied": reset_applied,
+        "resetReason": lifecycle_reason if reset_applied else None,
+        "continuityReason": lifecycle_reason if not reset_applied else None,
+        "observedAsOf": result.get("asOf"),
+        "observedShares": _round(position.get("shares"), 6),
+        "observedAverageCost": _round(position.get("avg"), 6),
+        "provenance": "dashboard aggregate SPMO holding snapshot",
+        "limitation": "A close-and-reopen between saved snapshots cannot be inferred; use --reset-stop with a reason when that occurs.",
+    }
+
+    gates = result.setdefault("gates", {})
+    gates["movingStopBreached"] = breached
+    actions = result.setdefault("actions", {})
+    if not current_active:
+        actions["existingSleeve"] = "NO_ACTIVE_POSITION: no persisted stop is in force."
+        actions["movingTakeProfit"] = "No active SPMO holding; a future entry starts a new stop lifecycle."
+    elif breached:
+        actions["existingSleeve"] = (
+            f"STOP_BREACHED: SPMO {result.get('price')} closed at/below the ratcheted "
+            f"moving stop {levels.get('movingStop3Atr')}; defend/trim per the written plan."
+        )
+        actions["movingTakeProfit"] = (
+            f"Ratcheted stop {levels.get('movingStop3Atr')} was breached; do not lower it to keep the position."
+        )
+    else:
+        actions["movingTakeProfit"] = (
+            f"Use ratcheted {levels.get('movingStop3Atr')} as the 3xATR reference; never move it down."
+        )
+    return result
+
+
+def sentinel_context_for_payload(payload, sentinel, now=None):
+    """Return an aligned market gate or an explicit fail-closed data gate."""
+    def blocked(status, reason):
+        context = {"status": status, "aligned": False, "reason": reason}
+        return (
+            {"intradayLabel": "BLOCK_DATA", "flags": {}, "_marketGateContext": context},
+            {"label": "BLOCK_DATA", "_marketGateContext": context},
+        )
+
+    if not isinstance(sentinel, dict) or not sentinel:
+        return blocked("MISSING_SENTINEL", "saved market sentinel is missing or unreadable")
     freshness = sentinel.get("dataFreshness") or {}
     summary = (payload or {}).get("summary") or {}
+    if not summary.get("generatedAt") or not summary.get("priceAsOf"):
+        return blocked("INCOMPLETE_DASHBOARD_FRESHNESS", "dashboard freshness keys are missing")
+    dashboard_session = closed_session_freshness(summary.get("priceAsOf"), now=now)
+    if not dashboard_session.get("fresh"):
+        return blocked(
+            "STALE_OR_FUTURE_DASHBOARD",
+            "dashboard price date is not a current last-closed-session input: "
+            + str(dashboard_session.get("reason")),
+        )
+    if not freshness.get("dashboardGeneratedAt") or not freshness.get("dashboardPriceAsOf"):
+        return blocked("INCOMPLETE_SENTINEL", "sentinel dashboard freshness keys are missing")
     if (
         freshness.get("dashboardGeneratedAt") != summary.get("generatedAt")
         or freshness.get("dashboardPriceAsOf") != summary.get("priceAsOf")
     ):
-        return None, None
+        return blocked("MISALIGNED_SENTINEL", "sentinel was built from a different dashboard snapshot")
+    sentinel_ran_at = _parse_timestamp(sentinel.get("ranAt"))
+    now_value = now or dt.datetime.now(tz=ET)
+    if now_value.tzinfo is None:
+        now_value = now_value.replace(tzinfo=ET)
+    if sentinel_ran_at is None:
+        return blocked("INCOMPLETE_SENTINEL", "sentinel ranAt timestamp is missing or invalid")
+    sentinel_age_hours = (
+        now_value.astimezone(dt.timezone.utc) - sentinel_ran_at.astimezone(dt.timezone.utc)
+    ).total_seconds() / 3600.0
+    if sentinel_age_hours < -0.1 or sentinel_age_hours > 36:
+        return blocked("STALE_OR_FUTURE_SENTINEL", "sentinel ranAt timestamp is stale or future-dated")
     agents = sentinel.get("agents") or {}
-    return agents.get("technical"), agents.get("decision")
+    technical = agents.get("technical")
+    decision = agents.get("decision")
+    if not isinstance(technical, dict) or not isinstance(decision, dict):
+        return blocked("INCOMPLETE_SENTINEL", "sentinel technical/decision agents are missing")
+    if technical.get("intradayLabel") not in {"ALLOW", "WATCH", "BLOCK"}:
+        return blocked("INCOMPLETE_SENTINEL", "sentinel technical label is missing or unknown")
+    if decision.get("label") not in {"ALLOW", "WATCH", "BLOCK"}:
+        return blocked("INCOMPLETE_SENTINEL", "sentinel decision label is missing or unknown")
+
+    technical = dict(technical)
+    decision = dict(decision)
+    hard_gates = technical.get("intradayHardGates") or {}
+    intraday = technical.get("intradayData") or {}
+    stale_or_locked = bool(
+        hard_gates.get("prohibitAllow")
+        or (hard_gates.get("available") and hard_gates.get("fresh") is False)
+        or (intraday.get("available") and intraday.get("fresh") is False)
+    )
+    context = {
+        "status": "STALE_OR_LOCKED" if stale_or_locked else "ALIGNED",
+        "aligned": True,
+        "reason": "intraday market gate is stale or prohibits ALLOW" if stale_or_locked else None,
+    }
+    technical["_marketGateContext"] = context
+    decision["_marketGateContext"] = context
+    return technical, decision
 
 
 def _df_to_rows(df):
@@ -142,7 +400,9 @@ def fetch_daily_rows(symbol, period="18mo"):
     warnings.filterwarnings("ignore")
     import yfinance as yf
 
-    df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+    # Adjust the entire OHLC series for distributions/splits so trend, ATR, and
+    # relative-strength gates do not interpret an ETF dividend as a drawdown.
+    df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
     return _df_to_rows(df)
 
 
@@ -176,15 +436,106 @@ def momentum_12_1(rows):
 
 
 def relative_strength(spmo_rows, bench_rows):
+    # Compare the same exchange sessions on both sides.  Independent N-row
+    # lookbacks silently compare different start dates when either feed has a
+    # missing bar.
+    spmo_by_date = {row.get("date"): row for row in spmo_rows if row.get("date")}
+    bench_by_date = {row.get("date"): row for row in bench_rows if row.get("date")}
+    common_dates = sorted(set(spmo_by_date) & set(bench_by_date))
     result = {}
     for bars, label in ((21, "rel21"), (63, "rel63"), (126, "rel126")):
-        s_ret = return_n(spmo_rows, bars)
-        b_ret = return_n(bench_rows, bars)
+        if len(common_dates) <= bars:
+            result[label] = None
+            continue
+        start, end = common_dates[-1 - bars], common_dates[-1]
+        s_ret = _pct(spmo_by_date[end]["close"], spmo_by_date[start]["close"])
+        b_ret = _pct(bench_by_date[end]["close"], bench_by_date[start]["close"])
         result[label] = _round(s_ret - b_ret, 2) if s_ret is not None and b_ret is not None else None
     return result
 
 
-def score_spmo(spmo_rows, benchmark_map, payload, technical=None, decision=None):
+def _market_gate(technical, decision, *, required=True):
+    if not required:
+        return {
+            "block": True,
+            "watch": False,
+            "dataValid": False,
+            "status": "EXPLICITLY_BYPASSED",
+            "reasons": ["market sentinel bypassed; diagnostic result cannot authorize a new add"],
+        }
+
+    technical = technical if isinstance(technical, dict) else {}
+    decision = decision if isinstance(decision, dict) else {}
+    t_label = technical.get("intradayLabel")
+    d_label = decision.get("label")
+    context = technical.get("_marketGateContext") or decision.get("_marketGateContext") or {}
+    context_status = context.get("status") or "IN_PROCESS"
+    reasons = []
+    data_invalid = context_status in {
+        "MISSING_SENTINEL",
+        "MISALIGNED_SENTINEL",
+        "INCOMPLETE_SENTINEL",
+        "INCOMPLETE_DASHBOARD_FRESHNESS",
+        "STALE_OR_FUTURE_DASHBOARD",
+        "STALE_OR_FUTURE_SENTINEL",
+        "STALE_OR_LOCKED",
+        "EXPLICITLY_BYPASSED",
+    } or context.get("aligned") is False
+    if context.get("reason"):
+        reasons.append(str(context["reason"]))
+    if not t_label or not d_label:
+        data_invalid = True
+        reasons.append("market technical/decision context is missing")
+    if t_label not in {"ALLOW", "WATCH", "BLOCK", "BLOCK_DATA"}:
+        data_invalid = True
+        reasons.append(f"unknown market technical label {t_label!r}")
+    if d_label not in {"ALLOW", "WATCH", "BLOCK", "BLOCK_DATA"}:
+        data_invalid = True
+        reasons.append(f"unknown market decision label {d_label!r}")
+
+    hard_gates = technical.get("intradayHardGates") or {}
+    intraday = technical.get("intradayData") or {}
+    if hard_gates.get("prohibitAllow"):
+        data_invalid = True
+        reasons.append("intraday hard gates prohibit ALLOW")
+    if intraday.get("available") and intraday.get("fresh") is False:
+        data_invalid = True
+        reasons.append("intraday market context is stale")
+
+    flags = technical.get("flags") or {}
+    blocked_label = t_label in {"BLOCK", "BLOCK_DATA"} or d_label in {"BLOCK", "BLOCK_DATA"}
+    blocked_structure = bool(flags.get("belowEma21"))
+    watched = t_label == "WATCH" or d_label == "WATCH"
+    if blocked_structure:
+        reasons.append("market sentinel/重心 blocked")
+    if t_label in {"BLOCK", "BLOCK_DATA"}:
+        reasons.append(f"market technical label {t_label}")
+    if d_label in {"BLOCK", "BLOCK_DATA"}:
+        reasons.append(f"market decision {d_label}")
+    if watched:
+        reasons.append("market sentinel is WATCH")
+    return {
+        "block": bool(data_invalid or blocked_label or blocked_structure),
+        "watch": bool(watched and not (data_invalid or blocked_label or blocked_structure)),
+        "dataValid": not data_invalid,
+        "status": context_status,
+        "technicalLabel": t_label,
+        "decisionLabel": d_label,
+        "reasons": sorted(set(reasons)),
+    }
+
+
+def score_spmo(
+    spmo_rows,
+    benchmark_map,
+    payload,
+    technical=None,
+    decision=None,
+    *,
+    market_gate_required=True,
+    price_basis="caller-provided OHLC; adjustment provenance not supplied",
+    now=None,
+):
     if len(spmo_rows) < 60:
         return {"available": False, "reason": "not enough SPMO rows"}
 
@@ -232,23 +583,61 @@ def score_spmo(spmo_rows, benchmark_map, payload, technical=None, decision=None)
     abs_score += 1 if (slope21 is not None and slope21 > 0) else -1
     abs_score += 1 if (slope50 is not None and slope50 > 0) else 0
 
-    market_block = False
-    market_watch = False
-    reasons = []
+    market = _market_gate(technical, decision, required=market_gate_required)
+    market_block = market["block"]
+    market_watch = market["watch"]
+    reasons = list(market["reasons"])
     q_latest = ((payload or {}).get("qqqTqqq") or {}).get("latest") or {}
     q_close = _to_float(q_latest.get("qqq"))
     q_ema21 = _to_float(q_latest.get("ema21"))
-    if q_close is not None and q_ema21 is not None and q_close < q_ema21:
+    if q_close is None or q_ema21 is None:
+        market_block = True
+        market["dataValid"] = False
+        market["status"] = "MISSING_QQQ_GATE"
+        reasons.append("dashboard QQQ/EMA21 market gate is missing")
+    elif q_close < q_ema21:
         market_block = True
         reasons.append("QQQ below EMA21")
-    if technical and ((technical.get("flags") or {}).get("belowEma21") or technical.get("intradayLabel") == "BLOCK"):
+    spmo_as_of = last.get("date")
+    benchmark_as_of = {
+        symbol: rows[-1].get("date") if rows else None
+        for symbol, rows in benchmark_map.items()
+    }
+    missing_or_misaligned = [
+        symbol
+        for symbol in BENCHMARKS
+        if not benchmark_map.get(symbol)
+        or len(benchmark_map.get(symbol) or []) < 64
+        or benchmark_as_of.get(symbol) != spmo_as_of
+    ]
+    if missing_or_misaligned:
         market_block = True
-        reasons.append("market sentinel/重心 blocked")
-    if decision and decision.get("label") == "BLOCK":
+        market["dataValid"] = False
+        market["status"] = "BENCHMARK_DATA_MISALIGNED"
+        reasons.append("missing/misaligned benchmark data: " + ", ".join(missing_or_misaligned))
+    summary = (payload or {}).get("summary") or {}
+    dashboard_as_of = summary.get("priceAsOf")
+    qqq_as_of = q_latest.get("date")
+    absolute_freshness = closed_session_freshness(spmo_as_of, now=now)
+    alignment_values = {
+        "SPMO": spmo_as_of,
+        "dashboard": dashboard_as_of,
+        "dashboardQQQ": qqq_as_of,
+        **benchmark_as_of,
+    }
+    date_alignment_pass = bool(
+        spmo_as_of and all(value == spmo_as_of for value in alignment_values.values())
+    )
+    if not absolute_freshness.get("fresh"):
         market_block = True
-        reasons.append("market decision BLOCK")
-    if decision and decision.get("label") == "WATCH":
-        market_watch = True
+        market["dataValid"] = False
+        market["status"] = "STALE_OR_FUTURE_PRICE_DATA"
+        reasons.append("SPMO last-closed-session freshness failed: " + str(absolute_freshness.get("reason")))
+    if not date_alignment_pass:
+        market_block = True
+        market["dataValid"] = False
+        market["status"] = "SPMO_QQQ_DASHBOARD_DATE_MISALIGNED"
+        reasons.append("SPMO/benchmark/QQQ/dashboard dates are not identical")
     spy_latest = (benchmark_map.get("SPY") or [{}])[-1] if benchmark_map.get("SPY") else {}
     spy_market_broken = bool(spy_latest.get("close") and spy_latest.get("ema50") and spy_latest["close"] < spy_latest["ema50"])
     if spy_market_broken:
@@ -280,6 +669,9 @@ def score_spmo(spmo_rows, benchmark_map, payload, technical=None, decision=None)
     if market_block:
         label = "BLOCK"
         action = "No new SPMO add. Keep existing sleeve only if it respects moving-stop; wait for QQQ reclaim."
+    elif market_watch:
+        label = "WATCH"
+        action = "Market gate is WATCH. Existing trend may be managed, but no new SPMO add until market ALLOW."
     elif sleeve_state == "trend" and abs_score >= 4 and rel_score >= max(3, len(rs_votes) // 2):
         label = "ALLOW"
         action = "Momentum confirmed. Add only by tranches after buy-stop/reclaim, not at market after a crash bar."
@@ -303,7 +695,6 @@ def score_spmo(spmo_rows, benchmark_map, payload, technical=None, decision=None)
         if stock.get("sym") == "SPMO" and stock.get("held"):
             holding = stock
             break
-    summary = (payload or {}).get("summary") or {}
     weight = None
     if holding and summary.get("marketValue"):
         weight = holding.get("value", 0) / summary["marketValue"] * 100
@@ -354,7 +745,21 @@ def score_spmo(spmo_rows, benchmark_map, payload, technical=None, decision=None)
             "hardHitDay": hard_hit,
             "marketBlock": market_block,
             "marketWatch": market_watch,
+            "marketDataValid": market["dataValid"],
+            "marketGateStatus": market["status"],
+            "marketTechnicalLabel": market.get("technicalLabel"),
+            "marketDecisionLabel": market.get("decisionLabel"),
             "spyBelowEma50": spy_market_broken,
+        },
+        "dataFreshness": {
+            "priceBasis": price_basis,
+            "spmoAsOf": spmo_as_of,
+            "benchmarkAsOf": benchmark_as_of,
+            "dashboardAsOf": dashboard_as_of,
+            "dashboardQqqAsOf": qqq_as_of,
+            "dateAlignmentPass": date_alignment_pass,
+            "absoluteSession": absolute_freshness,
+            "status": "PASS" if absolute_freshness.get("fresh") and date_alignment_pass else "BLOCK",
         },
         "spmoMomentum12Minus1": _round(momentum_12_1(spmo_rows), 2),
         "returns": {
@@ -401,7 +806,7 @@ def action_plan(label, sleeve_state, above50, two_below_ema21, hard_hit, stretch
     if label == "BLOCK":
         max_add = 0.0
     elif label == "WATCH":
-        max_add = min(max_add, 1.0)
+        max_add = 0.0
 
     if label == "ALLOW":
         new_add = "ALLOW tranche; never market-buy a vertical spike"
@@ -431,7 +836,7 @@ def tranche_plan(levels):
     return [
         {
             "tranche": "1/3",
-            "trigger": f"SPMO buy-stop/reclaim above {levels.get('buyStop')} with QQQ/sentinel not BLOCK.",
+            "trigger": f"SPMO buy-stop/reclaim above {levels.get('buyStop')} with QQQ/sentinel explicitly ALLOW.",
             "risk": f"Initial invalidation close {levels.get('invalidationClose')}.",
         },
         {
@@ -450,7 +855,7 @@ def tranche_plan(levels):
 def journal_checklist():
     return [
         "Regime label and data date are fresh.",
-        "QQQ/sentinel market gate is not BLOCK for a new add.",
+        "QQQ/sentinel market gate is explicitly ALLOW (WATCH/missing/stale/misaligned all prohibit a new add).",
         "SPMO is above EMA50 and not two closes below EMA21.",
         "SPMO/SPY 21d and 63d relative strength are positive.",
         "Entry uses buy-stop/reclaim or retest, not FOMO at market.",
@@ -485,11 +890,20 @@ def reviewer_notes(label, sleeve_state, weight, market_block, rel_score, total_v
     return {"principlesInvestor": dalio, "quantReviewer": quant, "executionDesk": execution}
 
 
-def run_once(payload=None, technical=None, decision=None):
+def run_once(payload=None, technical=None, decision=None, *, market_gate_required=True, now=None):
     payload = payload or read_dashboard_payload(DEFAULT_DASHBOARD)
     spmo_rows = fetch_daily_rows("SPMO")
     bench = {symbol: fetch_daily_rows(symbol) for symbol in BENCHMARKS}
-    return score_spmo(spmo_rows, bench, payload, technical=technical, decision=decision)
+    return score_spmo(
+        spmo_rows,
+        bench,
+        payload,
+        technical=technical,
+        decision=decision,
+        market_gate_required=market_gate_required,
+        price_basis="split-and-distribution-adjusted OHLC (yfinance auto_adjust=True)",
+        now=now,
+    )
 
 
 def format_report(result):
@@ -509,7 +923,11 @@ def format_report(result):
         "## Levels",
         f"- Buy-stop/reclaim: {result.get('levels', {}).get('buyStop')} / limit {result.get('levels', {}).get('buyLimit')}",
         f"- Invalidation close: {result.get('levels', {}).get('invalidationClose')}",
-        f"- Moving stop guide: {result.get('levels', {}).get('movingStop3Atr')}",
+        f"- Moving stop guide: {result.get('levels', {}).get('movingStop3Atr')} "
+        f"(raw {result.get('levels', {}).get('movingStop3AtrRaw')}, "
+        f"source {result.get('levels', {}).get('movingStopSource')})",
+        f"- Moving stop breached: {result.get('levels', {}).get('movingStopBreached')}",
+        f"- Position lifecycle: {result.get('positionLifecycle')}",
         "",
         "## Actions",
         f"- New add: {result.get('actions', {}).get('newAdd')}",
@@ -538,15 +956,21 @@ def format_report(result):
     return "\n".join(lines) + "\n"
 
 
-def write_outputs(result, out_dir=DEFAULT_OUT):
+def write_outputs(result, out_dir=DEFAULT_OUT, *, reset_stop=False, reset_reason=None):
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "latest_spmo_momentum.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    (out_dir / "latest_spmo_momentum.md").write_text(format_report(result), encoding="utf-8")
+    ensure_private_directory(out_dir)
+    latest_path = out_dir / "latest_spmo_momentum.json"
+    apply_persisted_moving_stop(
+        result,
+        read_json(latest_path),
+        reset_stop=reset_stop,
+        reset_reason=reset_reason,
+    )
+    atomic_write_json(latest_path, result)
+    atomic_write_text(out_dir / "latest_spmo_momentum.md", format_report(result))
     log = out_dir / "spmo_momentum_log.csv"
-    first = not log.exists()
     row = {
-        "ranAt": dt.datetime.now().isoformat(timespec="seconds"),
+        "ranAt": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "asOf": result.get("asOf"),
         "label": result.get("label"),
         "price": result.get("price"),
@@ -556,11 +980,7 @@ def write_outputs(result, out_dir=DEFAULT_OUT):
         "buyStop": (result.get("levels") or {}).get("buyStop"),
         "invalidationClose": (result.get("levels") or {}).get("invalidationClose"),
     }
-    with log.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if first:
-            writer.writeheader()
-        writer.writerow(row)
+    append_csv_row_private(log, row, list(row.keys()))
 
 
 def main():
@@ -570,14 +990,25 @@ def main():
     parser.add_argument("--sentinel", default=str(DEFAULT_SENTINEL),
                         help="latest market sentinel snapshot used for the QQQ/market gate")
     parser.add_argument("--ignore-sentinel", action="store_true",
-                        help="ignore the saved market sentinel gate and score SPMO in isolation")
+                        help="diagnostic asset-only run; fail-closed output cannot authorize a new add")
+    parser.add_argument("--reset-stop", action="store_true",
+                        help="start a new persisted-stop lifecycle for a known close/re-entry")
+    parser.add_argument("--reset-reason", default=None,
+                        help="required audit reason when --reset-stop is used")
     args = parser.parse_args()
+    if args.reset_stop and not str(args.reset_reason or "").strip():
+        parser.error("--reset-stop requires --reset-reason")
     payload = read_dashboard_payload(args.dashboard)
     technical = decision = None
     if not args.ignore_sentinel:
         technical, decision = sentinel_context_for_payload(payload, read_json(args.sentinel))
-    result = run_once(payload=payload, technical=technical, decision=decision)
-    write_outputs(result, args.out_dir)
+    result = run_once(
+        payload=payload,
+        technical=technical,
+        decision=decision,
+        market_gate_required=not args.ignore_sentinel,
+    )
+    write_outputs(result, args.out_dir, reset_stop=args.reset_stop, reset_reason=args.reset_reason)
     print(f"{result.get('asOf')} SPMO {result.get('label')} {result.get('action')}")
     print(Path(args.out_dir).resolve() / "latest_spmo_momentum.md")
 

@@ -1,3 +1,6 @@
+> Historical design log. The current renderer and UI regression tests supersede
+> its scores and remaining-work statements.
+>
 > **ROUND-3 STATUS:** scores after round 2 — typo 7.5 · color **8.0** · motion 7.0 · spatial 7.5 ·
 > atmosphere 7.0 · distinct **8.0** · dataviz 7.5 (avg 7.5; was 5.5 → 7.2 → 7.5). ACTIVE plan below = round 3.
 > **ROUND-3 STATUS (2026-06-10): IMPLEMENTED.** A1-A13 (true minus, bg2 depth, 2×2 mobile KPIs, chip demotions,

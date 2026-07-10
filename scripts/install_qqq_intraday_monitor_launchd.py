@@ -14,6 +14,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import atomic_write_bytes
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "monitor_qqq_intraday.py"
@@ -50,8 +55,8 @@ def build_plist(args, python_exe):
         "WorkingDirectory": str(ROOT),
         "EnvironmentVariables": env,
         "StartInterval": args.poll_seconds,
-        "StandardOutPath": "/tmp/qqq-intraday-launchd.out.log",
-        "StandardErrorPath": "/tmp/qqq-intraday-launchd.err.log",
+        "StandardOutPath": str(OUT / "launchd.out.log"),
+        "StandardErrorPath": str(OUT / "launchd.err.log"),
         "RunAtLoad": getattr(args, "run_at_load", False),
     }
 
@@ -59,12 +64,11 @@ def build_plist(args, python_exe):
 def install(args):
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
+    OUT.chmod(0o700)
     path = plist_path()
     uid = os.getuid()
     obj = build_plist(args, str(Path(sys.executable).resolve()))
-    with path.open("wb") as f:
-        plistlib.dump(obj, f)
-    path.chmod(0o600)
+    atomic_write_bytes(path, plistlib.dumps(obj))
     launchctl("bootout", f"gui/{uid}", str(path))
     boot = launchctl("bootstrap", f"gui/{uid}", str(path))
     if boot.returncode != 0:
@@ -101,13 +105,16 @@ def main():
     ap = argparse.ArgumentParser(description="Install/uninstall QQQ intraday monitor LaunchAgent.")
     ap.add_argument("--symbol", default="QQQ")
     ap.add_argument("--poll-seconds", type=int, default=900)
-    ap.add_argument("--run-at-load", action="store_true", default=True)
+    ap.add_argument("--run-at-load", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--telegram", action="store_true")
     ap.add_argument("--telegram-token-env", default="TELEGRAM_BOT_TOKEN")
     ap.add_argument("--telegram-chat-id-env", default="TELEGRAM_CHAT_ID")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--status", action="store_true")
     args = ap.parse_args()
+
+    if args.poll_seconds <= 0:
+        ap.error("--poll-seconds must be positive")
 
     if args.uninstall:
         uninstall()

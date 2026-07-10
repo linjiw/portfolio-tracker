@@ -17,13 +17,17 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import json
 import math
 import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from statistics import NormalDist
+
+try:
+    from scripts.artifact_io import atomic_write_csv, atomic_write_json, atomic_write_text
+except ImportError:  # direct `python scripts/market_mass_boundaries.py`
+    from artifact_io import atomic_write_csv, atomic_write_json, atomic_write_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +37,7 @@ DEFAULT_HORIZONS = (1, 5, 10, 21, 63)
 DEFAULT_CONFIDENCES = (0.68, 0.80, 0.95)
 DEFAULT_LOOKBACK = 252
 DEFAULT_HALF_LIFE = 63
+DEFAULT_MAX_IMPLIED_VOL_AGE_DAYS = 7
 GRAVITY_PROFILES = {
     "structural": (252, 63),
     "swing": (84, 21),
@@ -209,9 +214,16 @@ def _row_from_mapping(raw):
     volume = _to_float(raw.get("Volume") if "Volume" in raw else raw.get("volume")) or 0.0
     if close is None:
         return None
+    ohlc_imputed = any(value is None for value in (open_, high, low))
     open_ = close if open_ is None else open_
     high = close if high is None else high
     low = close if low is None else low
+    if min(open_, high, low, close) <= 0:
+        return None
+    # Do not silently normalize impossible bars.  Range-sensitive mass and
+    # option-touch calculations need the source defect to remain observable.
+    if high < max(open_, close) or low > min(open_, close) or high < low:
+        return None
     return {
         "date": str(raw.get("Date") or raw.get("date")),
         "open": open_,
@@ -219,17 +231,28 @@ def _row_from_mapping(raw):
         "low": low,
         "close": close,
         "volume": volume,
+        "ohlc_imputed": ohlc_imputed,
     }
 
 
 def read_ohlcv_csv(path):
     rows = []
     with Path(path).open("r", encoding="utf-8-sig", newline="") as fh:
-        for raw in csv.DictReader(fh):
+        for row_number, raw in enumerate(csv.DictReader(fh), start=2):
             row = _row_from_mapping(raw)
-            if row and row["close"] > 0:
-                rows.append(row)
+            if row is None or row["close"] <= 0:
+                raise ValueError(f"invalid OHLC row {row_number} in {path}")
+            if row.get("ohlc_imputed"):
+                raise ValueError(f"incomplete OHLC row {row_number} in {path}")
+            try:
+                dt.date.fromisoformat(date_key(row["date"]))
+            except ValueError as exc:
+                raise ValueError(f"invalid date at row {row_number} in {path}") from exc
+            rows.append(row)
     rows.sort(key=lambda r: r["date"])
+    dates = [date_key(row["date"]) for row in rows]
+    if len(dates) != len(set(dates)):
+        raise ValueError(f"duplicate dates in {path}")
     return rows
 
 
@@ -244,9 +267,14 @@ def _df_to_rows(df):
         low = _to_float(row.get("Low"))
         if close is None or close <= 0:
             continue
+        ohlc_imputed = any(value is None for value in (open_, high, low))
         open_ = close if open_ is None else open_
         high = close if high is None else high
         low = close if low is None else low
+        if min(open_, high, low, close) <= 0:
+            continue
+        if high < max(open_, close) or low > min(open_, close) or high < low:
+            continue
         volume = _to_float(row.get("Volume")) or 0.0
         rows.append({
             "date": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
@@ -255,6 +283,7 @@ def _df_to_rows(df):
             "low": low,
             "close": close,
             "volume": volume,
+            "ohlc_imputed": ohlc_imputed,
         })
     return rows
 
@@ -267,7 +296,9 @@ def fetch_yfinance_rows(symbol, period="5y", interval="1d"):
     except Exception as exc:
         raise RuntimeError("yfinance is required for live Yahoo Finance fetches") from exc
 
-    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    # Long-horizon price geometry must be split/distribution adjusted; otherwise
+    # a corporate action can manufacture a false mass wall or volatility jump.
+    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
     rows = _df_to_rows(df)
     if not rows:
         raise RuntimeError(f"yfinance returned no rows for {symbol}")
@@ -300,7 +331,11 @@ def fetch_price_rows(symbol, period="5y", interval="1d", stooq_fallback=True):
         if not stooq_fallback or interval != "1d":
             raise
         try:
-            return fetch_stooq_daily_rows(symbol), f"Stooq daily CSV fallback after yfinance error: {type(exc).__name__}"
+            return (
+                fetch_stooq_daily_rows(symbol),
+                f"Stooq daily CSV fallback (corporate-action adjustment not independently verified) "
+                f"after yfinance error: {type(exc).__name__}",
+            )
         except Exception:
             raise exc
 
@@ -351,6 +386,8 @@ def latest_on_or_before(series, key):
 
 
 def merge_price_and_volume_rows(price_rows, volume_rows=None):
+    if len({date_key(r["date"]) for r in price_rows}) != len(price_rows):
+        raise ValueError("price rows contain duplicate dates")
     if not volume_rows:
         out = []
         for row in price_rows:
@@ -361,7 +398,18 @@ def merge_price_and_volume_rows(price_rows, volume_rows=None):
             out.append(row)
         return out
 
+    price_by_date = {date_key(r["date"]): r for r in price_rows}
     by_date = {date_key(r["date"]): r for r in volume_rows}
+    if len(by_date) != len(volume_rows):
+        raise ValueError("volume-proxy rows contain duplicate dates")
+    common = sorted(set(price_by_date) & set(by_date))
+    if not common:
+        return []
+    first, last = common[0], common[-1]
+    price_inner = {key for key in price_by_date if first <= key <= last}
+    volume_inner = {key for key in by_date if first <= key <= last}
+    if price_inner != volume_inner:
+        raise ValueError("price and volume-proxy calendars differ inside their common date range")
     merged = []
     for row in price_rows:
         key = date_key(row["date"])
@@ -388,7 +436,8 @@ def compute_masses(rows, half_life=DEFAULT_HALF_LIFE):
     for i, row in enumerate(rows):
         age = n - 1 - i
         recency = 0.5 ** (age / max(float(half_life), 1.0))
-        dv = _to_float(row.get("dollar_volume")) or med_dv
+        observed_dv = _to_float(row.get("dollar_volume"))
+        dv = observed_dv if observed_dv is not None and observed_dv > 0 else med_dv * 0.10
         volume_term = math.sqrt(clamp(max(dv, 0.0) / med_dv if med_dv > 0 else 1.0, 0.10, 10.0))
         range_log = ranges[i]
         if med_range > 0 and range_log and range_log > 0:
@@ -451,8 +500,9 @@ def estimate_ou_gravity(rows, half_life=DEFAULT_HALF_LIFE):
     """Estimate mean reversion of log-price residuals around rolling centers.
 
     Regression: dy_t = a + b * y_{t-1} + eps_t, where
-    y_t = log(price_t) - rolling_center_log_t. Positive kappa = -b implies
-    pull back toward the center.
+    y_t = log(price_t) - rolling_center_log_{t-1}.  The lagged center prevents
+    the same close from mechanically moving its own reference point. Positive
+    kappa = -b implies pull back toward the prior accepted-participation center.
     """
     if len(rows) < 35:
         return {
@@ -470,7 +520,7 @@ def estimate_ou_gravity(rows, half_life=DEFAULT_HALF_LIFE):
         if end + 1 < min_window:
             residuals.append(None)
             continue
-        basic = compute_center_basic(rows[:end + 1], half_life=half_life)
+        basic = compute_center_basic(rows[:end], half_life=half_life)
         close = _to_float(rows[end].get("close"))
         if not basic or close is None or close <= 0:
             residuals.append(None)
@@ -649,6 +699,9 @@ def compute_center_basic(rows, half_life=DEFAULT_HALF_LIFE):
     if com_log is None:
         return None
     total_mass = sum(masses)
+    volume_coverage_ratio = sum(
+        1 for row in valid if (_to_float(row.get("dollar_volume")) or 0.0) > 0
+    ) / len(valid)
     variance = sum(w * (x - com_log) ** 2 for x, w in zip(logs, masses)) / max(total_mass, 1e-12)
     sigma = math.sqrt(max(variance, 1e-12))
     current_log = logs[-1]
@@ -667,6 +720,7 @@ def compute_center_basic(rows, half_life=DEFAULT_HALF_LIFE):
         "current_price": valid[-1]["close"],
         "mass_quantity": total_mass,
         "mass_quantity_ratio": total_mass / max(sum(recencies), 1e-12),
+        "volume_coverage_ratio": volume_coverage_ratio,
     }
 
 
@@ -693,6 +747,7 @@ def score_center(rows, half_life=DEFAULT_HALF_LIFE):
     above = sum(w for x, w in zip(logs, masses) if x > com_log)
     balance = clamp(1.0 - abs(below - above) / total_mass)
     effective_sample, effective_sample_ratio = effective_sample_score(masses)
+    volume_coverage = clamp(basic.get("volume_coverage_ratio"))
 
     shift = min(10, max(3, len(rows) // 12))
     if len(rows) > shift + 10:
@@ -714,6 +769,9 @@ def score_center(rows, half_life=DEFAULT_HALF_LIFE):
         + 0.16 * balance
         + 0.16 * effective_sample
     )
+    # A missing-volume center is still a useful recency/range heuristic, but it
+    # is not entitled to the same confidence as observed dollar-volume mass.
+    quality *= 0.65 + 0.35 * volume_coverage
     distance_z = (basic["current_log"] - com_log) / sigma
 
     if quality < 40:
@@ -735,6 +793,7 @@ def score_center(rows, half_life=DEFAULT_HALF_LIFE):
             "stability": stability * 100.0,
             "balance": balance * 100.0,
             "effective_sample_ratio": effective_sample * 100.0,
+            "volume_coverage": volume_coverage * 100.0,
         },
         "effective_sample_raw_ratio": effective_sample_ratio,
         "center_shift_z": center_shift_z,
@@ -748,13 +807,40 @@ def score_center(rows, half_life=DEFAULT_HALF_LIFE):
     return out
 
 
-def volatility_context(rows, vol_series=None, fallback_vol_series=None, as_of_date=None):
+def _calendar_age_days(as_of_date, observation_date):
+    try:
+        as_of = dt.date.fromisoformat(date_key(as_of_date))
+        observed = dt.date.fromisoformat(date_key(observation_date))
+    except (TypeError, ValueError):
+        return None
+    return (as_of - observed).days
+
+
+def volatility_context(
+    rows,
+    vol_series=None,
+    fallback_vol_series=None,
+    as_of_date=None,
+    max_implied_vol_age_days=DEFAULT_MAX_IMPLIED_VOL_AGE_DAYS,
+):
     as_of_date = date_key(as_of_date or rows[-1]["date"])
     realized_21 = annualized_realized_vol(rows, lookback=21)
     realized_10 = annualized_realized_vol(rows, lookback=10)
     realized_63 = annualized_realized_vol(rows, lookback=63)
     implied_raw, implied_date = latest_on_or_before(vol_series or {}, as_of_date)
     fallback_raw, fallback_date = latest_on_or_before(fallback_vol_series or {}, as_of_date)
+    primary_date = implied_date
+    implied_age_days = _calendar_age_days(as_of_date, implied_date) if implied_date else None
+    fallback_age_days = _calendar_age_days(as_of_date, fallback_date) if fallback_date else None
+    max_age = max(0, int(max_implied_vol_age_days))
+    primary_invalid = implied_raw is not None and implied_raw <= 0
+    fallback_invalid = fallback_raw is not None and fallback_raw <= 0
+    primary_stale = implied_raw is not None and (implied_age_days is None or implied_age_days > max_age)
+    fallback_stale = fallback_raw is not None and (fallback_age_days is None or fallback_age_days > max_age)
+    if primary_stale or primary_invalid:
+        implied_raw = None
+    if fallback_stale or fallback_invalid:
+        fallback_raw = None
     implied_source = None
     implied_vol = None
     if implied_raw is not None:
@@ -765,14 +851,23 @@ def volatility_context(rows, vol_series=None, fallback_vol_series=None, as_of_da
         implied_date = fallback_date
         implied_source = "fallback"
 
-    if implied_vol is not None and realized_21 is not None:
+    if implied_vol is not None and realized_21 is not None and implied_source == "primary":
         annual_vol = 0.45 * realized_21 + 0.55 * implied_vol
+        blend_method = "45pct_realized_55pct_primary_implied"
+    elif implied_vol is not None and realized_21 is not None:
+        # A broad-market fallback is not security-specific enough to pull a
+        # volatile asset's cone inward. It may only act as a volatility floor.
+        annual_vol = max(realized_21, implied_vol)
+        blend_method = "max_realized_or_fallback_proxy"
     elif implied_vol is not None:
         annual_vol = implied_vol
+        blend_method = "implied_only"
     elif realized_21 is not None:
         annual_vol = realized_21
+        blend_method = "realized_only"
     else:
         annual_vol = 0.20
+        blend_method = "constant_20pct_last_resort"
 
     ratio = None
     if implied_raw is not None and fallback_raw not in (None, 0):
@@ -786,10 +881,20 @@ def volatility_context(rows, vol_series=None, fallback_vol_series=None, as_of_da
         "implied_vol_raw": implied_raw if implied_raw is not None else fallback_raw,
         "implied_vol_date": implied_date if implied_raw is not None else fallback_date,
         "implied_vol_source": implied_source,
+        "implied_vol_max_age_days": max_age,
+        "primary_vol_observation_date": primary_date,
+        "primary_vol_age_calendar_days": implied_age_days,
+        "primary_vol_stale": primary_stale,
+        "primary_vol_invalid": primary_invalid,
+        "fallback_vol_observation_date": fallback_date,
+        "fallback_vol_age_calendar_days": fallback_age_days,
+        "fallback_vol_stale": fallback_stale,
+        "fallback_vol_invalid": fallback_invalid,
         "fallback_vol_raw": fallback_raw,
         "fallback_vol_date": fallback_date,
         "primary_to_fallback_vol_ratio": ratio,
         "annual_vol_used": annual_vol,
+        "annual_vol_blend_method": blend_method,
     }
 
 
@@ -961,7 +1066,12 @@ def boundary_rows(state, horizons, confidences, calibration=None, apply_calibrat
             cal_key = f"{horizon}|{confidence:.2f}"
             multiplier = 1.0
             if apply_calibration:
-                multiplier = (calibration.get(cal_key) or {}).get("suggested_width_multiplier", 1.0)
+                calibration_row = calibration.get(cal_key) or {}
+                multiplier = (
+                    calibration_row.get("suggested_width_multiplier", 1.0)
+                    if calibration_row.get("reliable")
+                    else 1.0
+                )
                 multiplier = max(1.0, _to_float(multiplier) or 1.0)
                 lower = current_log - (current_log - lower) * multiplier
                 upper = current_log + (upper - current_log) * multiplier
@@ -1058,12 +1168,21 @@ def backtest_calibration(rows, vol_series, fallback_vol_series, lookback, half_l
                     "samples": 0,
                     "close_hits": 0,
                     "path_hits": 0,
+                    "required_width_multipliers": [],
                 })
                 bucket["samples"] += 1
                 if band["lower_boundary"] <= future_close <= band["upper_boundary"]:
                     bucket["close_hits"] += 1
                 if band["lower_boundary"] <= future_low and future_high <= band["upper_boundary"]:
                     bucket["path_hits"] += 1
+                current = float(state["center"]["current_price"])
+                lower_width = max(math.log(current / band["lower_boundary"]), 1e-12)
+                upper_width = max(math.log(band["upper_boundary"] / current), 1e-12)
+                lower_excursion = max(math.log(current / future_low), 0.0)
+                upper_excursion = max(math.log(future_high / current), 0.0)
+                bucket["required_width_multipliers"].append(
+                    max(lower_excursion / lower_width, upper_excursion / upper_width)
+                )
         tested += 1
 
     by_band = []
@@ -1074,23 +1193,44 @@ def backtest_calibration(rows, vol_series, fallback_vol_series, lookback, half_l
         close_cov = bucket["close_hits"] / samples
         path_cov = bucket["path_hits"] / samples
         target = bucket["confidence"]
-        suggested = 1.0
-        if path_cov < target and path_cov > 0:
-            suggested = min(2.5, max(1.0, target / path_cov))
-        elif path_cov == 0 and samples:
-            suggested = 2.5
+        required = sorted(bucket.pop("required_width_multipliers", []))
+        if required:
+            # Empirical target quantile of the path excursion relative to each
+            # forecast's own asymmetric width.  Coverage ratios are not linear
+            # in width, so target/path_coverage is not a valid width estimator.
+            rank = max(0, min(len(required) - 1, math.ceil(target * len(required)) - 1))
+            raw_suggested = required[rank]
+            suggested = min(2.5, max(1.0, raw_suggested))
+        else:
+            raw_suggested = None
+            suggested = 1.0
         row = {
             **bucket,
             "close_coverage": close_cov,
             "path_coverage": path_cov,
             "target_coverage": target,
             "suggested_width_multiplier": suggested,
+            "uncapped_width_multiplier": raw_suggested,
+            "calibrated_path_coverage": (
+                sum(1 for value in required if value <= suggested) / len(required)
+                if required else None
+            ),
+            "multiplier_cap_binding": bool(
+                raw_suggested is not None and raw_suggested > 2.5
+            ),
+            "minimum_reliable_samples": 30,
+            "reliable": bucket["samples"] >= 30,
         }
         by_band.append(row)
         multipliers[f"{key[0]}|{key[1]:.2f}"] = row
 
     return {
         "available": bool(by_band),
+        "decision_grade": False,
+        "point_in_time_forecasts": True,
+        "evaluation": "in_sample_empirical_path_coverage",
+        "multiplier_method": "empirical target quantile of required asymmetric log-width",
+        "calibration_end_date": date_key(rows[end]["date"]),
         "rows_tested": tested,
         "by_band": by_band,
         "multipliers": multipliers,
@@ -1101,6 +1241,7 @@ def compact_center(center):
     keys = [
         "current_price", "center_price", "quality_score", "distance_z",
         "mass_quantity", "mass_quantity_ratio", "mass_sigma_pct",
+        "volume_coverage_ratio",
         "effective_sample_raw_ratio", "center_shift_z", "center_weight",
         "has_center", "usable_center", "active_center", "regime",
     ]
@@ -1127,7 +1268,6 @@ def rounded_for_json(obj):
 
 def write_boundaries_csv(path, rows):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "horizon_days", "confidence", "center_weight", "lower_center_weight", "upper_center_weight",
         "gravity_boundary_weight", "calibration_multiplier",
@@ -1136,16 +1276,12 @@ def write_boundaries_csv(path, rows):
         "distance_lower_pct", "distance_upper_pct",
         "vol_lower", "vol_upper", "mass_lower", "mass_upper", "profile_lower", "profile_upper", "ou_lower", "ou_upper",
     ]
-    with path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: _round(row.get(k), 6) for k in fields})
+    serialized = ({k: _round(row.get(k), 6) for k in fields} for row in rows)
+    atomic_write_csv(path, serialized, fields)
 
 
 def write_markdown(path, summary, boundaries):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     cur = summary["current"]
     center = cur["center"]
     vol = cur["volatility"]
@@ -1158,6 +1294,7 @@ def write_markdown(path, summary, boundaries):
         "# Market Mass Boundary Report",
         "",
         "Research output only. Boundary zones are probabilistic, not guaranteed support/resistance.",
+        "Decision grade: false. These levels do not include executable option-chain economics or portfolio sizing.",
         "",
         f"- Price ticker: {summary['inputs']['price_ticker']}",
         f"- Volume proxy: {summary['inputs'].get('volume_ticker') or summary['inputs']['price_ticker']}",
@@ -1198,16 +1335,16 @@ def write_markdown(path, summary, boundaries):
             "",
             "## Backtest Calibration",
             "",
-            "| Horizon | Confidence | Close coverage | Path coverage | Suggested width |",
-            "|---:|---:|---:|---:|---:|",
+            "| Horizon | Confidence | Close coverage | Path coverage | Suggested width | Applied-eligible |",
+            "|---:|---:|---:|---:|---:|---:|",
         ]
         for row in summary["calibration"]["by_band"]:
             lines.append(
                 f"| {row['horizon_days']}d | {row['confidence']:.0%} | "
                 f"{row['close_coverage']:.1%} | {row['path_coverage']:.1%} | "
-                f"{row['suggested_width_multiplier']:.2f}x |"
+                f"{row['suggested_width_multiplier']:.2f}x | {row.get('reliable', False)} |"
             )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def build_summary(args, market_rows, price_source, vol_series, vol_source, vol_error, fallback_series, fallback_source, fallback_error):
@@ -1247,8 +1384,23 @@ def build_summary(args, market_rows, price_source, vol_series, vol_source, vol_e
         warnings.append(f"Fallback volatility fetch issue: {fallback_error}")
     if state["volatility"].get("implied_vol") is None:
         warnings.append("No implied volatility series was available; boundaries use realized volatility only.")
+    if (state["center"].get("volume_coverage_ratio") or 0.0) < 0.80:
+        warnings.append("Fewer than 80% of mass-window bars had positive dollar volume; center confidence is penalized.")
+    if state["volatility"].get("primary_vol_stale"):
+        warnings.append("Primary implied-volatility observation exceeded the freshness limit and was excluded.")
+    if state["volatility"].get("fallback_vol_stale"):
+        warnings.append("Fallback implied-volatility observation exceeded the freshness limit and was excluded.")
+    if state["volatility"].get("primary_vol_invalid") or state["volatility"].get("fallback_vol_invalid"):
+        warnings.append("A non-positive volatility observation was excluded.")
+    if "Stooq daily CSV fallback" in str(price_source):
+        warnings.append("Stooq fallback corporate-action adjustment was not independently verified; treat long-horizon geometry as provisional.")
+    if args.apply_calibration and not calibration.get("available"):
+        warnings.append("Calibration was requested but unavailable; current boundaries were not widened.")
+    elif args.apply_calibration and any(not row.get("reliable") for row in calibration.get("by_band", [])):
+        warnings.append("At least one calibration band had fewer than 30 samples and was not applied.")
 
     summary = {
+        "schemaVersion": 1,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "inputs": {
             "price_ticker": args.price_ticker,
@@ -1285,6 +1437,23 @@ def build_summary(args, market_rows, price_source, vol_series, vol_source, vol_e
         },
         "boundaries": boundaries,
         "calibration": calibration or {"available": False, "reason": "not requested"},
+        "validation": {
+            "decisionGrade": False,
+            "researchOnly": True,
+            "calibrationEvaluation": (
+                calibration.get("evaluation") if calibration else "not_requested"
+            ),
+            "adjustedPricePolicy": (
+                "yfinance_auto_adjust_true"
+                if "Yahoo Finance" in str(price_source)
+                else "source_adjustment_not_independently_verified"
+            ),
+            "limitations": [
+                "Boundaries are distributional research estimates, not executable option strikes.",
+                "Calibration is in-sample empirical path coverage unless independently evaluated later.",
+                "Broad volatility proxies do not reproduce a security's option skew or term structure.",
+            ],
+        },
         "disclaimer": "Probabilistic research model only; boundaries are not guaranteed support/resistance and are not financial advice.",
     }
     return rounded_for_json(summary), boundaries
@@ -1297,7 +1466,8 @@ def parse_args(argv=None):
     ap.add_argument("--vol-ticker", default="^VXN", help="Primary implied volatility proxy.")
     ap.add_argument("--fallback-vol-ticker", default="^VIX", help="Fallback implied volatility proxy.")
     ap.add_argument("--period", default="5y", help="yfinance period, e.g. 2y, 5y, max.")
-    ap.add_argument("--interval", default="1d", help="yfinance interval, e.g. 1d, 1h, 5m.")
+    ap.add_argument("--interval", choices=["1d"], default="1d",
+                    help="Daily bars only; annualization and horizon units assume trading days.")
     ap.add_argument("--input-csv", default=None, help="Optional local OHLCV CSV instead of live price fetch.")
     ap.add_argument("--gravity-profile", choices=sorted(GRAVITY_PROFILES), default=None,
                     help="Named lookback/half-life profile: structural=252/63, swing=84/21, tactical=63/14.")
@@ -1318,6 +1488,16 @@ def parse_args(argv=None):
     args = ap.parse_args(argv)
     if args.gravity_profile:
         args.lookback, args.half_life = GRAVITY_PROFILES[args.gravity_profile]
+    if args.lookback < 30:
+        ap.error("--lookback must be at least 30 daily bars")
+    if not math.isfinite(args.half_life) or args.half_life <= 0:
+        ap.error("--half-life must be positive and finite")
+    if any(horizon <= 0 for horizon in args.horizons):
+        ap.error("all --horizons must be positive")
+    if any(not 0 < confidence < 1 for confidence in args.confidences):
+        ap.error("all --confidences must be between 0 and 1")
+    if args.max_backtest_evals <= 0:
+        ap.error("--max-backtest-evals must be positive")
     return args
 
 
@@ -1330,7 +1510,7 @@ def main(argv=None):
 
     if args.input_csv:
         price_rows = read_ohlcv_csv(args.input_csv)
-        price_source = f"local CSV {args.input_csv}"
+        price_source = "local OHLCV CSV input"
         volume_rows = None
     else:
         price_rows, price_source = fetch_price_rows(
@@ -1372,8 +1552,7 @@ def main(argv=None):
     )
 
     out_json = Path(args.out_json)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    atomic_write_json(out_json, summary)
     write_boundaries_csv(args.out_csv, boundaries)
     write_markdown(args.out_md, summary, boundaries)
 

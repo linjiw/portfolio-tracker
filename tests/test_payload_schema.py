@@ -31,10 +31,11 @@ ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 UI_CORE_KEYS = {
     "summary", "stocks", "options", "series", "portfolioFib", "behavior",
     "risk", "bridge", "account", "alloc", "qqqTqqq", "counterfactual",
+    "optionSettlements",
 }
 UI_OPTIONAL_KEYS = {
     "decision", "aiSemiQuant", "aiWatchlist", "aics", "marketMass",
-    "momentumTop3", "financialStatus",
+    "momentumTop3", "financialStatus", "closeVsIntraday", "artifactHealth",
 }
 
 
@@ -119,20 +120,41 @@ class PayloadSchemaTests(unittest.TestCase):
         # artifact files present every loader must return None (never raise),
         # so the template can rely on the key existing.
         with tempfile.TemporaryDirectory() as td:
+            health = {}
             optional = {
-                "decision": generate.load_decision_analysis(td),
-                "aiSemiQuant": generate.load_ai_semi_quant(td),
-                "aiWatchlist": generate.load_ai_watchlist(td),
-                "aics": generate.load_aics_payload(td),
-                "marketMass": generate.load_market_mass_dashboard(td),
-                "momentumTop3": generate.load_momentum_top3(td),
-                "financialStatus": generate.load_financial_status(td),
+                "decision": generate.load_decision_analysis(td, None, health),
+                "aiSemiQuant": generate.load_ai_semi_quant(td, None, health),
+                "aiWatchlist": generate.load_ai_watchlist(td, None, health),
+                "aics": generate.load_aics_payload(td, None, health),
+                "marketMass": generate.load_market_mass_dashboard(td, None, health),
+                "momentumTop3": generate.load_momentum_top3(td, None, health),
+                "financialStatus": generate.load_financial_status(td, None, health),
+                "closeVsIntraday": generate.load_close_vs_intraday(td, None, health),
+                "artifactHealth": health,
             }
         self.assertEqual(set(optional.keys()), UI_OPTIONAL_KEYS)
         for k, v in optional.items():
+            if k == "artifactHealth":
+                continue
             self.assertIsNone(v, f"loader for {k} should return None when file absent")
+        self.assertEqual(set(health), UI_OPTIONAL_KEYS - {"artifactHealth"})
         full = dict(self.payload, **optional)
         self.assertEqual(set(full.keys()), UI_CORE_KEYS | UI_OPTIONAL_KEYS)
+
+    def test_close_vs_intraday_loader_is_tolerant_and_reads_valid_artifact(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "close_vs_intraday.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("not json")
+            self.assertIsNone(generate.load_close_vs_intraday(td))
+            expected = {
+                "schemaVersion": 1, "generatedAt": "2026-07-09T20:00:00Z",
+                "asOf": "2026-07-09", "windows": {},
+                "researchOnly": True, "decisionGrade": False,
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(expected, handle)
+            self.assertEqual(generate.load_close_vs_intraday(td), expected)
 
     def test_top_level_types(self):
         p = self.payload
@@ -146,6 +168,25 @@ class PayloadSchemaTests(unittest.TestCase):
         self.assertIsInstance(p["alloc"], dict)
         self.assertIsNone(p["account"])          # no account snapshot supplied
         self.assertIsInstance(p["counterfactual"], (dict, list, type(None)))
+
+    def test_future_cache_rows_are_not_embedded_or_used_by_indicators(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        future = (datetime.date.fromisoformat(DMAX) + datetime.timedelta(days=1)).isoformat()
+        prices["AAA"][future] = 9999.0
+        prices["BBB"][future] = 9999.0
+        prices["^GSPC"][future] = 99999.0
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices,
+            deposits=1250.0, totals=(1250.0, 480.0),
+            dmin=DMIN, dmax=DMAX,
+            dividends=5.0, life_deposits=1250.0)
+
+        self.assertTrue(all(day <= DMAX for stock in payload["stocks"]
+                            for day, _price in stock["prices"]))
+        self.assertTrue(all(row["date"] <= DMAX for row in payload["series"]))
+        aaa = next(stock for stock in payload["stocks"] if stock["sym"] == "AAA")
+        self.assertNotEqual(aaa["fib"]["now"]["mom"], 100.0)
 
     # ---------------- summary ----------------
     def test_summary_types_and_counts(self):
@@ -179,6 +220,178 @@ class PayloadSchemaTests(unittest.TestCase):
         # fixture ground truth: realized = (120-100)*4; net invested 1250-480
         self.assertAlmostEqual(s["realized"], 80.0, places=2)
         self.assertAlmostEqual(s["netInvested"], 770.0, places=2)
+
+    def test_summary_exposes_return_and_realized_quality(self):
+        s = self.payload["summary"]
+
+        self.assertEqual(s["twrQuality"]["status"], "complete")
+        self.assertEqual(s["twrQuality"]["usableSessions"], len(DATES))
+        self.assertEqual(s["realizedPnlQuality"]["confidence"], "medium")
+        self.assertIn("average-cost", s["realizedPnlQuality"]["method"])
+
+    def test_realized_pnl_uses_net_sale_cash_and_flags_cross_account_pooling(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        txns["AAA"][0]["account"] = "A"
+        txns["AAA"][1]["account"] = "B"
+        txns["AAA"][1]["amount"] = 479.0  # $1 fee vs price × quantity
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(1250.0, 479.0), dmin=DMIN, dmax=DMAX)
+
+        aaa = next(row for row in payload["stocks"] if row["sym"] == "AAA")
+        self.assertEqual(aaa["realized"], 79.0)
+        self.assertEqual(aaa["realizedBasisScope"], "cross-account-average-cost")
+        self.assertTrue(any("pooled across accounts" in warning
+                            for warning in aaa["realizedWarnings"]))
+        self.assertEqual(aaa["realizedConfidence"], "medium")
+
+    def test_twr_starts_only_when_every_held_symbol_has_a_past_price(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        for d in DATES[:5]:
+            prices["BBB"].pop(d)
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(1250.0, 480.0), dmin=DMIN, dmax=DMAX)
+
+        self.assertEqual(payload["series"][0]["date"], DATES[5])
+        quality = payload["summary"]["twrQuality"]
+        self.assertEqual(quality["status"], "partial")
+        self.assertEqual(quality["seriesStart"], DATES[5])
+        self.assertEqual(quality["missingSymbols"], ["BBB"])
+        self.assertTrue(any(x["date"] == DATES[2] for x in quality["failures"]))
+
+    def test_mwr_uses_dated_cash_events_and_real_terminal_date(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(1250.0, 480.0), dmin=DMIN, dmax=DMAX,
+            dividends=5.0, life_deposits=1250.0, price_as_of=DMAX,
+            cash_events=[{"date": DATES[15], "kind": "DIV", "amount": 5.0,
+                          "account": "A"}])
+
+        quality = payload["summary"]["mwrQuality"]
+        self.assertEqual(quality["terminalDate"], DMAX)
+        self.assertEqual(quality["datedCashEventCount"], 1)
+        self.assertEqual(quality["fallbackAggregateCash"], 0.0)
+        self.assertTrue(quality["alignedWithTWR"])
+        self.assertEqual(quality["status"], "complete")
+        self.assertEqual(quality["exactTransactionFlowCount"], 3)
+        self.assertEqual(quality["estimatedOpeningValue"], 0.0)
+
+        expected_flows = [
+            (datetime.date.fromisoformat(DATES[0]), -1000.0),
+            (datetime.date.fromisoformat(DATES[2]), -250.0),
+            (datetime.date.fromisoformat(DATES[10]), 480.0),
+            (datetime.date.fromisoformat(DATES[15]), 5.0),
+            (datetime.date.fromisoformat(DMAX), payload["summary"]["marketValue"]),
+        ]
+        expected_rate = generate.xirr(expected_flows)
+        expected_period = ((1 + expected_rate) ** (
+            (datetime.date.fromisoformat(DMAX) -
+             datetime.date.fromisoformat(DMIN)).days / 365.0) - 1) * 100
+        self.assertAlmostEqual(payload["summary"]["mwrPeriod"],
+                               round(expected_period, 2))
+
+    def test_mwr_downgrades_pre_window_inventory_estimate(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        # One AAA share existed before the first usable session.
+        cur["AAA"]["shares"] += 1.0
+        cur["AAA"]["value"] += prices["AAA"][DMAX]
+        cur["AAA"]["cost"] += prices["AAA"][DMIN]
+        cur["AAA"]["gain"] = cur["AAA"]["value"] - cur["AAA"]["cost"]
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(1250.0, 480.0), dmin=DMIN, dmax=DMAX,
+            cash_events=[])
+
+        quality = payload["summary"]["mwrQuality"]
+        self.assertEqual(quality["status"], "estimated-opening-market-value")
+        self.assertEqual(quality["estimatedOpeningSymbols"], ["AAA"])
+        self.assertAlmostEqual(quality["estimatedOpeningValue"],
+                               prices["AAA"][DMIN])
+
+    def test_nonconventional_cash_flows_withhold_xirr_headline(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        txns["AAA"].extend([
+            {"date": DATES[5], "side": "SELL", "qty": 2.0,
+             "price": 110.0, "amount": 220.0},
+            {"date": DATES[8], "side": "BUY", "qty": 2.0,
+             "price": 115.0, "amount": -230.0},
+        ])
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(1480.0, 700.0), dmin=DMIN, dmax=DMAX,
+            price_as_of=DMAX, cash_events=[])
+
+        summary = payload["summary"]
+        quality = summary["mwrQuality"]
+        self.assertEqual(quality["status"], "review-nonconventional-cashflows")
+        self.assertGreater(quality["cashFlowSignChanges"], 1)
+        self.assertIsNotNone(quality["candidatePeriodPct"])
+        self.assertFalse(quality["published"])
+        self.assertIsNone(summary["mwrPeriod"])
+        self.assertIsNone(summary["mwrAnnual"])
+        self.assertIsNone(summary["behaviorGap"])
+
+    def test_settlement_accounting_and_behavior_provenance(self):
+        txns, opt_txns, names, cur, prices = make_fixture()
+        # Same-day, same-account exercise/assignment delivery is net-zero stock
+        # exposure and belongs to the option lifecycle, not equity realized P&L.
+        txns["AAA"].extend([
+            {"date": DATES[15], "side": "BUY", "qty": 100.0, "price": 130.0,
+             "amount": -13000.0, "account": "A", "actionType": "OPTION_SETTLEMENT",
+             "settlementType": "EXERCISED"},
+            {"date": DATES[15], "side": "SELL", "qty": 100.0, "price": 120.0,
+             "amount": 12000.0, "account": "A", "actionType": "OPTION_SETTLEMENT",
+             "settlementType": "ASSIGNED"},
+            # An unpaired delivery must remain in share/cost accounting.
+            {"date": DATES[16], "side": "BUY", "qty": 2.0, "price": 80.0,
+             "amount": -160.0, "account": "A", "actionType": "OPTION_SETTLEMENT",
+             "settlementType": "ASSIGNED"},
+        ])
+        txns["BBB"].append(
+            {"date": DATES[20], "side": "BUY", "qty": 1.0, "price": 60.0,
+             "amount": -60.0, "account": "A", "actionType": "REINVESTMENT"})
+        cur["AAA"].update({
+            "shares": 8.0, "value": round(8 * cur["AAA"]["price"], 2),
+            "cost": 760.0, "gain": round(8 * cur["AAA"]["price"] - 760, 2),
+            "avg": 95.0,
+        })
+        cur["AAA"]["gainpct"] = cur["AAA"]["gain"] / cur["AAA"]["cost"] * 100
+        cur["BBB"].update({
+            "shares": 6.0, "value": round(6 * cur["BBB"]["price"], 2),
+            "cost": 310.0, "gain": round(6 * cur["BBB"]["price"] - 310, 2),
+            "avg": 310 / 6,
+        })
+        cur["BBB"]["gainpct"] = cur["BBB"]["gain"] / cur["BBB"]["cost"] * 100
+
+        payload = generate.build_payload(
+            txns, opt_txns, names, cur, prices, deposits=1250.0,
+            totals=(999999.0, 999999.0), dmin=DMIN, dmax=DMAX,
+            dividends=5.0, life_deposits=1250.0, corporate_action_cash=0.88)
+
+        s = payload["summary"]
+        self.assertEqual(s["realized"], 80.0)
+        self.assertEqual(s["totalBuy"], 1470.0)
+        self.assertEqual(s["totalSell"], 480.0)
+        self.assertEqual(s["optionSettlementCash"], -1160.0)
+        self.assertEqual(s["pairedOptionSettlementCash"], -1000.0)
+        self.assertEqual(s["corporateActionCash"], 0.88)
+        self.assertEqual(s["optionSettlementGroups"], 2)
+        self.assertEqual(payload["behavior"]["stats"]["trades"], 3)
+
+        aaa = next(x for x in payload["stocks"] if x["sym"] == "AAA")
+        self.assertEqual([t["actionType"] for t in aaa["txns"]],
+                         ["TRADE", "TRADE", "OPTION_SETTLEMENT"])
+        self.assertEqual(aaa["shares"], 8.0)
+        paired = next(x for x in payload["optionSettlements"] if x["pairedNetZero"])
+        self.assertEqual(paired["accountingTreatment"], "excluded_from_equity_realized")
+        unpaired = next(x for x in payload["optionSettlements"] if not x["pairedNetZero"])
+        self.assertEqual(unpaired["accountingTreatment"], "included_in_share_accounting")
 
     # ---------------- per-stock ----------------
     def test_stock_row_schema(self):
@@ -263,12 +476,13 @@ class PayloadSchemaTests(unittest.TestCase):
         b = self.payload["bridge"]
         s = self.payload["summary"]
         legs = {leg["key"]: leg["amount"] for leg in b["legs"]}
-        self.assertEqual(set(legs), {"unreal", "real", "div", "opt"})
+        self.assertEqual(set(legs), {"unreal", "real", "div", "opt", "optSettlement"})
         self.assertAlmostEqual(b["totalPL"], sum(legs.values()), places=2)
         self.assertAlmostEqual(legs["unreal"], s["unrealized"], places=2)
         self.assertAlmostEqual(legs["real"], s["realized"], places=2)
         self.assertAlmostEqual(legs["div"], s["dividends"], places=2)
         self.assertAlmostEqual(legs["opt"], s["optNet"], places=2)
+        self.assertAlmostEqual(legs["optSettlement"], s["pairedOptionSettlementCash"], places=2)
         # broker identity: held cost + unrealized = terminal market value
         self.assertAlmostEqual(b["heldCost"] + legs["unreal"], b["terminal"], delta=0.02)
 

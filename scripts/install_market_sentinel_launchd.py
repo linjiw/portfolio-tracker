@@ -17,6 +17,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.artifact_io import atomic_write_bytes
+except ModuleNotFoundError:
+    from artifact_io import atomic_write_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "market_sentinel.py"
@@ -40,7 +45,10 @@ def parse_times(raw):
     out = []
     for part in raw.split(","):
         hh, mm = part.strip().split(":", 1)
-        out.append((int(hh), int(mm)))
+        hour, minute = int(hh), int(mm)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError(f"invalid launch time: {part!r}")
+        out.append((hour, minute))
     return out
 
 
@@ -77,12 +85,12 @@ def build_plist(args, python_exe):
 
 def install(args):
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
-    OUT.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    OUT.chmod(0o700)
     path = plist_path()
     uid = os.getuid()
-    with path.open("wb") as f:
-        plistlib.dump(build_plist(args, str(Path(sys.executable).resolve())), f)
-    path.chmod(0o600)
+    atomic_write_bytes(
+        path, plistlib.dumps(build_plist(args, str(Path(sys.executable).resolve()))))
     launchctl("bootout", f"gui/{uid}", str(path))
     boot = launchctl("bootstrap", f"gui/{uid}", str(path))
     if boot.returncode != 0:
@@ -127,6 +135,10 @@ def main():
     elif args.status:
         status()
     else:
+        try:
+            parse_times(args.times)
+        except (TypeError, ValueError) as exc:
+            ap.error(str(exc))
         install(args)
 
 

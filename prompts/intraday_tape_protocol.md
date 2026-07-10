@@ -14,6 +14,8 @@ Codex may not override `gates.json`.
 1. Use only closed bars. Treat forming bars as context.
 2. Classify the tape with 5m, 15m, and 30m together.
 3. Judge volume versus same-time-of-day baseline, not full-day average.
+   Require at least three prior sessions with the exact closed interval; a
+   missing/insufficient denominator is unknown evidence and prohibits ALLOW.
 4. Map price to active fib, macro fib, FMA band, prior-day H/L/C, VWAP, round
    number, and failed high/low clusters.
 5. Count repeated tests from `state.json`; third tests are more likely to
@@ -24,13 +26,20 @@ Codex may not override `gates.json`.
 
 ## Hard Rules
 
-- Before 09:45 ET and after 14:30 ET: no new entries; manage only.
+- Outside the session-aware entry window in `gates.json`: no new entries;
+  manage only. This is 09:45-14:30 ET on regular days and ends at 11:30 ET on
+  a 13:00 early close; weekends/standard holidays are closed.
 - Event window T-60m to T+15m: no new entries; separate event score from tape
-  score and require post-event decision bars.
+  score and require post-event decision bars. If the release is off the
+  quarter-hour, keep the lock until a 15m bar starting after the release closes.
 - 15m rvol < 1.0 and cumulative rvol < 1.0: vacuum tape; no ALLOW.
+- Missing or insufficient 15m same-time rvol/cumulative-rvol baseline: no
+  ALLOW; never convert the missing input to zero or a passed check.
 - Same-direction chase after >1.5 ATR extension from 20-bar mean: block chase.
 - Across binary events: halve spread size or reject; 0DTE/day-before crossing is
   rejected.
+- An option expiry beyond the validated event calendar's `validThrough` date is
+  rejected as unknown coverage, even when `next_binary_event` is empty.
 - Good news rejected is distribution until repaired by tape, not by narrative.
 - Let price come to levels. No trigger means no trade.
 

@@ -18,11 +18,17 @@ the analysis pipeline.
 
 import json
 import os
+import stat
 import sys
 import urllib.request
 import urllib.parse
 import urllib.error
 from pathlib import Path
+
+try:
+    from scripts.artifact_io import atomic_write_json, ensure_private_directory
+except ImportError:  # direct `python scripts/telegram_notifier.py`
+    from artifact_io import atomic_write_json, ensure_private_directory
 
 CONFIG_PATH = Path.home() / ".config" / "ptrak" / "telegram.json"
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
@@ -31,14 +37,38 @@ API_BASE = "https://api.telegram.org/bot{token}/{method}"
 def _load_config():
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"missing {CONFIG_PATH} — create it with {{token, chat_id}}")
+    info = CONFIG_PATH.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise PermissionError("Telegram config must be a regular, non-symlink file")
+    if info.st_uid != os.getuid():
+        raise PermissionError("Telegram config must be owned by the current user")
+    if info.st_mode & 0o077:
+        raise PermissionError("Telegram config permissions must be 0600")
+    def reject_constant(value):
+        raise ValueError(f"non-finite JSON constant {value}")
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f, parse_constant=reject_constant)
+    if not isinstance(config, dict):
+        raise ValueError("Telegram config must be a JSON object")
+    token = config.get("token")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("Telegram config token must be non-empty text")
+    chat_id = config.get("chat_id")
+    if chat_id is not None and not isinstance(chat_id, (int, str)):
+        raise ValueError("Telegram config chat_id must be an integer, text, or null")
+    return config
+
+
+def _safe_error(exc, token=None):
+    detail = str(exc)
+    if token:
+        detail = detail.replace(str(token), "[redacted-token]")
+    return detail
 
 
 def _save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    os.chmod(CONFIG_PATH, 0o600)
+    ensure_private_directory(CONFIG_PATH.parent)
+    atomic_write_json(CONFIG_PATH, cfg)
 
 
 def _api(token, method, params=None, timeout=10):
@@ -64,7 +94,7 @@ def discover_chat_id():
     try:
         j = _api(token, "getUpdates", {"timeout": 0, "limit": 100})
     except Exception as e:
-        print(f"telegram getUpdates failed: {e}", file=sys.stderr)
+        print(f"telegram getUpdates failed: {_safe_error(e, token)}", file=sys.stderr)
         return None
 
     updates = j.get("result", [])
@@ -142,10 +172,10 @@ def send_message(text, parse_mode="HTML", disable_web_page_preview=True):
         if "chat not found" in desc.lower() or "chat_id is empty" in desc.lower():
             cfg["chat_id"] = None
             _save_config(cfg)
-        print(f"telegram send failed: {desc}", file=sys.stderr)
+        print(f"telegram send failed: {_safe_error(desc, token)}", file=sys.stderr)
         return False
     except Exception as e:
-        print(f"telegram send failed: {e}", file=sys.stderr)
+        print(f"telegram send failed: {_safe_error(e, token)}", file=sys.stderr)
         return False
 
 

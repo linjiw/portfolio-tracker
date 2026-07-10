@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
 
@@ -286,6 +288,31 @@ class AicsToolTests(unittest.TestCase):
         self.assertEqual(summary["lowQualityRallies"][0]["ticker"], "AAA")
         self.assertEqual(summary["averageContribution"]["capitalFlowMomentumContribution"], 5)
 
+    def test_generated_return_attribution_withholds_unsupported_causal_components(self):
+        rows = [
+            {
+                "ticker": "AAA",
+                "market": {"ret3m": 30},
+                "growthRealizationScore": 80,
+                "valuationScore": 70,
+                "financialCapitalFlowScore": 75,
+            }
+        ]
+        attribution = aics.return_attribution(rows)[0]
+        self.assertEqual(attribution["totalReturn"], 30)
+        self.assertIsNone(attribution["earningsRevisionContribution"])
+        self.assertIsNone(attribution["valuationMultipleContribution"])
+        self.assertIsNone(attribution["capitalFlowMomentumContribution"])
+        self.assertFalse(attribution["causalAttributionAvailable"])
+        self.assertFalse(attribution["decisionGrade"])
+        self.assertAlmostEqual(sum(attribution["sensitivityWeights"].values()), 1.0, places=3)
+
+    def test_relationship_revenue_correlation_is_labeled_as_curated_prior(self):
+        doc = self.build_doc()
+        edge = doc["relationshipEdges"][0]
+        self.assertEqual(edge["revenueCorrelation"], edge["revenueDependencyPrior"])
+        self.assertIn("no statistical", edge["revenueCorrelationStatus"])
+
     def test_previous_snapshot_drives_score_delta(self):
         previous = {
             "scores": [
@@ -335,7 +362,7 @@ class AicsToolTests(unittest.TestCase):
         self.assertTrue(req["allEdgesWeighted"])
         self.assertGreaterEqual(doc["modelCard"]["edgeCount"], 10)
 
-    def test_static_backtest_calculates_equal_weight_basket_returns(self):
+    def test_static_cross_section_calculates_returns_but_is_not_a_backtest(self):
         rows = [
             {
                 "ticker": "AAA",
@@ -362,7 +389,9 @@ class AicsToolTests(unittest.TestCase):
         backtest = aics.static_basket_backtest(rows)
         top = next(b for b in backtest["baskets"] if b["name"] == "Top Final Score")
 
-        self.assertEqual(backtest["status"], "available")
+        self.assertEqual(backtest["status"], "descriptive_only")
+        self.assertFalse(backtest["decisionGrade"])
+        self.assertFalse(backtest["predictiveValidation"])
         self.assertEqual(top["members"], ["AAA", "BBB"])
         self.assertEqual(top["windows"]["1M"]["returnPct"], 5.0)
         self.assertEqual(top["windows"]["3M"]["returnPct"], 20.0)
@@ -379,7 +408,7 @@ class AicsToolTests(unittest.TestCase):
         )
         self.assertIn("topCapitalFlowBasket", backtest["currentCrossSection"])
 
-    def test_historical_snapshot_backtest_uses_start_snapshot_selection(self):
+    def test_historical_snapshot_backtest_lags_signal_before_entry(self):
         start = {
             "generatedAt": "2026-01-01T09:00:00-08:00",
             "benchmarks": [{"ticker": "SOXX", "price": 100}, {"ticker": "SMH", "price": 100}],
@@ -395,7 +424,7 @@ class AicsToolTests(unittest.TestCase):
                     "riskScore": 65,
                     "region": "US",
                     "peerGroup": "AI Accelerator / ASIC",
-                    "market": {"priceUsd": 100},
+                    "market": {"priceUsd": 999},
                 },
                 {
                     "ticker": "BBB",
@@ -408,7 +437,7 @@ class AicsToolTests(unittest.TestCase):
                     "riskScore": 45,
                     "region": "US",
                     "peerGroup": "Equipment",
-                    "market": {"priceUsd": 100},
+                    "market": {"priceUsd": 999},
                 },
                 {
                     "ticker": "CCC",
@@ -421,12 +450,21 @@ class AicsToolTests(unittest.TestCase):
                     "riskScore": 70,
                     "region": "Taiwan",
                     "peerGroup": "Foundry / Manufacturing",
-                    "market": {"priceUsd": 100},
+                    "market": {"priceUsd": 999},
                 },
             ],
         }
-        end = {
+        entry = {
             "generatedAt": "2026-02-01T09:00:00-08:00",
+            "benchmarks": [{"ticker": "SOXX", "price": 100}, {"ticker": "SMH", "price": 100}],
+            "scores": [
+                {"ticker": "AAA", "companyId": "aaa", "market": {"priceUsd": 100}},
+                {"ticker": "BBB", "companyId": "bbb", "market": {"priceUsd": 100}},
+                {"ticker": "CCC", "companyId": "ccc", "market": {"priceUsd": 100}},
+            ],
+        }
+        end = {
+            "generatedAt": "2026-03-01T09:00:00-08:00",
             "benchmarks": [{"ticker": "SOXX", "price": 102}, {"ticker": "SMH", "price": 104}],
             "scores": [
                 {"ticker": "AAA", "companyId": "aaa", "market": {"priceUsd": 110}},
@@ -435,19 +473,25 @@ class AicsToolTests(unittest.TestCase):
             ],
         }
 
-        backtest = aics.historical_snapshot_backtest([start, end], basket_size=2, transaction_cost_bps=10)
+        backtest = aics.historical_snapshot_backtest([start, entry, end], basket_size=2, transaction_cost_bps=10)
         top = next(row for row in backtest["baskets"] if row["name"] == "Top Final Score")
 
-        self.assertEqual(backtest["status"], "available")
+        self.assertEqual(backtest["status"], "insufficient_history")
         self.assertEqual(backtest["evaluatedPairs"], 1)
         self.assertEqual(backtest["rules"]["transactionCostBps"], 10)
+        self.assertIn("t+1", backtest["rules"]["publicationLag"])
         self.assertEqual(top["latestMembers"], ["AAA", "CCC"])
         self.assertEqual(top["avgGrossReturnPct"], 7.5)
-        self.assertEqual(top["avgNetReturnPct"], 7.4)
+        self.assertEqual(top["avgNetReturnPct"], 7.39)
         self.assertGreater(top["avgExcessVsUniversePct"], 0)
-        self.assertEqual(top["avgExcessVsSOXXPct"], 5.4)
-        self.assertEqual(top["avgExcessVsSMHPct"], 3.4)
+        self.assertEqual(top["avgExcessVsSOXXPct"], 5.39)
+        self.assertEqual(top["avgExcessVsSMHPct"], 3.39)
+        self.assertEqual(top["samples"][0]["tradedNotionalPct"], 100.0)
         self.assertIn("latestRegionExposure", top)
+        self.assertEqual(top["statisticsStatus"], "insufficient_history")
+        self.assertIsNone(top["cagrPct"])
+        self.assertIsNone(top["sharpe"])
+        self.assertIsNone(top["hitRatePct"])
 
     def test_historical_snapshot_backtest_adds_calendar_rebalance_modes(self):
         def snap(iso, prices, bench):
@@ -493,13 +537,120 @@ class AicsToolTests(unittest.TestCase):
 
         self.assertEqual(monthly["selectedPeriods"], ["2026-01", "2026-02", "2026-04", "2026-07"])
         self.assertEqual(quarterly["selectedPeriods"], ["2026-Q1", "2026-Q2", "2026-Q3"])
-        self.assertEqual(monthly["evaluatedPairs"], 3)
-        self.assertEqual(quarterly["evaluatedPairs"], 2)
-        self.assertEqual(monthly["rules"]["rebalance"], "first saved snapshot per monthly calendar period")
+        self.assertEqual(monthly["evaluatedPairs"], 2)
+        self.assertEqual(quarterly["evaluatedPairs"], 1)
+        self.assertEqual(monthly["rules"]["rebalance"], "first saved signal snapshot per monthly calendar period with one selected-period execution lag")
         self.assertGreater(monthly_top["rebalanceCount"], 0)
         self.assertGreater(quarterly_top["rebalanceCount"], 0)
         self.assertIsNotNone(monthly_top["avgNetReturnPct"])
         self.assertIsNotNone(quarterly_top["avgExcessVsSOXXPct"])
+
+    def test_historical_factor_profile_is_average_not_latest_sample(self):
+        def snap(iso, aaa_score, bbb_score, aaa_risk, bbb_risk, aaa_price, bbb_price):
+            return {
+                "generatedAt": iso,
+                "scores": [
+                    {
+                        "ticker": "AAA",
+                        "finalInvestmentScore": aaa_score,
+                        "riskScore": aaa_risk,
+                        "market": {"priceUsd": aaa_price},
+                    },
+                    {
+                        "ticker": "BBB",
+                        "finalInvestmentScore": bbb_score,
+                        "riskScore": bbb_risk,
+                        "market": {"priceUsd": bbb_price},
+                    },
+                ],
+            }
+
+        snapshots = [
+            snap("2026-01-02T09:00:00-08:00", 90, 80, 60, 40, 100, 100),
+            snap("2026-02-02T09:00:00-08:00", 70, 50, 80, 60, 105, 98),
+            snap("2026-03-02T09:00:00-08:00", 65, 45, 70, 50, 110, 96),
+            snap("2026-04-02T09:00:00-07:00", 60, 40, 65, 45, 115, 94),
+        ]
+
+        result = aics.historical_snapshot_backtest(snapshots, basket_size=2)
+        top = next(row for row in result["baskets"] if row["name"] == "Top Final Score")
+
+        # Sample start profiles are 85/50 and 60/70 for final/risk.
+        self.assertEqual(top["avgStartFactorProfile"]["finalInvestmentScore"], 72.5)
+        self.assertEqual(top["avgStartFactorProfile"]["riskScore"], 60.0)
+        self.assertEqual(top["latestStartFactorProfile"]["finalInvestmentScore"], 60.0)
+        self.assertNotEqual(top["avgStartFactorProfile"], top["latestStartFactorProfile"])
+
+    def test_two_snapshots_cannot_manufacture_same_close_validation(self):
+        snapshots = [
+            {
+                "generatedAt": "2026-01-01T09:00:00-08:00",
+                "scores": [
+                    {"ticker": "AAA", "finalInvestmentScore": 90, "market": {"priceUsd": 100}},
+                    {"ticker": "BBB", "finalInvestmentScore": 80, "market": {"priceUsd": 100}},
+                ],
+            },
+            {
+                "generatedAt": "2026-02-01T09:00:00-08:00",
+                "scores": [
+                    {"ticker": "AAA", "market": {"priceUsd": 200}},
+                    {"ticker": "BBB", "market": {"priceUsd": 50}},
+                ],
+            },
+        ]
+        result = aics.historical_snapshot_backtest(snapshots, basket_size=2)
+        self.assertEqual(result["status"], "not_enough_price_snapshots")
+        self.assertEqual(result["evaluatedPairs"], 0)
+        self.assertEqual(result["possibleSignalEntryExitTriples"], 0)
+
+    def test_history_requires_full_usd_price_coverage(self):
+        signal = {
+            "generatedAt": "2026-01-01T09:00:00-08:00",
+            "scores": [
+                {"ticker": "AAA", "finalInvestmentScore": 90, "market": {"priceUsd": 100}},
+                {"ticker": "KRW", "finalInvestmentScore": 80, "market": {"price": 1000, "currency": "KRW"}},
+            ],
+        }
+        entry = {
+            "generatedAt": "2026-02-01T09:00:00-08:00",
+            "scores": [
+                {"ticker": "AAA", "market": {"priceUsd": 100}},
+                {"ticker": "KRW", "market": {"price": 1100, "currency": "KRW"}},
+            ],
+        }
+        end = {
+            "generatedAt": "2026-03-01T09:00:00-08:00",
+            "scores": [
+                {"ticker": "AAA", "market": {"priceUsd": 110}},
+                {"ticker": "KRW", "market": {"price": 1200, "currency": "KRW"}},
+            ],
+        }
+        result = aics.historical_snapshot_backtest([signal, entry, end], basket_size=2)
+        self.assertEqual(result["evaluatedPairs"], 0)
+        self.assertEqual(result["skippedPairs"], 1)
+        self.assertIn("non-USD local-price fallback is prohibited", result["rules"]["fx"])
+
+    def test_history_turnover_includes_equal_weight_drift_rebalance(self):
+        def snap(iso, a, b):
+            return {
+                "generatedAt": iso,
+                "scores": [
+                    {"ticker": "AAA", "finalInvestmentScore": 90, "market": {"priceUsd": a}},
+                    {"ticker": "BBB", "finalInvestmentScore": 80, "market": {"priceUsd": b}},
+                ],
+            }
+
+        snapshots = [
+            snap("2026-01-01T09:00:00-08:00", 100, 100),
+            snap("2026-02-01T09:00:00-08:00", 100, 100),
+            snap("2026-03-01T09:00:00-08:00", 150, 100),
+            snap("2026-04-01T09:00:00-07:00", 165, 110),
+        ]
+        result = aics.historical_snapshot_backtest(snapshots, basket_size=2, transaction_cost_bps=10)
+        top = next(row for row in result["baskets"] if row["name"] == "Top Final Score")
+        self.assertEqual(top["rebalanceCount"], 2)
+        self.assertGreater(top["samples"][1]["tradedNotionalPct"], 0)
+        self.assertGreater(top["samples"][1]["transactionCostPct"], 0)
 
     def test_compact_snapshot_persists_benchmarks(self):
         snapshot = aics.compact_score_snapshot(
@@ -511,6 +662,58 @@ class AicsToolTests(unittest.TestCase):
 
         self.assertEqual(snapshot["benchmarks"][0]["ticker"], "SOXX")
         self.assertEqual(snapshot["scores"][0]["market"]["priceUsd"], 12.5)
+
+    def test_history_replaces_same_market_date_instead_of_creating_fake_pair(self):
+        def doc(generated_at, price):
+            return {
+                "generatedAt": generated_at,
+                "marketDataAsOf": "2026-07-09",
+                "benchmarkSnapshot": [],
+                "scores": [{"ticker": "AAA", "companyId": "aaa", "market": {"priceUsd": price}}],
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "history.jsonl"
+            aics.append_history(path, doc("2026-07-09T10:00:00-07:00", 100))
+            aics.append_history(path, doc("2026-07-09T14:00:00-07:00", 101))
+            rows = aics.read_history_snapshots(path)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["generatedAt"], "2026-07-09T14:00:00-07:00")
+        self.assertEqual(rows[0]["scores"][0]["market"]["priceUsd"], 101)
+
+        current = aics.compact_score_snapshot(
+            "2026-07-09T15:00:00-07:00", "2026-07-09",
+            [{"ticker": "AAA", "companyId": "aaa", "market": {"priceUsd": 102}}], [])
+        ordered = aics.ordered_backtest_snapshots(rows, current)
+        self.assertEqual(len(ordered), 1)
+        self.assertEqual(ordered[0]["scores"][0]["market"]["priceUsd"], 102)
+
+    def test_history_rejects_market_date_after_local_generation_date(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "history.jsonl"
+            path.write_text(json.dumps({
+                "generatedAt": "2026-07-09T17:00:00-07:00",
+                "marketDataAsOf": "2026-07-10",
+                "scores": [{"ticker": "AAA", "market": {"priceUsd": 100}}],
+            }) + "\n", encoding="utf-8")
+
+            self.assertEqual(aics.read_history_snapshots(path), [])
+
+    def test_history_rejects_naive_generation_timestamp(self):
+        self.assertIsNone(aics.parse_snapshot_time({"generatedAt": "2026-07-09T17:00:00"}))
+
+    def test_structural_only_run_is_not_appended_as_history(self):
+        doc = {
+            "generatedAt": "2026-07-09T15:00:00-07:00",
+            "marketDataAsOf": None,
+            "benchmarkSnapshot": [],
+            "scores": [{"ticker": "AAA", "companyId": "aaa", "market": {"priceUsd": None}}],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "history.jsonl"
+            aics.append_history(path, doc)
+            self.assertFalse(path.exists())
 
     def test_generate_py_has_aics_route_and_loader(self):
         text = (ROOT / "generate.py").read_text(encoding="utf-8")

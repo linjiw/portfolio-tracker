@@ -25,7 +25,9 @@ warnings.filterwarnings("ignore")
 import sys
 import json
 import datetime
+import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
@@ -36,8 +38,10 @@ INTERVALS = [
     ("15m", "5d"),
     ("30m", "1mo"),
 ]
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
 
 LOG_FILE = Path(__file__).parent.parent / "output" / "qqq_intraday_log.jsonl"
+ET = ZoneInfo("America/New_York")
 
 # Telegram notifier is best-effort: if config missing or network down, monitor still prints to stdout
 sys.path.insert(0, str(Path(__file__).parent))
@@ -45,6 +49,13 @@ try:
     from telegram_notifier import send_message as _tg_send
 except Exception:
     _tg_send = None
+try:
+    from scripts.intraday_tape_sensor import market_session as _market_session
+except Exception:
+    try:
+        from intraday_tape_sensor import market_session as _market_session
+    except Exception:
+        _market_session = None
 
 
 def vwap(df):
@@ -60,12 +71,37 @@ def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
 
-def analyze_timeframe(df, label):
+def closed_dataframe(df, label, now=None):
+    """Normalize to New York time and remove the provider's forming candle."""
+    if df is None or df.empty:
+        return df
+    current = (now or datetime.datetime.now(ET)).astimezone(ET)
+    normalized = df.copy()
+    if normalized.index.tz is None:
+        normalized.index = normalized.index.tz_localize(ET)
+    else:
+        normalized.index = normalized.index.tz_convert(ET)
+    started = normalized.index[-1].to_pydatetime()
+    ended = started + datetime.timedelta(minutes=INTERVAL_MINUTES[label])
+    if current < ended + datetime.timedelta(seconds=30):
+        normalized = normalized.iloc[:-1]
+    return normalized
+
+
+def analyze_timeframe(df, label, now=None):
     """Return dict of stability metrics for one timeframe."""
     if df is None or len(df) < 10:
         return {"label": label, "ok": False, "reason": f"not enough bars ({len(df) if df is not None else 0})"}
 
+    current = (now or datetime.datetime.now(ET)).astimezone(ET)
     today = df.index[-1].date()
+    if today != current.date():
+        return {"label": label, "ok": False, "reason": "latest closed bar is not from the current ET session"}
+    ended = df.index[-1].to_pydatetime() + datetime.timedelta(minutes=INTERVAL_MINUTES[label])
+    age_minutes = (current - ended).total_seconds() / 60.0
+    max_age = INTERVAL_MINUTES[label] * 2 + 5
+    if age_minutes < -2 or age_minutes > max_age:
+        return {"label": label, "ok": False, "reason": f"latest closed bar stale/future ({age_minutes:.1f}m)"}
     today_df = df[df.index.date == today]
     if len(today_df) < 3:
         return {"label": label, "ok": False, "reason": "not enough today bars"}
@@ -255,9 +291,15 @@ def overall_verdict(results):
 
 
 def main():
-    now_et = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-4)))
-    is_open = now_et.weekday() < 5 and (9 * 60 + 30) <= (now_et.hour * 60 + now_et.minute) <= (16 * 60)
-    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    now_et = datetime.datetime.now(ET)
+    session = _market_session(now_et.date()) if _market_session else {
+        "open": now_et.weekday() < 5,
+        "openAt": now_et.replace(hour=9, minute=30, second=0, microsecond=0).isoformat(),
+        "closeAt": now_et.replace(hour=16, minute=0, second=0, microsecond=0).isoformat(),
+    }
+    market_open = datetime.datetime.fromisoformat(session["openAt"]) if session.get("openAt") else None
+    market_close = datetime.datetime.fromisoformat(session["closeAt"]) if session.get("closeAt") else None
+    is_open = bool(session.get("open") and market_open <= now_et <= market_close)
     mins_to_close = max(0, int((market_close - now_et).total_seconds() / 60)) if is_open else None
 
     print(f"\n— QQQ 重心监控 · {now_et.strftime('%Y-%m-%d %H:%M ET')} · 市场 {'开盘' if is_open else '休市'}", end="")
@@ -270,25 +312,34 @@ def main():
     for interval, period in INTERVALS:
         try:
             df = t.history(period=period, interval=interval, prepost=False)
-            r = analyze_timeframe(df, interval)
+            df = closed_dataframe(df, interval, now=now_et)
+            r = analyze_timeframe(df, interval, now=now_et)
         except Exception as e:
             r = {"label": interval, "ok": False, "reason": f"fetch error: {type(e).__name__}: {e}"}
         results.append(r)
         print(fmt_section(r))
 
     overall, note = overall_verdict(results)
+    by_label = {row.get("label"): row for row in results}
+    evidence_fresh = all((by_label.get(label) or {}).get("ok") for label in ("5m", "15m"))
+    if not evidence_fresh:
+        overall, note = "UNCLEAR", "5m/15m current-session closed-bar evidence missing or stale"
     print(f"\n  综合：{overall}  ·  {note}")
 
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    LOG_FILE.parent.chmod(0o700)
     log_row = {
         "ts": now_et.isoformat(timespec="seconds"),
         "market_open": is_open,
         "mins_to_close": mins_to_close,
         "overall": overall,
+        "closed_bar_evidence_fresh": evidence_fresh,
         "by_tf": [{k: r.get(k) for k in ("label", "verdict", "last", "vwap", "above_vwap", "bars_since_day_low", "higher_lows", "lower_highs", "lower_lows", "range_contracting", "drift_up")} for r in results],
     }
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(log_row, ensure_ascii=False) + "\n")
+    fd = os.open(LOG_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_row, ensure_ascii=False, allow_nan=False) + "\n")
+    LOG_FILE.chmod(0o600)
 
     print(f"\n  · 完整快照写入 {LOG_FILE.name}\n")
     print("  ⚠ 技术观察 · 非投资建议 · 重心稳住 ≠ 必须进场，仍需结合你自己的计划与仓位规则。")
@@ -297,9 +348,11 @@ def main():
     #   - market open      → push every tick (intraday monitoring)
     #   - market just closed (within 20 min of 16:00 ET) → push closing tick + daily summary
     #   - market closed for hours/weekend → silent (launchd will still fire 24/7; we just don't spam)
-    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    just_closed = (not is_open) and now_et.weekday() < 5 and 0 <= (now_et - market_close).total_seconds() < 20 * 60
-    push_telegram = (is_open or just_closed) and _tg_send is not None
+    just_closed = bool(
+        session.get("open") and market_close and not is_open
+        and 0 <= (now_et - market_close).total_seconds() < 20 * 60
+    )
+    push_telegram = (is_open or just_closed) and evidence_fresh and _tg_send is not None
     if push_telegram:
         try:
             tg_msg = fmt_telegram(now_et, is_open, mins_to_close, results, overall, note)
