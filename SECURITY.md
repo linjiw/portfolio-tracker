@@ -28,13 +28,27 @@ The dashboard and sync-log objects contain private portfolio-derived fields. Som
 historical commits were still addressable on the public GitHub repository at audit time.
 
 Do not paste object IDs or artifact contents into public issues. History removal is a coordinated,
-destructive incident-response operation; it is intentionally not performed by normal review or
-automation.
+destructive incident-response operation and must not be run by unattended automation.
+
+### July 2026 remediation status
+
+With explicit owner authorization to keep the repository public, the affected detached lineage
+was rewritten in an isolated clone to remove `output/`. The sanitized legacy branch was published;
+all current public branch heads were then verified to contain no tracked `output/` path. The rewrite
+preserved every non-output blob byte-for-byte. An encrypted local recovery bundle was verified
+before the rewrite, and an all-object Gitleaks scan found no real credential exposure. GitHub secret
+scanning, push protection, and Dependabot security updates were enabled.
+
+Git ref cleanup does not delete cached dangling objects. At the post-rewrite check, 32 old detached
+commit IDs still resolved through the GitHub API. The incident therefore remains open until GitHub
+Support purges those cached objects and the old IDs stop resolving. Public visibility was retained
+at the owner's direction, so do not treat the ref cleanup as retroactive confidentiality.
 
 ### Safe remediation procedure
 
-1. Temporarily make the remote private and pause pushes. Notify every collaborator; do not let
-   anyone merge an old clone after cleanup.
+1. Prefer making the remote private and pause pushes. Notify every collaborator; do not let anyone
+   merge an old clone after cleanup. If the owner elects to remain public, record that exception and
+   the continuing cache/clone risk explicitly.
 2. Make an encrypted, offline mirror backup for recovery and legal/audit needs.
 3. In a new disposable mirror clone, inventory every branch, tag, pull-request ref, and historical
    private path. Run a secret scanner over all objects. Assess whether any API token, account
@@ -50,13 +64,13 @@ automation.
    re-clone; do not rebase or merge pre-cleanup clones.
 7. Ask GitHub Support to purge cached views, pull-request refs, and dangling sensitive objects.
    Rewriting reachable refs alone does not erase forks, clones, caches, or already downloaded data.
-8. Keep the repository private until direct historical object URLs no longer resolve and the
-   post-remediation scan is clean. Record the incident and rotation decisions without recording
+8. Prefer keeping the repository private until direct historical object URLs no longer resolve and
+   the post-remediation scan is clean. Record the incident and rotation decisions without recording
    the sensitive values themselves.
 
-No recognizable committed API token or private-key signature was found in the current-tree scan
-performed with this audit. That result does not replace an all-object secret scanner during the
-history-remediation procedure.
+No recognizable committed API token or private-key signature was found in either the current-tree
+or all-object scan. One declarative UI metadata identifier was reviewed as a Gitleaks false positive
+and is suppressed by its exact fingerprint rather than a broad rule exclusion.
 
 ## Dependency integrity
 
