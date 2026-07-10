@@ -2267,6 +2267,25 @@ def load_financial_status(out_dir):
         return None
 
 
+def load_memory_flow(out_dir):
+    """Optional Korean/U.S. memory-flow and market-structure research layer."""
+    path = os.path.join(out_dir, "memory_flow.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("schemaVersion") != 1 \
+                or not isinstance(payload.get("symbols"), dict) \
+                or not isinstance(payload.get("hypotheses"), list) \
+                or not isinstance(payload.get("decisionGrade"), bool):
+            raise ValueError("invalid memory-flow schema")
+        return payload
+    except (AttributeError, ValueError, OSError) as e:
+        print(f"  (skipped memory_flow.json: {e})")
+        return None
+
+
 def render_html(payload):
     DATA = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     tpl = HTML_TEMPLATE.replace("__DATA__", DATA)
@@ -3182,14 +3201,14 @@ document.getElementById('kpis').innerHTML=
 let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
 const DEFAULT_SEG={ov:'score',stk:'price'};
-const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
-const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
+const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
+const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', memflow:'存储资金流', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
 function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
 // Two-level portfolio nav: 5 themed workspaces (level 1) over the seg sub-rail (level 2).
 // Routing is untouched — hash stays #/portfolio/<seg>; the workspace is derived FROM the seg.
 const WS_MAP=[
  {id:'today', label:'今日决策', segs:['score','decide','qt','mass']},
- {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch']},
+ {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch','memflow']},
  {id:'perf',  label:'净值·表现', segs:['nw','cmp','mom','pfib','sig']},
  {id:'risk',  label:'风险·结构', segs:['risk','struct']},
  {id:'plan',  label:'行为·计划', segs:['beh','journal','rebal']},
@@ -4854,6 +4873,30 @@ function momentumTop3Tab(){
  const disc=D.disclaimer||"Survivorship bias: universe is today's index membership; decision support only.";
  return `<div class="card t1"><div class="dh"><h2 class="t">动量 Top-3 策略舱<span class="t-en">MOMENTUM</span></h2><span class="nm">window ${mtEsc(w.start||'—')} → ${mtEsc(w.end||'—')} · universe ${D.universe_size??'—'} · cost ${cost} · generated ${(D.generated_at||'').replace('T',' ')}</span></div><div class="note" style="line-height:1.7">${mtEsc(disc)} This page is embedded from the same artifact as the standalone Momentum Top-3 view and updates when <b>scripts/momentum_top3.py</b> refreshes prices and signals.</div></div>${mtEquityChart(D)}${mtLivePlanCard(D)}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">${cards}</div>${mtCompareTable(D)}`;
 }
+function mfEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function mfNum(v,d=0){if(v==null||v==='')return'—';v=Number(v);return Number.isFinite(v)?v.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';}
+function mfSigned(v,d=0,s=''){if(v==null||v==='')return'—';v=Number(v);return Number.isFinite(v)?`${v>0?'+':''}${mfNum(v,d)}${s}`:'—';}
+function mfTone(v){return {SUPPORTED:'#4FB286',MIXED:'#E8B339',REJECTED:'#E5707A',UNKNOWN:'#888D96',ALLOW_REVIEW:'#4FB286',WATCH:'#E8B339',BLOCK:'#E5707A'}[v]||'#888D96';}
+function mfChip(v){const c=mfTone(v);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${mfEsc(v||'—')}</span>`;}
+function memoryFlowCard(){
+ const D=DATA.memoryFlow;
+ if(!D||!D.symbols)return `<div class="card t1"><div class="dh"><h2 class="t">存储资金流<span class="t-en">FLOW</span></h2><span class="nm">artifact missing</span></div><div class="note" style="line-height:1.8">运行 <b>python3 scripts/memory_flow.py</b> 后重新生成 Dashboard。工具不会把价格形态伪装成做市商库存。</div></div>`;
+ const S=D.symbols||{},H=D.hypotheses||[],L=((D.groups||{}).skHynixLeverage||{}),M=L.marketMargin||{};
+ const hy=S['000660.KS']||{},ks=hy.krxShort||{},loan=hy.securitiesLending||{},flow=hy.investorFlow||{};
+ const P=((D.crossMarket||{}).skHynixAdrParity||{}),F=D.dataFreshness||{};
+ const hypotheses=H.map(h=>`<div class="badge"><div class="l">${mfEsc(h.claim||h.id)}</div><div class="v" style="font-size:17px;color:${mfTone(h.verdict)}">${mfEsc(h.verdict||'UNKNOWN')}</div><div class="note" style="line-height:1.5">支持：${mfEsc((h.supportingEvidence||[])[0]||'暂无决定性支持')}<br>反证：${mfEsc((h.counterEvidence||[])[0]||'暂无')}</div></div>`).join('');
+ const rows=Object.values(S).filter(r=>r.decisionSymbol).map(r=>{const t=r.technical||{},a=r.action||{},sc=r.scores||{},fr=r.finraShortVolume||{},k=r.krxShort||{};return `<tr><td class="l"><b>${mfEsc(r.symbol)}</b><br><span class="note">${mfEsc(r.subsector||'')}</span></td><td>${mfEsc(r.regime||'—')}</td><td>${mfNum(t.close,2)}</td><td class="${cls(t.ret5dPct)}">${mfSigned(t.ret5dPct,1,'%')}</td><td class="${cls(t.vsEma21Pct)}">${mfSigned(t.vsEma21Pct,1,'%')}</td><td>${mfNum(t.latestCloseLocation,2)}</td><td>${mfNum(sc.washoutPainScore,0)} / ${mfNum(sc.absorptionScore,0)} / ${mfNum(sc.distributionRiskScore,0)}</td><td>${k.latestShortTransactionPct!=null?`KRX ${mfNum(k.latestShortTransactionPct,2)}%`:(fr.latestPct!=null?`FINRA ${mfNum(fr.latestPct,1)}% · z ${mfSigned(fr.latestZ20,2)}`:'—')}</td><td>${mfChip(a.label)}</td></tr>`;}).join('');
+ const flowRows=['1d','5d','20d'].map(w=>{const x=flow[w]||{};return `<tr><td>${w.toUpperCase()}</td><td>${mfSigned(x.institutionNetShares,0)}</td><td>${mfSigned(x.foreignNetShares,0)}</td><td>${mfSigned(x.individualOtherResidualNetShares,0)}</td></tr>`;}).join('');
+ const levels=((hy.technical||{}).levels||{}),levelRows=[['失效 / 20D低点','invalidation20dLow'],['近端支撑 / 5D低点','support5d'],['第一修复 / EMA8','reclaimEma8'],['趋势确认 / EMA21','confirmEma21'],['第一供给 / 5D高点','firstSupply5dHigh'],['伸展供给 / 20D高点','stretchSupply20dHigh']].map(x=>`<tr><td class="l">${x[0]}</td><td>${mfNum(levels[x[1]],0)} KRW</td></tr>`).join('');
+ const gaps=(D.dataGaps||[]).map(g=>`<li><b>${mfEsc(g.id)}</b>：${mfEsc(g.gap||'')}</li>`).join('');
+ return `<div class="card t1"><div class="dh"><h2 class="t">存储资金流<span class="t-en">FLOW</span></h2><span class="nm">US ${mfEsc(D.asOf||'—')} · Korea ${mfEsc(((F.price||{}).koreaClosedAsOf)||'—')} · research-only</span></div><div class="note" style="line-height:1.7;margin-bottom:10px"><b>读法：</b>真实资金分类 → 市场机制 → 行为推断。公开数据看不到做市商净库存、客户方向或意图。</div><div class="badges">${hypotheses}</div></div>
+ <div class="card"><div class="dh"><h2 class="t">杠杆清洗审计<span class="t-en">KOFIA</span></h2><span class="nm">official market balances + 3 SK hynix 2x proxies</span></div><div class="badges"><div class="badge"><div class="l">2x距20D高点</div><div class="v neg">${mfSigned(L.averageDrawdownFrom20dHighPct,1,'%')}</div></div><div class="badge"><div class="l">2x个人/其他残差 5D</div><div class="v ${cls(L.individualOtherResidual5dShares)}">${mfSigned(L.individualOtherResidual5dShares,0)}</div></div><div class="badge"><div class="l">融资余额</div><div class="v">₩${mfNum(M.totalMarginCreditTrillionKrw,3)}tn</div><div class="note">距峰 ${mfSigned(M.totalMarginCreditFrom30dPeakPct,2,'%')}</div></div><div class="badge"><div class="l">客户预托金</div><div class="v">₩${mfNum(M.customerDepositsTrillionKrw,3)}tn</div><div class="note">融资/预托金 ${mfNum(M.marginCreditToCustomerDepositsPct,2)}%</div></div><div class="badge"><div class="l">出清确认</div><div class="v" style="color:${L.positionClearingConfirmed?'#4FB286':'#E5707A'}">${L.positionClearingConfirmed?'YES':'NO'}</div></div></div></div>
+ <div class="card"><div class="dh"><h2 class="t">成交卖空 ≠ 净空 ≠ 借券<span class="t-en">KRX / KSD</span></h2></div><div class="badges"><div class="badge"><div class="l">卖空成交占比</div><div class="v">${mfNum(ks.latestShortTransactionPct,2)}%</div><div class="note">z ${mfSigned(ks.latestZ20,2)}</div></div><div class="badge"><div class="l">需申报净空</div><div class="v">${mfNum(ks.reportedNetShortBalanceShares,0)}</div><div class="note">${mfNum(ks.reportedNetShortBalancePctOutstanding,4)}% issued · T+2</div></div><div class="badge"><div class="l">KSD借券余额</div><div class="v">${mfNum(loan.loanBalanceShares,0)}</div><div class="note">${mfNum(loan.loanBalancePctOutstanding,3)}% issued · 20D ${mfSigned(loan.loanBalance20dChangePct,2,'%')}</div></div><div class="badge"><div class="l">方向</div><div class="v" style="color:#E8B339">UNKNOWN</div><div class="note">借券还可用于做市、套利、交割与套保</div></div></div></div>
+ <div class="card"><div class="dh"><h2 class="t">个股压力表<span class="t-en">TAPE</span></h2><span class="nm">closed bars only</span></div><div class="scroll"><table><thead><tr><th class="l">标的</th><th>Regime</th><th>Close</th><th>5D</th><th>vs EMA21</th><th>CLV</th><th>Wash / Absorb / Distrib</th><th>Short-volume</th><th>Gate</th></tr></thead><tbody>${rows}</tbody></table></div><div class="note" style="margin-top:8px"><b>手机端可横滑查看全部列。</b> short-volume 不是 short interest；期权 OI 没有 dealer/customer 符号。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">SK hynix 投资者分类<span class="t-en">KRX-DERIVED</span></h2><span class="nm">${mfEsc(flow.asOf||'unavailable')} · secondary</span></div><div class="scroll"><table><thead><tr><th>窗口</th><th>机构净股数</th><th>外资净股数</th><th>个人/其他残差</th></tr></thead><tbody>${flowRows}</tbody></table></div><div class="note" style="margin-top:8px">外资持股 ${mfNum(flow.foreignOwnershipPct,2)}% · 20D ${mfSigned(flow.foreignOwnershipChange20dPp,2,'pp')}。残差不是券商标记的纯散户流。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">SKHYV / SKHY 发行锚<span class="t-en">ADR</span></h2><span class="nm">10 ADS = 1 common</span></div><div class="badges"><div class="badge"><div class="l">发行价</div><div class="v">$${mfNum(P.offerPriceUsd,2)}</div></div><div class="badge"><div class="l">隐含韩国原股</div><div class="v">₩${mfNum(P.offerImpliedLocalKrw,0)}</div></div><div class="badge"><div class="l">非同步溢价</div><div class="v ${cls(P.offerPremiumDiscountPct)}">${mfSigned(P.offerPremiumDiscountPct,2,'%')}</div></div><div class="badge"><div class="l">新增股份 / 发行前</div><div class="v">${mfNum(P.newSharesPctPreOffering,2)}%</div></div></div><div class="note" style="margin-top:8px;line-height:1.6">${mfEsc(P.conversionCaveat||'')}<br>${mfEsc(P.bookIndicationsCaveat||'')}<br>${mfEsc(P.stabilizationCaveat||'')}</div></div>
+ <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px"><div class="card"><div class="dh"><h2 class="t">海力士价格阶梯</h2><span class="nm">zones, not a top forecast</span></div><div class="scroll"><table><tbody>${levelRows}</tbody></table></div></div><div class="card"><div class="dh"><h2 class="t">决定性数据缺口</h2><span class="nm">${(D.dataGaps||[]).length} gaps</span></div><ul class="note" style="line-height:1.7;margin:0;padding-left:18px">${gaps||'<li>None reported.</li>'}</ul></div></div>`;
+}
 const PANEL_RENDERERS_OV={
  score: ()=>scorecardCard(),
  decide:()=>decisionLabCard(),
@@ -4861,6 +4904,7 @@ const PANEL_RENDERERS_OV={
  aisemi:()=>aiSemiQuantCard(),
  aics:()=>aicsToolTab(),
  aiwatch:()=>aiWatchlistCard(),
+ memflow:()=>memoryFlowCard(),
  qt:    ()=>qqqTqqqTab(),
  mass:  ()=>marketMassTab(),
  mom:   ()=>momentumTop3Tab(),
@@ -4919,13 +4963,13 @@ function renderOverview(){
  const _ob=document.getElementById('onboard-slot');if(_ob)_ob.innerHTML=onboardStrip();   // onboarding lives below the ledger, out of the hero zone
  // Render skeleton: viewbar + seg-rail + empty seg panels. ensureOvPanel() populates each on first activate.
  // activeSeg from URL is rendered eagerly so the initial paint has actual content.
- const segs=['score','decide','fin','aisemi','aics','aiwatch','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
+ const segs=['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
  const _ls=lastSeg('ov');const initialSeg=segs.indexOf(_ls)>=0?_ls:DEFAULT_SEG.ov;   // validate stale/invalid localStorage seg so .on/syncWs/panelMarkup all agree
  const _segin=document.body.classList.contains('done')?' segin':'';   // post-load renders settle; initial load keeps the stagger
  const panelMarkup=segs.map(s=>`<div class="seg${s===initialSeg?_segin:''}" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
  <nav aria-label="工作区" class="ws-rail-wrap"><div class="ws-rail"><span class="rail-here">组合总览</span>${WS_MAP.map(w=>`<button data-ws="${w.id}" title="${w.segs.map(s=>segLabel(s,'ov')).join(' · ')}" onclick="wsGo('${w.id}')">${w.label}</button>`).join('')}</div></nav>
- <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
+ <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="memflow" title="韩国与美国存储股的投资者流向、杠杆清洗和做市商情景">存储资金流</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设定的区间">再平衡计划</button></div></nav>
  ${panelMarkup}`;
  // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
  ensureOvPanel(initialSeg);
@@ -5910,6 +5954,7 @@ def main():
     payload["marketMass"] = load_market_mass_dashboard(os.path.dirname(args.out))
     payload["momentumTop3"] = load_momentum_top3(os.path.dirname(args.out))
     payload["financialStatus"] = load_financial_status(os.path.dirname(args.out))
+    payload["memoryFlow"] = load_memory_flow(os.path.dirname(args.out))
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(render_html(payload))
     s = payload["summary"]

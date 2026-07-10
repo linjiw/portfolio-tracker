@@ -19,6 +19,10 @@ Those files are local runtime data and are ignored by Git.
 - Market-mass / center-of-gravity boundary research and option-spread backtests.
 - AI semiconductor, AI watchlist, AICS, and financial-status scoring artifacts
   that can be embedded into the dashboard when generated locally.
+- Korean/U.S. memory-market flow research with KOFIA leverage balances, KRX
+  investor and short-sale evidence, KSD securities lending, U.S. retail/short
+  proxies, ADR parity, explicit hypothesis falsification, and fail-closed
+  dealer scenarios.
 
 This is research and analytics software, not financial advice.
 
@@ -89,6 +93,9 @@ python3 generate.py [options]
   --mark-to-market       revalue held stocks from latest Yahoo prices
 
 python3 scripts/financial_status_score.py --dashboard output/portfolio_dashboard.html
+python3 scripts/memory_flow.py
+  # Writes output/memory_flow.json and memory_flow_report.md; use --no-fetch
+  # to rebuild from the last private cache.
 python3 scripts/market_mass_boundaries.py --price-ticker QQQ --period 5y --interval 1d --calibrate
 python3 scripts/options_credit_spread_backtest.py --price-ticker QQQ --period 5y --lookback 126 --side-mode adaptive
 python3 scripts/ai_watchlist_score.py
