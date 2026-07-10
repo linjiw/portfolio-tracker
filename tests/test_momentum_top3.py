@@ -68,10 +68,35 @@ def test_asof_price_uses_last_close_on_or_before_calendar_anchor():
     assert anchor["AAA"] == 100
 
 
+def test_asof_price_is_per_security_and_rejects_stale_anchor():
+    index = pd.to_datetime(["2025-01-29", "2025-01-30", "2025-01-31", "2025-03-02"])
+    prices = pd.DataFrame(
+        {
+            "AAA": [90.0, 100.0, np.nan, 130.0],
+            "BBB": [80.0, np.nan, np.nan, 120.0],
+            "MKT": [100.0, 100.0, 100.0, 100.0],
+        },
+        index=index,
+    )
+
+    anchor = mt.asof_price(prices, 1, max_staleness_sessions=1)
+
+    # The calendar anchor is 2025-02-02. AAA can use its own Jan-30 close,
+    # one market session behind Jan-31; BBB's Jan-29 close is too stale.
+    assert anchor["AAA"] == 100.0
+    assert pd.isna(anchor["BBB"])
+
+
 def test_valid_columns_drops_sparse(toy_px):
     px = toy_px.copy()
     px.iloc[-200:, px.columns.get_loc("BBB")] = np.nan
     assert "BBB" not in mt.valid_columns(px)
+
+
+def test_valid_columns_uses_ceiling_not_floor_for_coverage():
+    index = pd.bdate_range("2026-01-02", periods=3)
+    prices = pd.DataFrame({"AAA": [100.0, 101.0, np.nan]}, index=index)
+    assert "AAA" not in mt.valid_columns(prices, months=13, coverage=0.95)
 
 
 def test_backtest_no_lookahead_and_costs(toy_px):
@@ -161,6 +186,28 @@ def test_initial_anchor_makes_first_fill_cost_visible_in_drawdown(monkeypatch):
     assert metrics["max_dd_pct"] == pytest.approx(-10.0)
 
 
+def test_midmonth_anchor_inherits_the_already_active_book(monkeypatch):
+    idx = pd.bdate_range("2024-11-01", "2025-03-10")
+    start = pd.Timestamp("2025-01-15")
+    aaa = pd.Series(100.0, index=idx)
+    aaa.loc[idx > start] = np.linspace(101.0, 125.0, int((idx > start).sum()))
+    px = pd.DataFrame({"AAA": aaa, "BBB": 100.0}, index=idx)
+    monkeypatch.setattr(
+        mt, "momentum_scores", lambda *_args, **_kwargs: pd.Series({"AAA": 1.0, "BBB": 0.0})
+    )
+
+    eq, _, audit = mt.run_backtest(
+        px, 1, 1, start, idx[-1], 0.0, return_diagnostics=True,
+    )
+
+    assert audit["warmStartUsed"] is True
+    assert audit["warmStartMonths"] == 2
+    assert audit["inheritedWeights"] == {"AAA": pytest.approx(1.0)}
+    assert eq.index[0] == start
+    assert eq.iloc[0] == pytest.approx(1.0)
+    assert eq.iloc[1] > 1.0  # no cash wait until the next month-end
+
+
 def test_held_price_gap_catches_up_from_last_observed_close(monkeypatch):
     idx = pd.to_datetime([
         "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
@@ -186,7 +233,7 @@ def test_held_price_gap_catches_up_from_last_observed_close(monkeypatch):
     assert audit["unresolvedPriceGaps"] == []
 
 
-def test_unresolved_held_price_gap_truncates_invalid_evaluation_segment(monkeypatch):
+def test_unresolved_held_price_gap_blocks_metrics_without_truncating(monkeypatch):
     idx = pd.to_datetime([
         "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
     ])
@@ -200,22 +247,140 @@ def test_unresolved_held_price_gap_truncates_invalid_evaluation_segment(monkeypa
         px, 1, 1, idx[0], idx[-1], 0.0, return_diagnostics=True,
     )
 
-    assert eq.index[-1] == pd.Timestamp("2026-02-03")
-    assert audit["evaluationTruncatedBefore"] == "2026-02-04"
+    metrics = mt.perf_metrics(eq)
+
+    assert eq.index[-1] == pd.Timestamp("2026-02-05")
+    assert "evaluationTruncatedBefore" not in audit
     assert audit["unresolvedPriceGaps"][0]["symbol"] == "AAA"
+    assert audit["metricStatus"] == "BLOCK"
+    assert metrics["status"] == "BLOCK"
+    assert metrics["total_x"] is None
+
+
+def test_missing_fill_retries_on_the_next_session(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
+    ])
+    px = pd.DataFrame({
+        "AAA": [100.0, 100.0, np.nan, 110.0, 121.0],
+        "BBB": [100.0, 100.0, 100.0, 100.0, 100.0],
+    }, index=idx)
+    monkeypatch.setattr(mt, "momentum_scores", lambda *_a, **_k: pd.Series({"AAA": 1.0}))
+
+    eq, _, audit = mt.run_backtest(
+        px, 1, 1, idx[0], idx[-1], 0.0,
+        return_diagnostics=True, max_fill_retry_sessions=2,
+    )
+
+    assert audit["skippedFills"][0]["attemptDate"] == "2026-02-03"
+    assert audit["skippedFills"][0]["willRetry"] is True
+    assert audit["fills"][0]["fillDate"] == "2026-02-04"
+    assert audit["fills"][0]["retryCount"] == 1
+    assert audit["expiredPendingFills"] == []
+    assert eq.loc["2026-02-05"] == pytest.approx(1.1)
+
+
+def test_independent_trading_start_removes_when_issued_coverage():
+    idx = pd.bdate_range("2025-01-02", "2026-02-27")
+    prices = pd.DataFrame(
+        {
+            "SNDK": np.linspace(20.0, 400.0, len(idx)),
+            "AAA": np.linspace(100.0, 130.0, len(idx)),
+        },
+        index=idx,
+    )
+
+    unmasked = mt.momentum_scores(prices, 11, coverage=0.95)
+    regular_way = mt.momentum_scores(
+        prices,
+        11,
+        coverage=0.95,
+        independent_trading_start={"SNDK": "2025-02-24"},
+    )
+
+    assert "SNDK" in unmasked
+    assert "SNDK" not in regular_way
+
+
+def test_load_independent_trading_starts_reads_only_regular_way_dates(tmp_path):
+    registry = tmp_path / "events.json"
+    registry.write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "securities": {
+                "NEW": {"regularWayStart": "2025-02-24"},
+                "OLD": {"identityStatus": "VERIFIED"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert mt.load_independent_trading_starts(registry) == {
+        "NEW": "2025-02-24",
+    }
+
+
+def test_point_in_time_eligibility_and_action_masks_fail_closed():
+    idx = pd.bdate_range("2025-01-02", "2026-02-27")
+    prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100.0, 180.0, len(idx)),
+            "BBB": np.linspace(100.0, 120.0, len(idx)),
+        },
+        index=idx,
+    )
+    eligibility = pd.DataFrame(
+        {"AAA": [False], "BBB": [True]}, index=[pd.Timestamp("2025-01-01")]
+    )
+    actions = pd.DataFrame(
+        {"AAA": [True], "BBB": [True]}, index=[pd.Timestamp("2025-01-01")]
+    )
+
+    scores = mt.momentum_scores(
+        prices, 11, coverage=0.95,
+        eligibility_mask=eligibility, action_mask=actions,
+    )
+
+    assert list(scores.index) == ["BBB"]
+
+
+def test_held_security_action_mask_failure_blocks_metrics(monkeypatch):
+    idx = pd.to_datetime([
+        "2026-01-30", "2026-01-31", "2026-02-03", "2026-02-04", "2026-02-05",
+    ])
+    prices = pd.DataFrame({"AAA": 100.0, "BBB": 100.0}, index=idx)
+    monkeypatch.setattr(mt, "momentum_scores", lambda *_a, **_k: pd.Series({"AAA": 1.0}))
+
+    def validated(date, symbol):
+        return symbol != "AAA" or date <= pd.Timestamp("2026-02-03")
+
+    eq, _, audit = mt.run_backtest(
+        prices, 1, 1, idx[0], idx[-1], 0.0,
+        return_diagnostics=True, action_mask=validated,
+    )
+
+    assert audit["unresolvedCorporateActions"]
+    assert audit["metricStatus"] == "BLOCK"
+    assert mt.perf_metrics(eq)["status"] == "BLOCK"
 
 
 def test_perf_metrics_shape(toy_px):
     eq = toy_px["AAA"] / toy_px["AAA"].iloc[0]
     m = mt.perf_metrics(eq)
-    assert set(m) == {"total_x", "cagr_pct", "max_dd_pct", "sharpe"}
+    assert set(m) == {
+        "total_x", "cagr_pct", "max_dd_pct", "sharpe", "status", "block_reasons"
+    }
+    assert m["status"] == "PASS"
     assert m["total_x"] > 1 and m["max_dd_pct"] <= 0
 
 
 def test_config_and_payload_schema(toy_px, payload_px):
     cfg = json.loads((ROOT / "data" / "momentum_config.json").read_text())
+    assert cfg["backtest"]["years"] == 10
     assert [s["id"] for s in cfg["strategies"]] == [
-        "RET_11M_top3", "RET_9M_top3", "RET_5M_top5"]
+        "RET_11M_top3", "RET_9M_top3", "RET_11M_top5"]
+    assert [(s["lookback_months"], s["top_n"]) for s in cfg["strategies"] if s["id"] != "RET_9M_top3"] == [
+        (11, 3), (11, 5)
+    ]
     cfg = {**cfg, "backtest": {**cfg["backtest"], "years": 2}}
     payload = mt.build_payload(cfg, payload_px)
     assert {"generated_at", "window", "strategies", "benchmarks",
@@ -227,6 +392,7 @@ def test_config_and_payload_schema(toy_px, payload_px):
     assert "cumulative return" in payload["methodology"]["missingHeldClosePolicy"]
     assert "truncate" in payload["methodology"]["unresolvedHeldClosePolicy"]
     assert payload["methodology"]["currentUniverseSurvivorship"] is True
+    assert payload["universe_mode"] == "current_universe_survivor_biased"
     assert payload["methodology"]["inSampleStrategySelection"] is True
     assert payload["price_freshness"]["fresh_count"] == len(payload_px.columns)
     for s in payload["strategies"]:
@@ -234,6 +400,9 @@ def test_config_and_payload_schema(toy_px, payload_px):
         assert s["equity_weekly"], "equity curve must be non-empty"
         w = sum(h["weight_pct"] for h in s["current_signal"]["holdings"])
         assert w == pytest.approx(100.0, abs=0.2)
+        assert s["execution"]["anchor_date"] == payload["window"]["start"]
+        assert s["execution"]["warm_start_months"] == 2
+        assert s["metrics"]["status"] == "PASS"
 
 
 def test_current_signal_excludes_symbol_without_latest_close(payload_px):

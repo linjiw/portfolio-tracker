@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="动量策略公开研究站：仅展示经过严格脱敏的聚合研究数据。">
+  <title>动量研究公开站</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <header class="masthead">
+    <div class="masthead__inner">
+      <a class="brand" href="./" aria-label="动量研究公开站首页">
+        <span class="brand__mark" aria-hidden="true">MR</span>
+        <span>
+          <strong>动量研究公开站</strong>
+          <small>PUBLIC MOMENTUM RESEARCH</small>
+        </span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="#research">研究面板</a>
+        <a href="#quality">质量台账</a>
+        <a href="#method">方法与限制</a>
+        <a href="#evidence">官方证据</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div>
+        <p class="eyebrow">严格脱敏 · 聚合指标 · 非投资建议</p>
+        <h1 id="hero-title">让每个动量决策<br>都能被解释与复验</h1>
+        <p class="hero__copy">
+          这里不读取账户、持仓、交易或本地运行目录。站点只接受公开 schema
+          明确允许的策略指标、时间序列、模型暴露和研究限制。
+        </p>
+      </div>
+      <aside class="hero__status" aria-label="数据状态">
+        <span class="status-dot" aria-hidden="true"></span>
+        <div>
+          <span>公开数据状态</span>
+          <strong id="data-status">正在验证…</strong>
+          <small id="generated-date">—</small>
+        </div>
+      </aside>
+    </section>
+
+    <section id="research" class="section" aria-labelledby="research-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">RESEARCH CONSOLE</p>
+          <h2 id="research-title">策略研究面板</h2>
+        </div>
+        <label class="strategy-control" for="strategy-select">
+          <span>选择策略</span>
+          <select id="strategy-select" disabled>
+            <option>正在载入公开数据…</option>
+          </select>
+        </label>
+      </div>
+
+      <article class="strategy-summary" aria-live="polite">
+        <div>
+          <p id="strategy-family" class="strategy-summary__family">—</p>
+          <h3 id="strategy-name">—</h3>
+          <p id="strategy-summary">—</p>
+        </div>
+        <div id="metric-grid" class="metric-grid" aria-label="策略核心指标"></div>
+      </article>
+
+      <div class="table-wrap comparison-wrap">
+        <table aria-label="六组策略十年结果对比">
+          <thead>
+            <tr>
+              <th scope="col">策略</th>
+              <th scope="col">定位</th>
+              <th scope="col">期末净值</th>
+              <th scope="col">年化收益</th>
+              <th scope="col">最大回撤</th>
+              <th scope="col">状态</th>
+            </tr>
+          </thead>
+          <tbody id="comparison-body"></tbody>
+        </table>
+      </div>
+
+      <div class="chart-grid">
+        <article class="chart-card">
+          <header>
+            <div>
+              <span class="chart-kicker">GROWTH</span>
+              <h3 id="nav-title">模型净值</h3>
+            </div>
+            <output id="nav-output">—</output>
+          </header>
+          <svg id="nav-chart" class="chart" role="img" aria-labelledby="nav-chart-title nav-chart-desc">
+            <title id="nav-chart-title">模型净值时间序列</title>
+            <desc id="nav-chart-desc">所选策略的标准化模型净值，不代表任何真实账户。</desc>
+          </svg>
+        </article>
+
+        <article class="chart-card">
+          <header>
+            <div>
+              <span class="chart-kicker">DRAWDOWN</span>
+              <h3>回撤路径</h3>
+            </div>
+            <output id="drawdown-output">—</output>
+          </header>
+          <svg id="drawdown-chart" class="chart" role="img" aria-labelledby="dd-chart-title dd-chart-desc">
+            <title id="dd-chart-title">模型回撤时间序列</title>
+            <desc id="dd-chart-desc">从阶段高点计算的模型回撤。</desc>
+          </svg>
+        </article>
+
+        <article class="chart-card">
+          <header>
+            <div>
+              <span class="chart-kicker">EXPOSURE</span>
+              <h3 id="exposure-title">模型暴露</h3>
+            </div>
+            <output id="exposure-output">—</output>
+          </header>
+          <svg id="exposure-chart" class="chart" role="img" aria-labelledby="exposure-chart-title exposure-chart-desc">
+            <title id="exposure-chart-title">模型目标暴露时间序列</title>
+            <desc id="exposure-chart-desc">仅表示策略模型目标，不表示真实持仓。</desc>
+          </svg>
+        </article>
+      </div>
+
+      <div class="time-console">
+        <div class="time-console__controls">
+          <button id="prev-decision" class="button button--ghost" type="button" disabled>上一个决策</button>
+          <label for="time-slider">
+            <span>研究时间</span>
+            <input id="time-slider" type="range" min="0" max="0" value="0" aria-describedby="selected-date" disabled>
+          </label>
+          <button id="next-decision" class="button button--ghost" type="button" disabled>下一个决策</button>
+        </div>
+        <div class="time-console__date">
+          <span>观察截面</span>
+          <strong id="selected-date">—</strong>
+        </div>
+      </div>
+
+      <div class="decision-grid">
+        <article class="detail-card" aria-live="polite">
+          <header>
+            <span class="chart-kicker">DECISION LOG</span>
+            <h3>决策详情</h3>
+          </header>
+          <dl id="decision-detail" class="detail-list"></dl>
+        </article>
+
+        <article class="detail-card detail-card--accent">
+          <header>
+            <span class="chart-kicker">CURRENT MODEL</span>
+            <h3>当前模型持仓</h3>
+          </header>
+          <p class="privacy-caption">模型目标暴露，不是账户持仓或交易指令。</p>
+          <div id="current-model" class="model-tracks"></div>
+        </article>
+      </div>
+    </section>
+
+    <section id="quality" class="section" aria-labelledby="quality-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">QUALITY LEDGER</p>
+          <h2 id="quality-title">Top3 / Top5 质量台账</h2>
+        </div>
+        <div class="segmented-control" role="group" aria-label="质量台账范围">
+          <button type="button" class="is-active" data-ledger="top3" aria-pressed="true">Top 3</button>
+          <button type="button" data-ledger="top5" aria-pressed="false">Top 5</button>
+        </div>
+      </div>
+      <p class="section-intro">
+        台账展示已完成月末信号的 11M 收益、证券身份与公司行动核验状态；候选名称不映射任何私人账户。
+      </p>
+      <p id="quality-asof" class="quality-asof">信号截面正在验证…</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">排名</th>
+              <th scope="col">研究候选</th>
+              <th scope="col">11M 收益</th>
+              <th scope="col">状态</th>
+              <th scope="col">证据摘要</th>
+            </tr>
+          </thead>
+          <tbody id="quality-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="method" class="section" aria-labelledby="method-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">METHOD & LIMITS</p>
+          <h2 id="method-title">方法与限制</h2>
+        </div>
+      </div>
+      <div class="method-grid">
+        <div id="method-list" class="method-list"></div>
+        <aside class="limitations">
+          <h3>必须保留的限制</h3>
+          <ul id="limitation-list"></ul>
+        </aside>
+      </div>
+    </section>
+
+    <section id="evidence" class="section" aria-labelledby="evidence-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">OFFICIAL EVIDENCE</p>
+          <h2 id="evidence-title">身份、成分与公司行动证据</h2>
+        </div>
+      </div>
+      <p class="section-intro">
+        当前候选先锁定证券身份和独立交易起始日，再检查原始价、复权价、分红与拆股。以下为关键官方证据；免费数据仍不足以重建完整的退市收益和历史成分。
+      </p>
+      <ul class="source-list">
+        <li><a href="https://www.spglobal.com/spdji/en/indices/dividends-factors/sp-500-momentum-index">S&amp;P DJI · S&amp;P 500 Momentum Index 与 SPMO 关联产品</a></li>
+        <li><a href="https://www.sec.gov/Archives/edgar/data/2023554/000202355425000034/sndk-20250627.htm">SEC · Sandisk 新实体与分拆披露</a></li>
+        <li><a href="https://ir.nasdaq.com/news-releases/news-release-details/sandisk-corporation-join-nasdaq-100-indexr-beginning-april-20">Nasdaq · SNDK 纳入 Nasdaq-100</a></li>
+        <li><a href="https://www.sec.gov/Archives/edgar/data/106040/000119312525033383/d847507d8k.htm">SEC · WDC / SNDK 分拆与分配比例</a></li>
+        <li><a href="https://www.nasdaq.com/press-release/lumentum-holdings-inc-join-nasdaq-100-indexr-beginning-may-18-2026-2026-05-09">Nasdaq · LITE 纳入 Nasdaq-100</a></li>
+        <li><a href="https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20260306-1482263/1482263_march2026rebalance1546.pdf">S&amp;P DJI · LITE 纳入 S&amp;P 500</a></li>
+        <li><a href="https://www.crsp.org/wp-content/uploads/guides/CRSP_US_Stock_%26_Indexes_Database_Guide_Flat_File_Format_2.0.pdf">CRSP · 退市收益与永久证券身份的数据标准</a></li>
+      </ul>
+    </section>
+
+    <section class="disclosure" aria-labelledby="disclosure-title">
+      <p class="eyebrow">PUBLIC DATA BOUNDARY</p>
+      <h2 id="disclosure-title">这个站点明确不发布什么</h2>
+      <div class="disclosure-grid">
+        <p>无账户编号</p>
+        <p>无真实持仓与股数</p>
+        <p>无交易与现金流</p>
+        <p>无本地绝对路径</p>
+        <p>无原始 broker 文件</p>
+        <p>无外部运行时 API</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p id="site-notice">研究展示，不构成投资建议。</p>
+    <p>数据边界由 <code>public-study.schema.json</code> 与前端 allowlist 双重约束。</p>
+  </footer>
+
+  <div id="fatal-error" class="fatal-error" role="alert" hidden>
+    <strong>公开数据未通过验证</strong>
+    <p>页面已停止渲染，避免展示未经允许的字段。</p>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

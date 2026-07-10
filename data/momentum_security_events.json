@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-07-10",
+  "researchOnly": true,
+  "decisionGradeGate": "BLOCK_DECISION_GRADE",
+  "decisionGradeReasons": [
+    "The local momentum cache contains today's SPX/NDX/DJIA union, not a complete point-in-time membership history.",
+    "The local cache does not contain a permanent-identifier security master for every historical constituent.",
+    "Free provider history does not provide complete delisting returns and post-delisting distributions."
+  ],
+  "knownTickerReuse": [
+    {
+      "ticker": "SNDK",
+      "oldCik": "1000180",
+      "oldIdentityEnd": "2016-05-12",
+      "newCik": "2023554",
+      "newRegularWayStart": "2025-02-24",
+      "source": "https://www.sec.gov/Archives/edgar/data/1000180/000119312516588394/d194408d8k.htm"
+    },
+    {
+      "ticker": "BBBY",
+      "oldCik": "886158",
+      "oldIdentityEnd": "2023-09-29",
+      "newCik": "1130713",
+      "newIdentityStart": "2025-08-29",
+      "source": "https://www.sec.gov/Archives/edgar/data/1130713/000113071325000078/byon-20250930.htm"
+    }
+  ],
+  "securities": {
+    "SNDK": {
+      "name": "Sandisk Corporation",
+      "cik": "2023554",
+      "compositeFigi": "BBG01R388JG1",
+      "shareClassFigi": "BBG01R388JK6",
+      "identityStatus": "VERIFIED",
+      "whenIssuedStart": "2025-02-13",
+      "regularWayStart": "2025-02-24",
+      "currentMembershipStart": "2026-04-20",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/Archives/edgar/data/2023554/000202355425000034/sndk-20250627.htm",
+        "https://ir.nasdaq.com/news-releases/news-release-details/sandisk-corporation-join-nasdaq-100-indexr-beginning-april-20",
+        "https://www.nasdaq.com/market-activity/stocks/sndk/historical"
+      ]
+    },
+    "WDC": {
+      "name": "Western Digital Corporation",
+      "cik": "106040",
+      "compositeFigi": "BBG000BWNFZ9",
+      "shareClassFigi": "BBG001S5XD28",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2025-12-22",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/Archives/edgar/data/106040/000119312525033383/d847507d8k.htm",
+        "https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-indexr-2",
+        "https://www.nasdaq.com/market-activity/stocks/wdc/historical"
+      ]
+    },
+    "MU": {
+      "name": "Micron Technology, Inc.",
+      "cik": "723125",
+      "compositeFigi": "BBG000C5Z1S3",
+      "shareClassFigi": "BBG001S6P675",
+      "identityStatus": "VERIFIED",
+      "currentMembershipAsOf": "2026-06-30",
+      "currentMembershipIndex": "SPX",
+      "officialSources": [
+        "https://www.sec.gov/Archives/edgar/data/723125/000110465926005366/R1.htm",
+        "https://www.spglobal.com/spdji/en/indices/equity/sp-500/",
+        "https://www.nasdaq.com/market-activity/stocks/mu/historical"
+      ]
+    },
+    "LITE": {
+      "name": "Lumentum Holdings Inc.",
+      "cik": "1633978",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2026-05-18",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1633978",
+        "https://ir.nasdaq.com/node/110416"
+      ]
+    },
+    "INTC": {
+      "name": "Intel Corporation",
+      "cik": "50863",
+      "identityStatus": "VERIFIED",
+      "currentMembershipAsOf": "2026-06-30",
+      "currentMembershipIndex": "SPX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=50863",
+        "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/"
+      ]
+    },
+    "STX": {
+      "name": "Seagate Technology Holdings plc",
+      "cik": "1137789",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2025-12-22",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1137789",
+        "https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-indexr-2"
+      ]
+    },
+    "DELL": {
+      "name": "Dell Technologies Inc.",
+      "cik": "1571996",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2024-09-23",
+      "currentMembershipIndex": "SPX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1571996",
+        "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20240906-1474143/1474143_septembershuffle546.pdf"
+      ]
+    },
+    "MRVL": {
+      "name": "Marvell Technology, Inc.",
+      "cik": "1835632",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2020-12-21",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1835632",
+        "https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-index-9",
+        "https://press.spglobal.com/2026-06-05-Marvell-Technology-and-Flex-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600"
+      ]
+    },
+    "ARM": {
+      "name": "Arm Holdings plc",
+      "cik": "1973239",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2024-06-24",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1973239",
+        "https://ir.nasdaq.com/news-releases/news-release-details/arm-holdings-plc-join-nasdaq-100-indexr-beginning-june-24-2024"
+      ]
+    },
+    "NBIS": {
+      "name": "Nebius Group N.V.",
+      "cik": "1513845",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2026-06-22",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1513845",
+        "https://ir.nasdaq.com/news-releases/news-release-details/nasdaq-100-indexr-june-2026-quarterly-changes"
+      ]
+    },
+    "ALAB": {
+      "name": "Astera Labs, Inc.",
+      "cik": "1736297",
+      "identityStatus": "VERIFIED",
+      "currentMembershipStart": "2026-06-22",
+      "currentMembershipIndex": "NDX",
+      "officialSources": [
+        "https://www.sec.gov/edgar/browse/?CIK=1736297",
+        "https://ir.nasdaq.com/news-releases/news-release-details/nasdaq-100-indexr-june-2026-quarterly-changes"
+      ]
+    },
+    "DHR": {
+      "name": "Danaher Corporation",
+      "cik": "313616",
+      "identityStatus": "VERIFIED",
+      "officialSources": [
+        "https://www.sec.gov/Archives/edgar/data/313616/000031361616000206/dhr-201671x10q.htm"
+      ]
+    },
+    "FTV": {
+      "name": "Fortive Corporation",
+      "cik": "1659166",
+      "identityStatus": "VERIFIED",
+      "regularWayStart": "2016-07-05",
+      "officialSources": [
+        "https://www.sec.gov/Archives/edgar/data/1659166/000165916616000036/a7116-10q.htm",
+        "https://press.spglobal.com/2016-06-23-Albemarle-and-Fortive-Set-to-Join-the-S-P-500-EMCOR-to-Join-S-P-MidCap-400-Inteliquent-to-Join-S-P-SmallCap-600"
+      ]
+    }
+  },
+  "events": [
+    {
+      "id": "WDC_SNDK_2025_SPIN",
+      "type": "SPINOFF_COMPLEX",
+      "parentTicker": "WDC",
+      "childTicker": "SNDK",
+      "recordDate": "2025-02-12",
+      "distributionDate": "2025-02-21",
+      "regularWayDate": "2025-02-24",
+      "childSharesPerParentShare": 0.3333333333,
+      "providerExpected": {
+        "WDC": {
+          "fractionalSplitFactors": [1.323]
+        }
+      },
+      "status": "OFFICIAL_EVENT_VERIFIED_PROVIDER_FACTOR_REQUIRES_AUDIT",
+      "sources": [
+        "https://www.sec.gov/Archives/edgar/data/106040/000119312525033383/d847507d8k.htm",
+        "https://www.sec.gov/Archives/edgar/data/2023554/000202355425000034/sndk-20250627.htm"
+      ]
+    },
+    {
+      "id": "DHR_FTV_2016_SPIN",
+      "type": "SPINOFF_COMPLEX",
+      "parentTicker": "DHR",
+      "childTicker": "FTV",
+      "recordDate": "2016-06-15",
+      "distributionDate": "2016-07-02",
+      "regularWayDate": "2016-07-05",
+      "childSharesPerParentShare": 0.5,
+      "providerExpected": {
+        "DHR": {
+          "fractionalSplitFactors": [1.319],
+          "largeDistributions": [24.56]
+        }
+      },
+      "status": "OFFICIAL_EVENT_VERIFIED_PROVIDER_FACTOR_REQUIRES_AUDIT",
+      "sources": [
+        "https://www.sec.gov/Archives/edgar/data/313616/000031361616000206/dhr-201671x10q.htm",
+        "https://www.sec.gov/Archives/edgar/data/1659166/000165916616000036/a7116-10q.htm"
+      ]
+    }
+  ]
+}

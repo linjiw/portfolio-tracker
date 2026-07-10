@@ -144,6 +144,18 @@ python3 scripts/memory_flow.py
   # private cache. Add --no-fetch to rebuild from the last cache.
 python3 scripts/spmo_momentum_sleeve.py
   # For a known close/re-entry between snapshots: --reset-stop --reset-reason "..."
+python3 scripts/momentum_overlay_research.py
+  # Ten-year SPY/QQQ/SPMO/11M-Top3 overlay research with chronological folds;
+  # 2024+ is now a previously exposed fixed replay, not an untouched holdout.
+  # Add --no-fetch to reproduce from the private market and Top-3 caches.
+python3 scripts/momentum_policy_lab.py --no-fetch
+  # One parameter set across SPY/QQQ and five independent momentum ETFs,
+  # including annual nested pseudo-OOS selection and a fixed 2024+ replay.
+python3 scripts/momentum_final_candidate.py
+  # Focused 6/10/12-month asymmetric ON/OFF calibration with cost/funding stress.
+python3 scripts/momentum_rl_research.py --epochs 1
+  # Slow research-only tabular challenger. The default 15 epochs takes much
+  # longer; historical success can qualify only for prospective paper testing.
 python3 scripts/close_vs_intraday.py --dashboard output/portfolio_dashboard.html
 python3 scripts/market_mass_boundaries.py --price-ticker QQQ --period 5y --interval 1d --calibrate
 python3 scripts/options_credit_spread_backtest.py --price-ticker QQQ --period 5y --lookback 126 --side-mode adaptive
@@ -170,6 +182,10 @@ Optional API credentials are read from environment variables or local files unde
 See [docs/METHODOLOGY.md](docs/METHODOLOGY.md) for the data contract, P&L
 calculation rules, sync verification gate, financial-status scoring lens, and
 market-mass research workflow.
+
+See [docs/MOMENTUM_RESEARCH_CONCLUSION.md](docs/MOMENTUM_RESEARCH_CONCLUSION.md)
+for the corrected ten-year momentum-overlay result, cross-asset falsification,
+SPMO shadow challenger, and conservative RL disposition.
 
 See [README_options_credit_spread_backtest.md](README_options_credit_spread_backtest.md)
 for the option-spread research model.

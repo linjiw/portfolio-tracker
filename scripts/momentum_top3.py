@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Momentum Top-3 sleeve: signals + 8y backtest + dashboard artifact.
+"""Momentum Top-3/Top-5 sleeve: signals + 10y backtest + dashboard artifact.
 
 Implements three strategies selected from the July-2026 40-variant sweep
 (see ~/.hermes skill quant-momentum-research / references/findings-2026-07.md):
 
   1. RET_11M_top3  — 11-month total return, top-3 equal weight (flagship)
   2. RET_9M_top3   —  9-month total return, top-3 equal weight (balanced)
-  3. RET_5M_top5   —  5-month total return, top-5 equal weight (breadth variant)
+  3. RET_11M_top5  — 11-month total return, top-5 equal weight (breadth control)
 
 Design rules (no lookahead): signals are computed at month-end close and filled
 at the next session's close. The prior portfolio earns the signal-to-fill close
@@ -51,6 +51,7 @@ except ModuleNotFoundError:  # direct ``python scripts/momentum_top3.py`` execut
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "data" / "momentum_config.json"
+DEFAULT_SECURITY_EVENTS = ROOT / "data" / "momentum_security_events.json"
 DEFAULT_OUT = ROOT / "output" / "momentum_top3"
 PRICE_CACHE = ROOT / "output" / "momentum_prices.csv.gz"
 CACHE_LOCK = ROOT / "output" / ".momentum_prices.lock"
@@ -66,6 +67,26 @@ WIKI = {
     "DJIA": ("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", "Symbol"),
 }
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) portfolio-tracker/1.0"}
+
+
+def load_independent_trading_starts(path=DEFAULT_SECURITY_EVENTS):
+    """Load verified regular-way dates used to mask when-issued observations.
+
+    This is deliberately narrower than the corporate-action quality gate: a
+    dated regular-way start can be applied mechanically, while unresolved
+    spinoff/delisting economics remain in the separate fail-closed audit.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"security-event registry not found: {path}")
+    registry = json.loads(path.read_text(encoding="utf-8"))
+    if registry.get("schemaVersion") != 1 or not isinstance(registry.get("securities"), dict):
+        raise ValueError("invalid security-event registry")
+    return {
+        str(ticker): row["regularWayStart"]
+        for ticker, row in registry["securities"].items()
+        if isinstance(row, dict) and row.get("regularWayStart")
+    }
 
 
 # ---------------------------------------------------------------- data layer
@@ -390,25 +411,147 @@ def load_prices(cfg, no_fetch=False):
 
 
 # ------------------------------------------------------------- signal layer
-def asof_price(hist, months):
-    ts = hist.index[-1] - pd.DateOffset(months=months)
-    # Use the last observable close on or before the calendar anchor. Choosing
-    # the first close after a weekend/holiday silently shortens the lookback.
-    idx = hist.index[hist.index <= ts]
-    if not len(idx):
-        return hist.iloc[0] * np.nan
-    return hist.loc[idx[-1]]
+def _asof_prices(hist, target, max_staleness_sessions=3):
+    """Return each security's own last valid close on/before ``target``.
+
+    A single global row is unsafe: one missing quote on that row otherwise
+    removes a security even when it has a recent, observable close.  Staleness
+    is counted in sessions present in the market-wide frame, not calendar days.
+    """
+    if isinstance(hist, pd.Series):
+        hist = hist.to_frame()
+    if not isinstance(hist, pd.DataFrame):
+        return pd.Series(dtype=float)
+    if hist.empty:
+        return pd.Series(index=hist.columns, dtype=float)
+    eligible_index = hist.index[hist.index <= pd.Timestamp(target)]
+    if not len(eligible_index):
+        return pd.Series(np.nan, index=hist.columns, dtype=float)
+
+    window = hist.loc[eligible_index]
+    if max_staleness_sessions is not None:
+        window = window.tail(max(1, int(max_staleness_sessions) + 1))
+    result = window.ffill().iloc[-1].astype(float)
+    return result.where(np.isfinite(result) & (result > 0))
+
+
+def asof_price(hist, months, max_staleness_sessions=3):
+    if not isinstance(hist.index, pd.DatetimeIndex):
+        hist = hist.copy()
+        hist.index = pd.to_datetime(hist.index, errors="coerce")
+    target = hist.index[-1] - pd.DateOffset(months=months)
+    return _asof_prices(hist, target, max_staleness_sessions=max_staleness_sessions)
 
 
 def valid_columns(hist, months=13, coverage=0.95):
     w = hist.loc[hist.index >= hist.index[-1] - pd.DateOffset(months=months)]
-    return w.columns[w.notna().sum() >= int(len(w) * coverage)]
+    valid = w.notna() & np.isfinite(w) & (w > 0)
+    return w.columns[valid.sum() >= math.ceil(len(w) * coverage)]
 
 
-def momentum_scores(hist, lookback_months, coverage=0.95, exclude=()):
+def _mask_allows(mask, date, symbol):
+    """Resolve a point-in-time boolean mask supplied as callback/table/mapping.
+
+    DataFrame masks are state tables: the last non-null value on or before the
+    decision date is used.  ``True`` means eligible/validated and absent values
+    fail closed.  Callbacks receive ``(Timestamp, ticker)``.
+    """
+    if mask is None:
+        return True
+    date = pd.Timestamp(date)
+    symbol = str(symbol)
+    if callable(mask):
+        return bool(mask(date, symbol))
+    if isinstance(mask, pd.DataFrame):
+        if symbol not in mask.columns:
+            return False
+        frame = mask.copy()
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+        values = frame.loc[(~frame.index.isna()) & (frame.index <= date), symbol].dropna()
+        return bool(values.iloc[-1]) if len(values) else False
+    if isinstance(mask, pd.Series):
+        if symbol not in mask.index or pd.isna(mask.loc[symbol]):
+            return False
+        return bool(mask.loc[symbol])
+    if hasattr(mask, "get"):
+        value = mask.get(symbol)
+        return bool(value) if value is not None and not pd.isna(value) else False
+    raise TypeError("mask must be a callback, DataFrame, Series, mapping, or None")
+
+
+def _independent_start_for(independent_trading_start, symbol):
+    """Resolve the first regular-way/independent trading date for a ticker."""
+    if independent_trading_start is None:
+        return None
+    symbol = str(symbol)
+    if callable(independent_trading_start):
+        value = independent_trading_start(symbol)
+    elif isinstance(independent_trading_start, pd.DataFrame):
+        if symbol in independent_trading_start.index:
+            row = independent_trading_start.loc[symbol]
+            value = row.get("independent_trading_start", row.iloc[0])
+        elif symbol in independent_trading_start.columns:
+            value = independent_trading_start[symbol].dropna().iloc[-1]
+        else:
+            return None
+    elif isinstance(independent_trading_start, pd.Series):
+        value = independent_trading_start.get(symbol)
+    elif hasattr(independent_trading_start, "get"):
+        value = independent_trading_start.get(symbol)
+    else:
+        raise TypeError("independent_trading_start must be a callback/table/mapping or None")
+    if value is None or pd.isna(value):
+        return None
+    parsed = pd.Timestamp(value)
+    return parsed.tz_localize(None) if parsed.tzinfo is not None else parsed
+
+
+def _mask_when_issued(hist, independent_trading_start):
+    """Blank when-issued/pre-independence prices before coverage and scoring."""
+    if independent_trading_start is None:
+        return hist
+    masked = hist.copy()
+    for symbol in masked.columns:
+        start = _independent_start_for(independent_trading_start, symbol)
+        if start is not None:
+            masked.loc[masked.index < start, symbol] = np.nan
+    return masked
+
+
+def momentum_scores(
+    hist,
+    lookback_months,
+    coverage=0.95,
+    exclude=(),
+    *,
+    anchor_staleness_sessions=3,
+    signal_staleness_sessions=0,
+    eligibility_mask=None,
+    action_mask=None,
+    independent_trading_start=None,
+):
+    if not (
+        isinstance(hist, pd.DataFrame)
+        and isinstance(hist.index, pd.DatetimeIndex)
+        and hist.index.is_monotonic_increasing
+        and not hist.index.has_duplicates
+    ):
+        hist = normalize_price_frame(hist)
+    hist = _mask_when_issued(hist, independent_trading_start)
+    signal_date = hist.index[-1]
     cols = [c for c in valid_columns(hist, coverage=coverage) if c not in exclude]
+    if eligibility_mask is not None:
+        cols = [c for c in cols if _mask_allows(eligibility_mask, signal_date, c)]
+    if action_mask is not None:
+        cols = [c for c in cols if _mask_allows(action_mask, signal_date, c)]
     h = hist[cols]
-    return (h.iloc[-1] / asof_price(h, lookback_months) - 1).dropna()
+    current = _asof_prices(
+        h, signal_date, max_staleness_sessions=signal_staleness_sessions
+    )
+    anchor = asof_price(
+        h, lookback_months, max_staleness_sessions=anchor_staleness_sessions
+    )
+    return (current / anchor - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
 
 
 # ----------------------------------------------------------- backtest layer
@@ -439,8 +582,25 @@ def weekday_age(end, today=None):
     return age
 
 
-def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
-                 coverage=0.95, exclude=(), return_diagnostics=False):
+def run_backtest(
+    px,
+    lookback_months,
+    top_n,
+    start,
+    end,
+    cost_per_side,
+    coverage=0.95,
+    exclude=(),
+    return_diagnostics=False,
+    *,
+    anchor_staleness_sessions=3,
+    signal_staleness_sessions=0,
+    warm_start_months=2,
+    max_fill_retry_sessions=3,
+    eligibility_mask=None,
+    action_mask=None,
+    independent_trading_start=None,
+):
     """Monthly close-to-close simulation with conservative next-close fills.
 
     A month-end signal is not executable at the close that created it. The
@@ -450,9 +610,16 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
     curve includes a 1.0 initial-capital anchor.
     """
     px = normalize_price_frame(px)
-    window = px.index[(px.index >= pd.Timestamp(start)) & (px.index <= pd.Timestamp(end))]
+    evaluation_window = px.index[
+        (px.index >= pd.Timestamp(start)) & (px.index <= pd.Timestamp(end))
+    ]
     diagnostics = {
         "anchorDate": None,
+        "evaluationEndDate": None,
+        "warmStartDate": None,
+        "warmStartMonths": int(warm_start_months),
+        "warmStartUsed": False,
+        "inheritedWeights": {},
         "signalTiming": "month-end close",
         "fillTiming": "next session close",
         "fillDayExposure": "prior weights through fill close",
@@ -460,21 +627,46 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
             "held positions use cumulative returns from their last observed close after a price gap; "
             "rebalances require valid closes for every held and target symbol"
         ),
+        "universeMode": (
+            "point_in_time_eligibility_mask"
+            if eligibility_mask is not None else "current_universe_survivor_biased"
+        ),
+        "independentTradingStartMask": independent_trading_start is not None,
+        "corporateActionMask": action_mask is not None,
+        "maxFillRetrySessions": int(max_fill_retry_sessions),
         "fills": [],
+        "warmupFills": [],
         "skippedFills": [],
+        "warmupSkippedFills": [],
+        "expiredPendingFills": [],
         "priceGapObservations": [],
         "cumulativeGapReturns": [],
         "unresolvedPriceGaps": [],
+        "anchorPriceGaps": [],
+        "unresolvedCorporateActions": [],
+        "metricStatus": "PASS",
+        "metricBlockReasons": [],
     }
-    if not len(window):
+    if not len(evaluation_window):
         empty = pd.Series(dtype=float)
         return (empty, 0.0, diagnostics) if return_diagnostics else (empty, 0.0)
 
-    anchor = window[0]
-    last_date = window[-1]
+    anchor = evaluation_window[0]
+    last_date = evaluation_window[-1]
+    warmup_cutoff = anchor - pd.DateOffset(months=max(0, int(warm_start_months)))
+    simulation_candidates = px.index[
+        (px.index >= warmup_cutoff) & (px.index <= last_date)
+    ]
+    simulation_start = simulation_candidates[0] if len(simulation_candidates) else anchor
+    window = px.index[(px.index >= simulation_start) & (px.index <= last_date)]
     diagnostics["anchorDate"] = str(anchor.date())
+    diagnostics["evaluationEndDate"] = str(last_date.date())
+    diagnostics["warmStartDate"] = str(simulation_start.date())
+    diagnostics["warmStartUsed"] = bool(simulation_start < anchor)
     signal_dates = month_end_index(px)
-    signal_dates = signal_dates[(signal_dates >= anchor) & (signal_dates <= last_date)]
+    signal_dates = signal_dates[
+        (signal_dates >= simulation_start) & (signal_dates <= last_date)
+    ]
     fill_schedule = {}
     for signal_date in signal_dates:
         future = px.index[(px.index > signal_date) & (px.index <= last_date)]
@@ -484,6 +676,11 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
         scores = momentum_scores(
             px.loc[:signal_date], lookback_months,
             coverage=coverage, exclude=exclude,
+            anchor_staleness_sessions=anchor_staleness_sessions,
+            signal_staleness_sessions=signal_staleness_sessions,
+            eligibility_mask=eligibility_mask,
+            action_mask=action_mask,
+            independent_trading_start=independent_trading_start,
         )
         top = scores.sort_values(ascending=False, kind="mergesort").head(top_n)
         target = (pd.Series(1 / len(top), index=top.index, dtype=float)
@@ -492,17 +689,26 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
 
     equity_value = 1.0
     equity_values = [equity_value]
-    equity_dates = [anchor]
+    equity_dates = [simulation_start]
     current_w = pd.Series(dtype=float)
     last_mark_prices = pd.Series(dtype=float)
     last_mark_dates = {}
     open_gaps = {}
     turnover_sum = 0.0
     executed = 0
+    pending_rebalance = None
+    unresolved_actions = {}
     for day in window[1:]:
         if len(current_w):
             held_returns = pd.Series(0.0, index=current_w.index, dtype=float)
             for symbol in current_w.index:
+                if not _mask_allows(action_mask, day, symbol):
+                    key = (str(symbol), str(day.date()))
+                    unresolved_actions[key] = {
+                        "symbol": str(symbol),
+                        "date": str(day.date()),
+                        "phase": "evaluation" if day >= anchor else "warmup",
+                    }
                 current_close = px.at[day, symbol] if symbol in px.columns else np.nan
                 observed = pd.notna(current_close) and np.isfinite(current_close) and float(current_close) > 0
                 if not observed:
@@ -544,7 +750,21 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
 
         scheduled = fill_schedule.get(day)
         if scheduled is not None:
-            target = scheduled["target"]
+            if pending_rebalance is not None:
+                diagnostics["expiredPendingFills"].append({
+                    "signalDate": str(pending_rebalance["signalDate"].date()),
+                    "intendedFillDate": str(pending_rebalance["intendedFillDate"].date()),
+                    "reason": "superseded by a newer month-end signal",
+                    "phase": "evaluation" if day >= anchor else "warmup",
+                })
+            pending_rebalance = {
+                **scheduled,
+                "intendedFillDate": day,
+                "failedAttempts": 0,
+            }
+
+        if pending_rebalance is not None:
+            target = pending_rebalance["target"]
             required_quotes = current_w.index.union(target.index)
             missing_quotes = sorted(
                 symbol for symbol in required_quotes
@@ -556,11 +776,31 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
                 )
             )
             if missing_quotes:
-                diagnostics["skippedFills"].append({
-                    "signalDate": str(scheduled["signalDate"].date()),
-                    "fillDate": str(day.date()),
+                failed_attempts = int(pending_rebalance["failedAttempts"]) + 1
+                pending_rebalance["failedAttempts"] = failed_attempts
+                will_retry = (
+                    failed_attempts <= int(max_fill_retry_sessions)
+                    and day < last_date
+                )
+                row = {
+                    "signalDate": str(pending_rebalance["signalDate"].date()),
+                    "intendedFillDate": str(pending_rebalance["intendedFillDate"].date()),
+                    "attemptDate": str(day.date()),
+                    "retryNumber": failed_attempts - 1,
+                    "willRetry": will_retry,
                     "reason": "missing close for " + ", ".join(missing_quotes),
-                })
+                }
+                destination = (
+                    diagnostics["skippedFills"]
+                    if day >= anchor else diagnostics["warmupSkippedFills"]
+                )
+                destination.append(row)
+                if not will_retry:
+                    diagnostics["expiredPendingFills"].append({
+                        **row,
+                        "phase": "evaluation" if day >= anchor else "warmup",
+                    })
+                    pending_rebalance = None
             else:
                 both = target.index.union(current_w.index)
                 pretrade = current_w.reindex(both, fill_value=0.0)
@@ -570,11 +810,14 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
                 cost_rate = gross_traded * float(cost_per_side)
                 equity_before_cost = equity_value
                 equity_value *= max(0.0, 1.0 - cost_rate)
-                turnover_sum += one_way_turnover
-                executed += 1
-                diagnostics["fills"].append({
-                    "signalDate": str(scheduled["signalDate"].date()),
+                if day >= anchor:
+                    turnover_sum += one_way_turnover
+                    executed += 1
+                fill_row = {
+                    "signalDate": str(pending_rebalance["signalDate"].date()),
+                    "intendedFillDate": str(pending_rebalance["intendedFillDate"].date()),
                     "fillDate": str(day.date()),
+                    "retryCount": int(pending_rebalance["failedAttempts"]),
                     "preTradeWeights": {str(k): round(float(v), 10) for k, v in pretrade.items()},
                     "targetWeights": {str(k): round(float(v), 10) for k, v in posttrade.items()},
                     "oneWayTurnover": one_way_turnover,
@@ -582,7 +825,9 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
                     "costRate": cost_rate,
                     "equityBeforeCost": equity_before_cost,
                     "equityAfterCost": equity_value,
-                })
+                }
+                destination = diagnostics["fills"] if day >= anchor else diagnostics["warmupFills"]
+                destination.append(fill_row)
                 current_w = target.copy()
                 last_mark_prices = pd.Series(
                     {symbol: float(px.at[day, symbol]) for symbol in target.index},
@@ -590,17 +835,45 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
                 )
                 last_mark_dates = {symbol: day for symbol in target.index}
                 open_gaps = {symbol: gap for symbol, gap in open_gaps.items() if symbol in target.index}
+                pending_rebalance = None
 
         equity_values.append(equity_value)
         equity_dates.append(day)
+        if day == anchor:
+            diagnostics["inheritedWeights"] = {
+                str(k): round(float(v), 10) for k, v in current_w.items()
+            }
+            diagnostics["anchorPriceGaps"] = sorted(open_gaps.values(), key=lambda row: row["symbol"])
 
-    ser = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates), dtype=float)
-    ser = ser[~ser.index.duplicated(keep="last")]
+    if simulation_start == anchor:
+        diagnostics["inheritedWeights"] = {
+            str(k): round(float(v), 10) for k, v in current_w.items()
+        }
+
+    full_ser = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates), dtype=float)
+    full_ser = full_ser[~full_ser.index.duplicated(keep="last")]
+    ser = full_ser.loc[full_ser.index >= anchor].copy()
+    if len(ser) and float(ser.iloc[0]) > 0:
+        ser = ser / float(ser.iloc[0])
     if open_gaps:
         diagnostics["unresolvedPriceGaps"] = sorted(open_gaps.values(), key=lambda row: row["symbol"])
-        first_unresolved = min(pd.Timestamp(gap["firstMissingDate"]) for gap in open_gaps.values())
-        ser = ser.loc[ser.index < first_unresolved]
-        diagnostics["evaluationTruncatedBefore"] = str(first_unresolved.date())
+    diagnostics["unresolvedCorporateActions"] = sorted(
+        unresolved_actions.values(), key=lambda row: (row["date"], row["symbol"])
+    )
+
+    block_reasons = []
+    if diagnostics["unresolvedPriceGaps"]:
+        block_reasons.append("unresolved held-price gap at evaluation end")
+    if diagnostics["anchorPriceGaps"]:
+        block_reasons.append("held-price gap crossed the evaluation anchor")
+    if diagnostics["expiredPendingFills"]:
+        block_reasons.append("rebalance could not execute within the retry window")
+    if any(row["phase"] == "evaluation" for row in diagnostics["unresolvedCorporateActions"]):
+        block_reasons.append("held security failed the corporate-action validation mask")
+    diagnostics["metricBlockReasons"] = block_reasons
+    diagnostics["metricStatus"] = "BLOCK" if block_reasons else "PASS"
+    ser.attrs["metricStatus"] = diagnostics["metricStatus"]
+    ser.attrs["metricBlockReasons"] = list(block_reasons)
     average_turnover = turnover_sum / max(executed, 1)
     diagnostics["executedRebalances"] = executed
     diagnostics["averageOneWayTurnover"] = average_turnover
@@ -610,11 +883,36 @@ def run_backtest(px, lookback_months, top_n, start, end, cost_per_side,
 
 
 def perf_metrics(eq):
+    status = str(eq.attrs.get("metricStatus", "PASS"))
+    block_reasons = list(eq.attrs.get("metricBlockReasons", []))
+    contract = {"status": status, "block_reasons": block_reasons}
+    if status != "PASS":
+        return {
+            "total_x": None,
+            "cagr_pct": None,
+            "max_dd_pct": None,
+            "sharpe": None,
+            **contract,
+        }
     if len(eq) < 2:
-        return {"total_x": None, "cagr_pct": None, "max_dd_pct": None, "sharpe": None}
+        return {
+            "total_x": None,
+            "cagr_pct": None,
+            "max_dd_pct": None,
+            "sharpe": None,
+            "status": "BLOCK",
+            "block_reasons": ["fewer than two equity observations"],
+        }
     eq = eq.dropna().sort_index()
     if len(eq) < 2 or float(eq.iloc[0]) <= 0:
-        return {"total_x": None, "cagr_pct": None, "max_dd_pct": None, "sharpe": None}
+        return {
+            "total_x": None,
+            "cagr_pct": None,
+            "max_dd_pct": None,
+            "sharpe": None,
+            "status": "BLOCK",
+            "block_reasons": ["invalid equity path"],
+        }
     r = eq.pct_change().dropna()
     yrs = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
     total_x = float(eq.iloc[-1] / eq.iloc[0])
@@ -624,7 +922,8 @@ def perf_metrics(eq):
     return {"total_x": round(total_x, 2),
             "cagr_pct": round(cagr * 100, 1),
             "max_dd_pct": round(dd * 100, 1),
-            "sharpe": round(sharpe, 2) if sharpe is not None else None}
+            "sharpe": round(sharpe, 2) if sharpe is not None else None,
+            **contract}
 
 
 def cycle_stats(eq, months_back=13):
@@ -693,16 +992,30 @@ def weekly_points(eq):
 
 
 # ------------------------------------------------------------ artifact layer
-def build_payload(cfg, px):
+def build_payload(
+    cfg,
+    px,
+    *,
+    eligibility_mask=None,
+    action_mask=None,
+    independent_trading_start=None,
+):
     px = normalize_price_frame(px)
     validation_errors = price_frame_errors(px, cfg)
     if validation_errors:
         raise ValueError("price frame rejected: " + "; ".join(validation_errors))
     bench = cfg["backtest"]["benchmarks"]
     end = px.index[-1]
-    start = end - pd.DateOffset(years=cfg["backtest"]["years"])
+    requested_start = end - pd.DateOffset(years=cfg["backtest"]["years"])
+    common_dates = px.index[px.index >= requested_start]
+    start = common_dates[0] if len(common_dates) else end
     cost = cfg["backtest"]["cost_per_side"]
     coverage = cfg["universe"].get("min_history_coverage", 0.95)
+    anchor_staleness = int(cfg["universe"].get("max_anchor_staleness_sessions", 3))
+    signal_staleness = int(cfg["universe"].get("max_signal_staleness_sessions", 0))
+    max_fill_retries = int(cfg["backtest"].get("max_fill_retry_sessions", 3))
+    warm_start_months = int(cfg["backtest"].get("warm_start_months", 2))
+    has_pit_universe = eligibility_mask is not None
     fresh_columns = [col for col in px.columns
                      if px[col].last_valid_index() is not None and px[col].last_valid_index() == end]
     stale_columns = sorted(set(px.columns) - set(fresh_columns))
@@ -719,6 +1032,10 @@ def build_payload(cfg, px):
         "universe_size": int(px.shape[1] - len(bench)),
         "universe_source": px.attrs.get("universeSource", "provided_prices"),
         "universe_warning": px.attrs.get("universeWarning"),
+        "universe_mode": (
+            "point_in_time_eligibility_mask"
+            if has_pit_universe else "current_universe_survivor_biased"
+        ),
         "price_freshness": {"as_of": str(end.date()),
                             "fresh_count": len(fresh_columns),
                             "stale_symbols": stale_columns,
@@ -728,8 +1045,11 @@ def build_payload(cfg, px):
         "researchOnly": True,
         "decisionGrade": False,
         "decisionGradeReason": (
-            "Current-universe survivorship and in-sample selection from the same "
-            "40-variant sweep prevent decision-grade performance claims."
+            ("In-sample selection from the same 40-variant sweep and unvalidated "
+             "corporate-action total returns prevent decision-grade performance claims.")
+            if has_pit_universe else
+            ("Current-universe survivorship, unvalidated corporate-action total returns, "
+             "and in-sample selection prevent decision-grade performance claims.")
         ),
         "methodology": {
             "signalTiming": "month-end close",
@@ -738,19 +1058,33 @@ def build_payload(cfg, px):
             "turnoverTiming": "after fill-day return, from drifted pre-trade weights to target weights",
             "costModel": "gross traded notional multiplied by configured per-side cost at fill close",
             "missingHeldClosePolicy": "carry the last mark, then book the cumulative return when a valid close resumes",
-            "missingRebalanceClosePolicy": "skip the rebalance when any held or target close is invalid",
-            "unresolvedHeldClosePolicy": "truncate performance before the first unresolved held-price gap",
+            "missingRebalanceClosePolicy": (
+                f"keep the order pending for up to {max_fill_retries} later sessions; "
+                "audit every failed attempt and block metrics if it expires"
+            ),
+            "unresolvedHeldClosePolicy": "carry the last mark but BLOCK all performance metrics; never truncate the loss away",
             "initialCapitalAnchor": True,
-            "initialization": "cash from the anchor until the first post-anchor signal fills",
+            "initialization": f"simulate {warm_start_months} pre-anchor months and inherit the already-active book at the common evaluation anchor",
+            "anchorPricePolicy": f"per-security as-of close, maximum {anchor_staleness} stale sessions",
+            "signalPricePolicy": f"per-security as-of close, maximum {signal_staleness} stale sessions",
+            "eligibilityMode": (
+                "point-in-time mask supplied" if has_pit_universe
+                else "today's constituent union reused historically"
+            ),
+            "independentTradingStartMask": independent_trading_start is not None,
+            "corporateActionValidationMask": action_mask is not None,
             "adjustedPrices": True,
-            "currentUniverseSurvivorship": True,
+            "currentUniverseSurvivorship": not has_pit_universe,
             "inSampleStrategySelection": True,
-            "strategySelection": "three variants selected from a 40-variant sweep using overlapping history",
+            "strategySelection": "11m Top3/Top5 breadth control plus a 9m Top3 comparator, evaluated on overlapping history",
             "outOfSampleValidation": False,
         },
         "disclaimer": (
-            "Research only. Current-universe survivorship and in-sample strategy "
-            "selection can materially overstate both performance and ranking stability."
+            "Research only. In-sample selection and unvalidated corporate actions can "
+            "materially overstate performance and ranking stability."
+            if has_pit_universe else
+            "Research only. Current-universe survivorship, in-sample selection, and "
+            "unvalidated corporate actions can materially overstate performance and ranking stability."
         ),
         "strategies": [], "benchmarks": {},
     }
@@ -765,10 +1099,22 @@ def build_payload(cfg, px):
         eq, turn, execution = run_backtest(
             px, s["lookback_months"], s["top_n"], start, end, cost,
             coverage, exclude=bench, return_diagnostics=True,
+            anchor_staleness_sessions=anchor_staleness,
+            signal_staleness_sessions=signal_staleness,
+            warm_start_months=warm_start_months,
+            max_fill_retry_sessions=max_fill_retries,
+            eligibility_mask=eligibility_mask,
+            action_mask=action_mask,
+            independent_trading_start=independent_trading_start,
         )
         signal_px = px[fresh_columns]
         latest_scores = momentum_scores(
-            signal_px, s["lookback_months"], coverage=coverage, exclude=bench
+            signal_px, s["lookback_months"], coverage=coverage, exclude=bench,
+            anchor_staleness_sessions=anchor_staleness,
+            signal_staleness_sessions=signal_staleness,
+            eligibility_mask=eligibility_mask,
+            action_mask=action_mask,
+            independent_trading_start=independent_trading_start,
         )
         latest_top = latest_scores.sort_values(ascending=False, kind="mergesort").head(s["top_n"])
         latest_weight_pct = round(100 / len(latest_top), 1) if len(latest_top) else None
@@ -777,6 +1123,11 @@ def build_payload(cfg, px):
             completed_scores = momentum_scores(
                 px.loc[:completed_signal_date], s["lookback_months"],
                 coverage=coverage, exclude=bench,
+                anchor_staleness_sessions=anchor_staleness,
+                signal_staleness_sessions=signal_staleness,
+                eligibility_mask=eligibility_mask,
+                action_mask=action_mask,
+                independent_trading_start=independent_trading_start,
             )
             active_top = completed_scores.sort_values(
                 ascending=False, kind="mergesort"
@@ -800,6 +1151,13 @@ def build_payload(cfg, px):
                 "anchor_date": execution["anchorDate"],
                 "executed_rebalances": execution["executedRebalances"],
                 "skipped_rebalances": len(execution["skippedFills"]),
+                "failed_fill_attempts": len(execution["skippedFills"]),
+                "expired_pending_fills": len(execution["expiredPendingFills"]),
+                "metric_status": execution["metricStatus"],
+                "metric_block_reasons": execution["metricBlockReasons"],
+                "warm_start_date": execution["warmStartDate"],
+                "warm_start_months": execution["warmStartMonths"],
+                "inherited_weights": execution["inheritedWeights"],
                 "first_fill_date": execution["fills"][0]["fillDate"] if execution["fills"] else None,
                 "last_fill_date": execution["fills"][-1]["fillDate"] if execution["fills"] else None,
             },
@@ -843,7 +1201,7 @@ def render_html(payload):
                 .replace("\u2029", "\\u2029"))
     return """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>动量 Top-3 策略舱 · Momentum Sleeve</title><style>
+<title>动量 Top-3/Top-5 策略舱 · Momentum Sleeve</title><style>
 :root{--bg:#0b0f14;--card:#121821;--ink:#e6edf3;--mut:#8b98a5;--line:#1f2937;
 --g:#3fb950;--r:#f85149;--a1:#58a6ff;--a2:#d29922;--a3:#bc8cff;--b1:#484f58;--b2:#6e7681}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
@@ -878,7 +1236,7 @@ svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
 .next td{background:#0d1f33}
 .mirror{font-size:11px;color:var(--a2);margin-top:6px}
 </style></head><body>
-<h1>动量 Top-3 策略舱</h1>
+<h1>动量 Top-3/Top-5 策略舱</h1>
 <div class="sub" id="sub"></div>
 <div class="warn">⚠️ <b>仅研究 / Decision Grade: NO</b>。宇宙使用今日指数成分，且三组参数来自同一段历史上的 40 变体筛选；绝对收益和策略排名都不是样本外证据。</div>
 <div class="warn" id="datawarn"></div>
@@ -888,7 +1246,7 @@ svg text{fill:var(--mut);font-size:10px}.hold{font-weight:600}
 <div class="card"><h2>策略对比总表</h2><table class="cmp" id="cmp"></table></div>
 <script>
 const D=__DATA__;
-const C={RET_11M_top3:'var(--a1)',RET_9M_top3:'var(--a2)',RET_5M_top5:'var(--a3)',SPY:'var(--b1)',QQQ:'var(--b2)'};
+const C={RET_11M_top3:'var(--a1)',RET_9M_top3:'var(--a2)',RET_11M_top5:'var(--a3)',SPY:'var(--b1)',QQQ:'var(--b2)'};
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 document.getElementById('sub').textContent=`窗口 ${D.window.start} → ${D.window.end} · 宇宙 ${D.universe_size} 只 (SPX∪NDX∪DJIA) · 月末收盘信号/下一交易日收盘成交/成交日沿用旧权重 · 单边成本 ${(D.cost_per_side*1e4).toFixed(0)}bp · 生成于 ${D.generated_at}`;
 document.getElementById('datawarn').textContent=`价格数据 ${D.price_freshness.status} · as of ${D.price_freshness.as_of} · 工作日龄 ${D.price_freshness.age_weekdays} · stale symbols ${D.price_freshness.stale_symbols.length}`;
@@ -950,8 +1308,12 @@ rows.map(r=>`<tr><td>${esc(r.n)}</td><td>${fmt(r.m.total_x)}x</td><td>${fmt(r.m.
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Momentum Top-3 sleeve artifact")
+    ap = argparse.ArgumentParser(description="Momentum Top-3/Top-5 sleeve artifact")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
+    ap.add_argument("--security-events", default=str(DEFAULT_SECURITY_EVENTS),
+                    help="verified identity/event registry used for regular-way start masks")
+    ap.add_argument("--ignore-security-events", action="store_true",
+                    help="diagnostic only: disable regular-way/when-issued masking")
     ap.add_argument("--out-dir", default=str(DEFAULT_OUT))
     ap.add_argument("--no-fetch", action="store_true",
                     help="reuse cached prices (offline)")
@@ -959,7 +1321,15 @@ def main():
 
     cfg = json.loads(Path(args.config).read_text())
     px = load_prices(cfg, no_fetch=args.no_fetch)
-    payload = build_payload(cfg, px)
+    independent_starts = (
+        None if args.ignore_security_events
+        else load_independent_trading_starts(args.security_events)
+    )
+    payload = build_payload(
+        cfg,
+        px,
+        independent_trading_start=independent_starts,
+    )
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
