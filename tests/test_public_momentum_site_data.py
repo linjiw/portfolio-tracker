@@ -33,10 +33,33 @@ STRATEGY_KEYS = {
     "exposureUnit",
     "metrics",
     "currentModels",
+    "currentSnapshot",
     "series",
     "qualityLedger",
 }
-DECISION_KEYS = {"action", "regime", "reason", "targetExposure", "modelBasket"}
+SNAPSHOT_KEYS = {
+    "asOf",
+    "mode",
+    "newCapitalGate",
+    "action",
+    "basketBasis",
+    "modelBasket",
+    "cashWeight",
+    "nextTrigger",
+    "riskTrigger",
+    "note",
+}
+DECISION_KEYS = {"kind", "action", "regime", "reason", "targetExposure", "modelBasket"}
+DECISION_KINDS = {
+    "ENTER",
+    "ADD",
+    "HOLD",
+    "REDUCE",
+    "EXIT",
+    "REBALANCE",
+    "BLOCK",
+    "REFERENCE",
+}
 FORBIDDEN_KEYS = {
     "account",
     "accountid",
@@ -168,6 +191,76 @@ def test_spmo_public_models_match_the_explicit_two_track_decision(study):
     assert new_capital["gate"] == "BLOCK"
 
 
+def test_current_snapshots_are_complete_and_match_model_baskets(study):
+    expected_modes = [
+        "PRODUCTION_HOLD",
+        "SHADOW_ONLY",
+        "BENCHMARK",
+        "BENCHMARK",
+        "RESEARCH_BLOCKED",
+        "RESEARCH_BLOCKED",
+    ]
+    expected_gates = ["BLOCK", "BLOCK", "NA", "NA", "BLOCK", "BLOCK"]
+    expected_bases = [
+        "account-target",
+        "shadow-account-target",
+        "benchmark",
+        "benchmark",
+        "research-sleeve",
+        "research-sleeve",
+    ]
+    expected_baskets = [
+        [("SPMO", 0.08)],
+        [("SPMO", 0.10)],
+        [("SPY", 1.0)],
+        [("QQQ", 1.0)],
+        [("SNDK", 1 / 3), ("MU", 1 / 3), ("WDC", 1 / 3)],
+        [
+            ("SNDK", 0.2),
+            ("MU", 0.2),
+            ("WDC", 0.2),
+            ("LITE", 0.2),
+            ("INTC", 0.2),
+        ],
+    ]
+    expected_cash = [0.92, 0.90, 0.0, 0.0, 0.0, 0.0]
+
+    for index, strategy in enumerate(study["strategies"]):
+        snapshot = strategy["currentSnapshot"]
+        assert set(snapshot) == SNAPSHOT_KEYS
+        assert snapshot["mode"] == expected_modes[index]
+        assert snapshot["newCapitalGate"] == expected_gates[index]
+        assert snapshot["basketBasis"] == expected_bases[index]
+        assert snapshot["cashWeight"] == pytest.approx(expected_cash[index])
+        assert [item["asset"] for item in snapshot["modelBasket"]] == [
+            asset for asset, _ in expected_baskets[index]
+        ]
+        assert [item["weight"] for item in snapshot["modelBasket"]] == pytest.approx(
+            [weight for _, weight in expected_baskets[index]], abs=1e-9
+        )
+        assert sum(item["weight"] for item in snapshot["modelBasket"]) + snapshot[
+            "cashWeight"
+        ] == pytest.approx(1.0, abs=1e-9)
+        assert all(snapshot[field] for field in ("action", "nextTrigger", "riskTrigger", "note"))
+
+    source = json.loads(public_data.DEFAULT_SPMO_ARTIFACT.read_text(encoding="utf-8"))
+    production_snapshot = study["strategies"][0]["currentSnapshot"]
+    assert production_snapshot["newCapitalGate"] == public_data._spmo_new_capital_gate(
+        source
+    )
+    levels = source["levels"]
+    for name in ("buyStop", "buyLimit"):
+        assert f"{float(levels[name]):.2f}" in production_snapshot["nextTrigger"]
+    for name in ("invalidationClose", "movingStop3Atr"):
+        assert f"{float(levels[name]):.2f}" in production_snapshot["riskTrigger"]
+
+    for benchmark in study["strategies"][2:4]:
+        benchmark_track = benchmark["currentModels"][0]
+        assert benchmark_track["targetExposure"] == pytest.approx(1.0)
+        assert benchmark_track["cashExposure"] == pytest.approx(0.0)
+        assert benchmark_track["riskyAsset"] == benchmark["currentSnapshot"]["modelBasket"][0]["asset"]
+
+
 def test_metrics_and_series_are_real_deterministic_replays(study):
     for strategy in study["strategies"]:
         metrics = strategy["metrics"]
@@ -216,10 +309,33 @@ def test_weekly_downsample_preserves_exact_monthly_decision_dates(study):
             if decision is None:
                 continue
             assert set(decision) == DECISION_KEYS
+            assert decision["kind"] in DECISION_KINDS
             assert 1 <= len(decision["modelBasket"]) <= 5
             assert sum(item["weight"] for item in decision["modelBasket"]) == pytest.approx(
                 decision["targetExposure"]
             )
+
+
+def test_decision_kinds_are_deterministic_by_strategy_family(study):
+    kinds = [
+        [
+            point["decision"]["kind"]
+            for point in strategy["series"]
+            if point["decision"] is not None
+        ]
+        for strategy in study["strategies"]
+    ]
+    assert set(kinds[0]) <= {"HOLD", "BLOCK"}
+    assert {"HOLD", "BLOCK"} <= set(kinds[0])
+    assert kinds[1][0] == "ENTER"
+    assert set(kinds[1]) <= {"ENTER", "ADD", "HOLD", "REDUCE"}
+    assert {"ENTER", "ADD", "REDUCE"} <= set(kinds[1])
+    assert set(kinds[2]) == {"REFERENCE"}
+    assert set(kinds[3]) == {"REFERENCE"}
+    assert kinds[4][0] == "REBALANCE"
+    assert kinds[5][0] == "REBALANCE"
+    assert set(kinds[4]) == {"REBALANCE", "HOLD"}
+    assert set(kinds[5]) == {"REBALANCE", "HOLD"}
 
 
 def test_top_proxy_baskets_show_exact_monthly_assets_and_weights(study):

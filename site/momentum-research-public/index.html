@@ -21,6 +21,7 @@
         </span>
       </a>
       <nav aria-label="页面导航">
+        <a href="#now">现在怎么做</a>
         <a href="#research">研究面板</a>
         <a href="#quality">质量台账</a>
         <a href="#method">方法与限制</a>
@@ -49,7 +50,20 @@
       </aside>
     </section>
 
-    <section id="research" class="section" aria-labelledby="research-title">
+    <section id="now" class="section section--compact action-board" aria-labelledby="now-title">
+      <div class="section-heading section-heading--compact">
+        <div>
+          <p class="eyebrow">CURRENT PLAYBOOK</p>
+          <h2 id="now-title">现在该做什么</h2>
+        </div>
+        <p class="action-board__intro">
+          六组模型各自独立表达；颜色同时配有文字与形状。点击任一策略，进入对应研究截面。
+        </p>
+      </div>
+      <div id="overview-grid" class="overview-grid" aria-live="polite" aria-label="六组策略当前行动概览"></div>
+    </section>
+
+    <section id="research" class="section" aria-labelledby="research-title" tabindex="-1">
       <div class="section-heading">
         <div>
           <p class="eyebrow">RESEARCH CONSOLE</p>
@@ -86,6 +100,60 @@
           </thead>
           <tbody id="comparison-body"></tbody>
         </table>
+      </div>
+
+      <section class="replay-panel" aria-labelledby="replay-title">
+        <header class="replay-panel__header">
+          <div>
+            <span class="chart-kicker">REPLAY INDEX</span>
+            <h3 id="replay-title">关键与近期决策</h3>
+          </div>
+          <div class="decision-legend" aria-label="决策颜色图例">
+            <span class="legend-item tone-green"><i aria-hidden="true"></i>ENTER / ADD / ALLOW</span>
+            <span class="legend-item tone-amber"><i aria-hidden="true"></i>HOLD / WATCH</span>
+            <span class="legend-item tone-cyan"><i aria-hidden="true"></i>REBALANCE / REFERENCE</span>
+            <span class="legend-item tone-red"><i aria-hidden="true"></i>REDUCE / EXIT / BLOCK</span>
+            <span class="legend-item tone-violet"><i aria-hidden="true"></i>影子 / 研究模式（次级）</span>
+          </div>
+        </header>
+        <div id="decision-shortcuts" class="decision-shortcuts" aria-live="polite"></div>
+      </section>
+
+      <div class="decision-grid">
+        <article id="decision-card" class="detail-card" aria-live="polite" tabindex="-1">
+          <header>
+            <div>
+              <span class="chart-kicker">DECISION LOG</span>
+              <h3>决策详情</h3>
+            </div>
+            <span id="decision-kind" class="semantic-badge tone-cyan">REFERENCE</span>
+          </header>
+          <dl id="decision-detail" class="detail-list"></dl>
+        </article>
+
+        <article class="detail-card detail-card--accent">
+          <header>
+            <span class="chart-kicker">CURRENT MODEL</span>
+            <h3>当前模型持仓</h3>
+          </header>
+          <p class="privacy-caption">模型目标暴露，不是账户持仓或交易指令。</p>
+          <div id="current-model" class="model-tracks"></div>
+        </article>
+      </div>
+
+      <div class="time-console">
+        <div class="time-console__controls">
+          <button id="prev-decision" class="button button--ghost" type="button" disabled>上一个决策</button>
+          <label for="time-slider">
+            <span>研究时间</span>
+            <input id="time-slider" type="range" min="0" max="0" value="0" aria-describedby="selected-date" disabled>
+          </label>
+          <button id="next-decision" class="button button--ghost" type="button" disabled>下一个决策</button>
+        </div>
+        <div class="time-console__date">
+          <span>观察截面</span>
+          <strong id="selected-date">—</strong>
+        </div>
       </div>
 
       <div class="chart-grid">
@@ -129,40 +197,6 @@
             <title id="exposure-chart-title">模型目标暴露时间序列</title>
             <desc id="exposure-chart-desc">仅表示策略模型目标，不表示真实持仓。</desc>
           </svg>
-        </article>
-      </div>
-
-      <div class="time-console">
-        <div class="time-console__controls">
-          <button id="prev-decision" class="button button--ghost" type="button" disabled>上一个决策</button>
-          <label for="time-slider">
-            <span>研究时间</span>
-            <input id="time-slider" type="range" min="0" max="0" value="0" aria-describedby="selected-date" disabled>
-          </label>
-          <button id="next-decision" class="button button--ghost" type="button" disabled>下一个决策</button>
-        </div>
-        <div class="time-console__date">
-          <span>观察截面</span>
-          <strong id="selected-date">—</strong>
-        </div>
-      </div>
-
-      <div class="decision-grid">
-        <article class="detail-card" aria-live="polite">
-          <header>
-            <span class="chart-kicker">DECISION LOG</span>
-            <h3>决策详情</h3>
-          </header>
-          <dl id="decision-detail" class="detail-list"></dl>
-        </article>
-
-        <article class="detail-card detail-card--accent">
-          <header>
-            <span class="chart-kicker">CURRENT MODEL</span>
-            <h3>当前模型持仓</h3>
-          </header>
-          <p class="privacy-caption">模型目标暴露，不是账户持仓或交易指令。</p>
-          <div id="current-model" class="model-tracks"></div>
         </article>
       </div>
     </section>

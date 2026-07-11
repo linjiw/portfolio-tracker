@@ -71,6 +71,7 @@
         "exposureUnit",
         "metrics",
         "currentModels",
+        "currentSnapshot",
         "series",
         "qualityLedger"
       ],
@@ -107,6 +108,9 @@
           "items": {
             "$ref": "#/$defs/currentModel"
           }
+        },
+        "currentSnapshot": {
+          "$ref": "#/$defs/currentSnapshot"
         },
         "series": {
           "type": "array",
@@ -207,6 +211,69 @@
         }
       }
     },
+    "currentSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asOf",
+        "mode",
+        "newCapitalGate",
+        "action",
+        "basketBasis",
+        "modelBasket",
+        "cashWeight",
+        "nextTrigger",
+        "riskTrigger",
+        "note"
+      ],
+      "properties": {
+        "asOf": {
+          "type": "string",
+          "format": "date"
+        },
+        "mode": {
+          "enum": ["PRODUCTION_HOLD", "SHADOW_ONLY", "BENCHMARK", "RESEARCH_BLOCKED"]
+        },
+        "newCapitalGate": {
+          "enum": ["ALLOW", "WATCH", "BLOCK", "NA"]
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "basketBasis": {
+          "enum": ["account-target", "shadow-account-target", "benchmark", "research-sleeve"]
+        },
+        "modelBasket": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/basketItem"
+          }
+        },
+        "cashWeight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "nextTrigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "riskTrigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        }
+      }
+    },
     "point": {
       "type": "object",
       "additionalProperties": false,
@@ -246,8 +313,11 @@
     "decision": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["action", "regime", "reason", "targetExposure", "modelBasket"],
+      "required": ["kind", "action", "regime", "reason", "targetExposure", "modelBasket"],
       "properties": {
+        "kind": {
+          "enum": ["ENTER", "ADD", "HOLD", "REDUCE", "EXIT", "REBALANCE", "BLOCK", "REFERENCE"]
+        },
         "action": {
           "type": "string",
           "minLength": 1,

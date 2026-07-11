@@ -257,6 +257,58 @@ def _spmo_public_models(spmo: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _spmo_new_capital_gate(spmo: Mapping[str, Any]) -> str:
+    """Map the latest explicit new-add instruction onto the public gate enum."""
+    actions = spmo.get("actions")
+    new_add = str(actions.get("newAdd", "")) if isinstance(actions, dict) else ""
+    normalized = new_add.upper()
+    if "BLOCK" in normalized:
+        return "BLOCK"
+    if "WATCH" in normalized:
+        return "WATCH"
+    if "ALLOW" in normalized:
+        return "ALLOW"
+
+    label = str(spmo.get("label", "")).upper()
+    if label in {"ALLOW", "WATCH"}:
+        return label
+    return "BLOCK"
+
+
+def _spmo_current_snapshot(spmo: Mapping[str, Any]) -> dict[str, Any]:
+    as_of = _date(spmo["asOf"])
+    price = _number(spmo["price"], 2)
+    ema21 = _number(spmo["ema21"], 2)
+    ema50 = _number(spmo["ema50"], 2)
+    levels = spmo.get("levels", {})
+    buy_stop = _number(levels.get("buyStop"), 2)
+    buy_limit = _number(levels.get("buyLimit"), 2)
+    invalidation = _number(levels.get("invalidationClose"), 2)
+    moving_stop = _number(levels.get("movingStop3Atr"), 2)
+    new_capital_gate = _spmo_new_capital_gate(spmo)
+    return {
+        "asOf": as_of,
+        "mode": "PRODUCTION_HOLD",
+        "newCapitalGate": new_capital_gate,
+        "action": f"持有既有8% SPMO模型袖套；新增资金{new_capital_gate}。",
+        "basketBasis": "account-target",
+        "modelBasket": [{"asset": "SPMO", "weight": 0.08}],
+        "cashWeight": 0.92,
+        "nextTrigger": (
+            f"仅当市场门为ALLOW且SPMO触发{buy_stop:.2f}买入止损单时考虑新增；"
+            f"限价不高于{buy_limit:.2f}。"
+        ),
+        "riskTrigger": (
+            f"收盘跌破{invalidation:.2f}进入防守/减仓复核；"
+            f"3ATR移动止盈{moving_stop:.2f}只升不降。"
+        ),
+        "note": (
+            f"SPMO {price:.2f}，EMA21 {ema21:.2f}，EMA50 {ema50:.2f}；"
+            "这是公开模型权重，不是任何真实账户持仓。"
+        ),
+    }
+
+
 def _shadow_public_models(as_of: str, current_internal_target: float) -> list[dict[str, Any]]:
     state = "ON" if current_internal_target > 0.5 + EPS else "OFF"
     account_shadow = 0.10 if state == "ON" else 0.04
@@ -289,18 +341,45 @@ def _shadow_public_models(as_of: str, current_internal_target: float) -> list[di
     ]
 
 
+def _shadow_current_snapshot(
+    as_of: str,
+    current_internal_target: float,
+    completed_close: float,
+    ten_month_average: float,
+) -> dict[str, Any]:
+    state = "ON" if current_internal_target > 0.5 + EPS else "OFF"
+    account_shadow = 0.10 if state == "ON" else 0.04
+    next_state = "OFF并降至4%" if state == "ON" else "ON并升至10%"
+    relation = "跌回" if state == "ON" else "重新站上"
+    return {
+        "asOf": as_of,
+        "mode": "SHADOW_ONLY",
+        "newCapitalGate": "BLOCK",
+        "action": f"影子状态{state}：记录SPMO {account_shadow:.0%}、现金{1-account_shadow:.0%}；不进入生产。",
+        "basketBasis": "shadow-account-target",
+        "modelBasket": [{"asset": "SPMO", "weight": account_shadow}],
+        "cashWeight": _number(1.0 - account_shadow, 8),
+        "nextTrigger": (
+            f"最近完成月收盘{completed_close:.2f}；下个完成月收盘{relation}"
+            f"10个月均线{ten_month_average:.2f}时切换为{next_state}。"
+        ),
+        "riskTrigger": "验证门未通过前生产权重始终为0%；影子权重变化不授权真实下单。",
+        "note": f"内部目标{current_internal_target:.2f}×按8%基础袖套映射；仅用于前瞻样本外验证。",
+    }
+
+
 def _comparison_models(asset: str, as_of: str, reference_price: float) -> list[dict[str, Any]]:
     return [
         {
             "track": "existing-sleeve",
-            "label": "历史对照",
+            "label": "100%买入持有基准",
             "asOf": as_of,
             "riskyAsset": asset,
-            "targetExposure": 0.0,
-            "cashExposure": 1.0,
-            "action": "仅保留为历史基准",
+            "targetExposure": 1.0,
+            "cashExposure": 0.0,
+            "action": f"REFERENCE：维持100% {asset}基准模型",
             "gate": "BLOCK",
-            "note": f"同期参考收盘 {reference_price:.2f}；只用于衡量相对表现，不构成配置建议。",
+            "note": f"同期参考收盘 {reference_price:.2f}；这是绩效对照模型，不构成生产配置建议。",
         },
         {
             "track": "new-capital",
@@ -314,6 +393,25 @@ def _comparison_models(asset: str, as_of: str, reference_price: float) -> list[d
             "note": f"同期参考收盘 {reference_price:.2f}；若单独投资该基准，应另行建立风险预算。",
         },
     ]
+
+
+def _comparison_current_snapshot(
+    asset: str,
+    as_of: str,
+    reference_price: float,
+) -> dict[str, Any]:
+    return {
+        "asOf": as_of,
+        "mode": "BENCHMARK",
+        "newCapitalGate": "NA",
+        "action": f"100% {asset}仅作为买入持有对照，不是执行建议。",
+        "basketBasis": "benchmark",
+        "modelBasket": [{"asset": asset, "weight": 1.0}],
+        "cashWeight": 0.0,
+        "nextTrigger": "无交易触发；每个完成月末只记录参考净值。",
+        "riskTrigger": "不适用：基准不承担策略门禁或止损规则。",
+        "note": f"同期参考收盘{reference_price:.2f}；模型展示不包含真实账户数据。",
+    }
 
 
 def _top_proxy_models(
@@ -348,6 +446,30 @@ def _top_proxy_models(
     ]
 
 
+def _top_proxy_current_snapshot(
+    assets: tuple[str, ...],
+    as_of: str,
+) -> dict[str, Any]:
+    count = len(assets)
+    weight = _number(1.0 / count, 10)
+    names = " / ".join(assets)
+    return {
+        "asOf": as_of,
+        "mode": "RESEARCH_BLOCKED",
+        "newCapitalGate": "BLOCK",
+        "action": f"纸面11m Top{count}等权篮子：{names}；生产权重为0%。",
+        "basketBasis": "research-sleeve",
+        "modelBasket": [
+            {"asset": asset, "weight": weight}
+            for asset in assets
+        ],
+        "cashWeight": 0.0,
+        "nextTrigger": "下一个完成月末重新计算11个月总回报排名，下一交易日收盘形成纸面换仓。",
+        "riskTrigger": "完整PIT历史成分、退市收益与复杂公司行动未补齐前，始终阻断生产下单。",
+        "note": "当前候选窗口已核验；100%仅表示研究袖套内部权重，不代表账户配置建议。",
+    }
+
+
 def _baseline_decisions(price: pd.Series, start: pd.Timestamp) -> dict[pd.Timestamp, dict[str, Any]]:
     ema21 = price.ewm(span=21, adjust=False).mean()
     ema50 = price.ewm(span=50, adjust=False).mean()
@@ -365,11 +487,13 @@ def _baseline_decisions(price: pd.Series, start: pd.Timestamp) -> dict[pd.Timest
         else:
             regime, action = "趋势转弱", "DEFEND REVIEW"
         decisions[day] = {
+            "kind": "BLOCK" if action == "DEFEND REVIEW" else "HOLD",
             "action": action,
             "regime": regime,
             "reason": (
                 f"月末只复盘SPMO收盘 {close:.2f}、EMA21 {fast:.2f}、EMA50 {slow:.2f}；"
-                "这是可复现的趋势监测，不追溯声称历史sentinel门。"
+                "这是可复现的趋势监测，不追溯声称历史sentinel门；"
+                "DEFEND REVIEW只标记防守复核，并未在该代理路径中执行减仓。"
             ),
             "targetExposure": 1.0,
             "modelBasket": [{"asset": "SPMO", "weight": 1.0}],
@@ -380,6 +504,7 @@ def _baseline_decisions(price: pd.Series, start: pd.Timestamp) -> dict[pd.Timest
 def _benchmark_decisions(price: pd.Series, start: pd.Timestamp, asset: str) -> dict[pd.Timestamp, dict[str, Any]]:
     return {
         day: {
+            "kind": "REFERENCE",
             "action": "HOLD",
             "regime": "被动基准",
             "reason": f"{asset}买入持有对照；月末仅记录，不进行择时或换仓。",
@@ -400,6 +525,7 @@ def _shadow_decisions(
     month_close = price.groupby(price.index.to_period("M")).last()
     month_average = month_close.rolling(10, min_periods=10).mean()
     decisions: dict[pd.Timestamp, dict[str, Any]] = {}
+    previous_desired: float | None = None
     for day in signal_mask[signal_mask].index:
         if day < start:
             continue
@@ -408,7 +534,16 @@ def _shadow_decisions(
         average = float(month_average.at[period])
         desired = float(target.at[day])
         state = "ON" if desired > 0.5 + EPS else "OFF"
+        if previous_desired is None:
+            kind = "ENTER"
+        elif desired > previous_desired + EPS:
+            kind = "ADD"
+        elif desired < previous_desired - EPS:
+            kind = "REDUCE"
+        else:
+            kind = "HOLD"
         decisions[day] = {
+            "kind": kind,
             "action": f"SET {desired:.2f}×",
             "regime": f"10m SMA {state}",
             "reason": (
@@ -418,6 +553,7 @@ def _shadow_decisions(
             "targetExposure": desired,
             "modelBasket": [{"asset": "SPMO", "weight": desired}],
         }
+        previous_desired = desired
     return decisions
 
 
@@ -431,6 +567,7 @@ def _buy_hold_strategy(
     summary: str,
     status: str,
     current_models: list[dict[str, Any]],
+    current_snapshot: dict[str, Any],
     quality_ledger: dict[str, Any],
     charge_entry_cost: bool,
     trend_decisions: bool = False,
@@ -477,6 +614,7 @@ def _buy_hold_strategy(
             equity, annual_turnover=annual_turnover, status=status
         ),
         "currentModels": current_models,
+        "currentSnapshot": current_snapshot,
         "series": _weekly_plus_decisions(equity, exposure, decisions),
         "qualityLedger": copy.deepcopy(quality_ledger),
     }
@@ -517,6 +655,12 @@ def _shadow_strategy(
     )
     annual_turnover = float(simulation.turnover.sum()) / years
     current_target = float(target.iloc[-1])
+    completed_day = _completed_month_ends(price)[-1]
+    completed_period = completed_day.to_period("M")
+    month_close = price.groupby(price.index.to_period("M")).last()
+    ten_month_average = month_close.rolling(10, min_periods=10).mean()
+    completed_close = float(price.at[completed_day])
+    current_average = float(ten_month_average.at[completed_period])
     decisions = _shadow_decisions(price, simulation.equity.index[0], target, signal_mask)
     return {
         "id": "spmo-shadow-10m",
@@ -533,6 +677,12 @@ def _shadow_strategy(
             status="影子",
         ),
         "currentModels": _shadow_public_models(as_of, current_target),
+        "currentSnapshot": _shadow_current_snapshot(
+            as_of,
+            current_target,
+            completed_close,
+            current_average,
+        ),
         "series": _weekly_plus_decisions(
             simulation.equity, simulation.exposure, decisions
         ),
@@ -571,6 +721,7 @@ def _top_proxy_strategy(
         raise ValueError(f"11m Top{top_n} proxy produced no usable path")
     exposure = pd.Series(1.0, index=equity.index, dtype=float)
     decisions: dict[pd.Timestamp, dict[str, Any]] = {}
+    previous_signature: tuple[tuple[str, float], ...] | None = None
     for row in diagnostics.get("fills", []):
         day = pd.Timestamp(row["signalDate"])
         if day not in equity.index:
@@ -579,8 +730,17 @@ def _top_proxy_strategy(
         assets = [str(asset) for asset, weight in weights.items() if float(weight) > 0]
         if not assets:
             continue
+        signature = tuple(
+            sorted(
+                (str(asset), _number(weight, 10))
+                for asset, weight in weights.items()
+                if float(weight) > 0
+            )
+        )
+        kind = "REBALANCE" if previous_signature is None or signature != previous_signature else "HOLD"
         decisions[day] = {
-            "action": "REBALANCE → " + " / ".join(assets),
+            "kind": kind,
+            "action": f"{kind} → " + " / ".join(assets),
             "regime": f"11m Top{top_n} · 当代成分代理",
             "reason": (
                 "用当月末11个月总回报排序并等权，下一交易日收盘执行；"
@@ -593,6 +753,7 @@ def _top_proxy_strategy(
                 if float(weight) > 0
             ],
         }
+        previous_signature = signature
     years = max((equity.index[-1] - equity.index[0]).days / 365.25, EPS)
     annual_turnover = sum(
         float(row.get("oneWayTurnover", 0.0)) for row in diagnostics.get("fills", [])
@@ -611,6 +772,7 @@ def _top_proxy_strategy(
             equity, annual_turnover=annual_turnover, status="非决策级代理"
         ),
         "currentModels": _top_proxy_models(assets, as_of),
+        "currentSnapshot": _top_proxy_current_snapshot(assets, as_of),
         "series": _weekly_plus_decisions(equity, exposure, decisions),
         "qualityLedger": copy.deepcopy(quality_ledger),
     }
@@ -744,6 +906,7 @@ def build_public_study(
             ),
             status="采用",
             current_models=_spmo_public_models(spmo),
+            current_snapshot=_spmo_current_snapshot(spmo),
             quality_ledger=ledger,
             charge_entry_cost=True,
             trend_decisions=True,
@@ -760,6 +923,9 @@ def build_public_study(
             current_models=_comparison_models(
                 "SPY", generated_date, float(frame["SPY"].dropna().iloc[-1])
             ),
+            current_snapshot=_comparison_current_snapshot(
+                "SPY", generated_date, float(frame["SPY"].dropna().iloc[-1])
+            ),
             quality_ledger=ledger,
             charge_entry_cost=False,
         ),
@@ -772,6 +938,9 @@ def build_public_study(
             summary="QQQ十年买入持有，仅用于比较纳指暴露，不是当前建议配置。",
             status="基准",
             current_models=_comparison_models(
+                "QQQ", generated_date, float(frame["QQQ"].dropna().iloc[-1])
+            ),
+            current_snapshot=_comparison_current_snapshot(
                 "QQQ", generated_date, float(frame["QQQ"].dropna().iloc[-1])
             ),
             quality_ledger=ledger,

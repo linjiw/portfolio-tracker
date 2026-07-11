@@ -34,6 +34,7 @@ STRATEGY_KEYS = {
     "exposureUnit",
     "metrics",
     "currentModels",
+    "currentSnapshot",
     "series",
     "qualityLedger",
 }
@@ -49,8 +50,30 @@ MODEL_KEYS = {
     "gate",
     "note",
 }
+SNAPSHOT_KEYS = {
+    "asOf",
+    "mode",
+    "newCapitalGate",
+    "action",
+    "basketBasis",
+    "modelBasket",
+    "cashWeight",
+    "nextTrigger",
+    "riskTrigger",
+    "note",
+}
 POINT_KEYS = {"date", "nav", "drawdown", "exposure", "decision"}
-DECISION_KEYS = {"action", "regime", "reason", "targetExposure", "modelBasket"}
+DECISION_KEYS = {"kind", "action", "regime", "reason", "targetExposure", "modelBasket"}
+DECISION_KINDS = {
+    "ENTER",
+    "ADD",
+    "HOLD",
+    "REDUCE",
+    "EXIT",
+    "REBALANCE",
+    "BLOCK",
+    "REFERENCE",
+}
 BASKET_KEYS = {"asset", "weight"}
 QUALITY_KEYS = {"rank", "asset", "momentumReturn", "status", "evidence"}
 QUALITY_STATUSES = {"PASS", "WATCH", "BLOCK_DECISION_GRADE"}
@@ -215,6 +238,75 @@ class PublicBundleTests(unittest.TestCase):
                     1.250001,
                 )
 
+    def test_current_snapshots_make_each_strategy_immediately_actionable(self) -> None:
+        expected_modes = [
+            "PRODUCTION_HOLD",
+            "SHADOW_ONLY",
+            "BENCHMARK",
+            "BENCHMARK",
+            "RESEARCH_BLOCKED",
+            "RESEARCH_BLOCKED",
+        ]
+        expected_gates = ["BLOCK", "BLOCK", "NA", "NA", "BLOCK", "BLOCK"]
+        expected_bases = [
+            "account-target",
+            "shadow-account-target",
+            "benchmark",
+            "benchmark",
+            "research-sleeve",
+            "research-sleeve",
+        ]
+        expected_assets = [
+            ["SPMO"],
+            ["SPMO"],
+            ["SPY"],
+            ["QQQ"],
+            ["SNDK", "MU", "WDC"],
+            ["SNDK", "MU", "WDC", "LITE", "INTC"],
+        ]
+        expected_cash = [0.92, 0.90, 0.0, 0.0, 0.0, 0.0]
+
+        for index, strategy in enumerate(self.study["strategies"]):
+            snapshot = strategy["currentSnapshot"]
+            self.assertEqual(set(snapshot), SNAPSHOT_KEYS)
+            self.assertEqual(snapshot["mode"], expected_modes[index])
+            self.assertEqual(snapshot["newCapitalGate"], expected_gates[index])
+            self.assertEqual(snapshot["basketBasis"], expected_bases[index])
+            self.assertEqual(
+                [item["asset"] for item in snapshot["modelBasket"]],
+                expected_assets[index],
+            )
+            self.assertAlmostEqual(snapshot["cashWeight"], expected_cash[index])
+            self.assertAlmostEqual(
+                sum(item["weight"] for item in snapshot["modelBasket"])
+                + snapshot["cashWeight"],
+                1.0,
+                places=8,
+            )
+            for field in ("action", "nextTrigger", "riskTrigger", "note"):
+                self.assertTrue(snapshot[field])
+
+        production = self.study["strategies"][0]["currentSnapshot"]
+        self.assertEqual(production["modelBasket"], [{"asset": "SPMO", "weight": 0.08}])
+        self.assertGreaterEqual(
+            len(re.findall(r"\d+\.\d{2}", production["nextTrigger"])),
+            2,
+        )
+        self.assertGreaterEqual(
+            len(re.findall(r"\d+\.\d{2}", production["riskTrigger"])),
+            2,
+        )
+        shadow = self.study["strategies"][1]["currentSnapshot"]
+        self.assertEqual(shadow["modelBasket"], [{"asset": "SPMO", "weight": 0.1}])
+        for benchmark in self.study["strategies"][2:4]:
+            benchmark_track = benchmark["currentModels"][0]
+            self.assertEqual(benchmark_track["targetExposure"], 1.0)
+            self.assertEqual(benchmark_track["cashExposure"], 0.0)
+            self.assertEqual(
+                benchmark_track["riskyAsset"],
+                benchmark["currentSnapshot"]["modelBasket"][0]["asset"],
+            )
+
     def test_series_and_decisions_use_observable_fields(self) -> None:
         for strategy in self.study["strategies"]:
             series = strategy["series"]
@@ -231,6 +323,7 @@ class PublicBundleTests(unittest.TestCase):
                 decision = point["decision"]
                 if decision is not None:
                     self.assertEqual(set(decision), DECISION_KEYS)
+                    self.assertIn(decision["kind"], DECISION_KINDS)
                     self.assertNotIn("confidence", decision)
                     self.assertGreaterEqual(decision["targetExposure"], 0)
                     self.assertLessEqual(decision["targetExposure"], 1.25)
@@ -245,6 +338,45 @@ class PublicBundleTests(unittest.TestCase):
                     self.assertLessEqual(total_weight, 1.250001)
             self.assertEqual(dates, sorted(dates))
             self.assertEqual(len(dates), len(set(dates)))
+
+    def test_decision_kinds_encode_material_changes(self) -> None:
+        all_decisions = [
+            [point["decision"] for point in strategy["series"] if point["decision"]]
+            for strategy in self.study["strategies"]
+        ]
+
+        for decision in all_decisions[0]:
+            expected = "BLOCK" if decision["action"] == "DEFEND REVIEW" else "HOLD"
+            self.assertEqual(decision["kind"], expected)
+            if expected == "BLOCK":
+                self.assertEqual(decision["targetExposure"], 1.0)
+                self.assertIn("未在该代理路径中执行减仓", decision["reason"])
+
+        previous_target = None
+        for decision in all_decisions[1]:
+            if previous_target is None:
+                expected = "ENTER"
+            elif decision["targetExposure"] > previous_target + 1e-12:
+                expected = "ADD"
+            elif decision["targetExposure"] < previous_target - 1e-12:
+                expected = "REDUCE"
+            else:
+                expected = "HOLD"
+            self.assertEqual(decision["kind"], expected)
+            previous_target = decision["targetExposure"]
+
+        for decisions in all_decisions[2:4]:
+            self.assertEqual({row["kind"] for row in decisions}, {"REFERENCE"})
+
+        for decisions in all_decisions[4:]:
+            previous_basket = None
+            for decision in decisions:
+                basket = tuple(
+                    sorted((item["asset"], item["weight"]) for item in decision["modelBasket"])
+                )
+                expected = "REBALANCE" if previous_basket is None or basket != previous_basket else "HOLD"
+                self.assertEqual(decision["kind"], expected)
+                previous_basket = basket
 
     def test_top3_top5_ledger_is_11m_and_not_subjective_score(self) -> None:
         expected = {
@@ -273,9 +405,23 @@ class PublicBundleTests(unittest.TestCase):
         self.assertIn("momentumReturn", quality["properties"])
         self.assertNotIn("score", quality["properties"])
         decision = self.schema["$defs"]["decision"]
+        self.assertIn("kind", decision["properties"])
         self.assertIn("targetExposure", decision["properties"])
         self.assertIn("modelBasket", decision["properties"])
         self.assertNotIn("confidence", decision["properties"])
+        snapshot = self.schema["$defs"]["currentSnapshot"]
+        self.assertEqual(
+            snapshot["properties"]["mode"]["enum"],
+            ["PRODUCTION_HOLD", "SHADOW_ONLY", "BENCHMARK", "RESEARCH_BLOCKED"],
+        )
+        self.assertEqual(
+            snapshot["properties"]["newCapitalGate"]["enum"],
+            ["ALLOW", "WATCH", "BLOCK", "NA"],
+        )
+        self.assertEqual(
+            snapshot["properties"]["basketBasis"]["enum"],
+            ["account-target", "shadow-account-target", "benchmark", "research-sleeve"],
+        )
 
     def test_runtime_resources_are_relative_and_local(self) -> None:
         parser = ResourceParser()
@@ -294,6 +440,30 @@ class PublicBundleTests(unittest.TestCase):
         self.assertIn('new URL("./data/study.json", document.baseURI)', app)
         self.assertIn("fetch(DATA_URL", app)
         self.assertNotRegex(app, r"fetch\(\s*['\"]https?://")
+
+    def test_fast_decision_dashboard_contract_is_present(self) -> None:
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        app = (ROOT / "app.js").read_text(encoding="utf-8")
+        css = (ROOT / "styles.css").read_text(encoding="utf-8")
+        for element_id in ("now", "overview-grid", "decision-shortcuts", "decision-kind"):
+            self.assertIn(f'id="{element_id}"', html)
+        for token in (
+            "MODE_LABELS",
+            "BASKET_BASIS_LABELS",
+            "KIND_LABELS",
+            "renderOverview",
+            "kindForSnapshot",
+            'setAttribute("aria-current", "date")',
+            "模型总权重必须为100%",
+        ):
+            self.assertIn(token, app)
+        for selector in (
+            ".overview-grid",
+            ".decision-shortcuts",
+            ".decision-marker",
+            ".model-track .detail-list",
+        ):
+            self.assertIn(selector, css)
 
     def test_workflow_stages_only_explicit_public_files(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
