@@ -196,6 +196,28 @@ class ArtifactValidationTests(unittest.TestCase):
         self.assertFalse(health["decisionGrade"])
         self.assertIn("research-only", health["reason"])
 
+    def test_semi_leverage_artifact_is_validated_as_research_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "semi_leverage_tracker.json"
+            path.write_text(json.dumps({
+                "schemaVersion": 2,
+                "generatedAt": "2026-07-09T20:00:00Z",
+                "asOf": "2026-07-09",
+                "researchOnly": True,
+                "decisionGrade": False,
+                "korea": {},
+                "unitedStates": {},
+                "prices": {},
+                "analysis": {},
+            }), encoding="utf-8")
+
+            doc, health = artifacts.load_artifact(td, "semiLeverage", "2026-07-09")
+
+        self.assertIsNotNone(doc)
+        self.assertEqual("fresh", health["status"])
+        self.assertFalse(health["decisionGrade"])
+        self.assertIn("research-only", health["reason"])
+
     def test_fresh_artifact_requires_an_explicit_true_decision_grade_contract(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "financial_status.json"

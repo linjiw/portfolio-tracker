@@ -151,6 +151,7 @@ python3 scripts/options_credit_spread_backtest.py --price-ticker QQQ --period 5y
   # non-overlapping capital, explicit dividend/IV/slippage assumptions, nested walk-forward.
 python3 scripts/ai_watchlist_score.py
 python3 scripts/aics_tool.py
+python3 scripts/semi_leverage_tracker.py
 ```
 
 AI score outputs distinguish curated priors from observed market data. Non-USD
@@ -173,6 +174,10 @@ market-mass research workflow.
 
 See [README_options_credit_spread_backtest.md](README_options_credit_spread_backtest.md)
 for the option-spread research model.
+
+See [docs/semi_leverage_tracker.md](docs/semi_leverage_tracker.md) for the
+Korea/U.S. leverage data contract, publication-aware alignment, and
+semiconductor price-relationship tests.
 
 ## Project Layout
 

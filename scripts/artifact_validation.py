@@ -31,6 +31,13 @@ ARTIFACT_SPECS = {
                      "researchOnly": bool, "decisionGrade": bool},
         "asOf": ("marketDataAsOf",), "generatedAt": ("generatedAt",), "maxAgeDays": 14,
     },
+    "semiLeverage": {
+        "path": "semi_leverage_tracker.json", "versions": {2},
+        "required": {"generatedAt": str, "asOf": str, "korea": dict,
+                     "unitedStates": dict, "prices": dict, "analysis": dict,
+                     "researchOnly": bool, "decisionGrade": bool},
+        "asOf": ("asOf",), "generatedAt": ("generatedAt",), "maxAgeDays": 5,
+    },
     "aiWatchlist": {
         "path": "ai_watchlist.json", "versions": {1}, "legacy": True,
         "required": {"generatedAt": str, "scores": list, "modelCard": dict,

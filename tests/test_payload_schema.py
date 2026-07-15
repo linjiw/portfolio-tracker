@@ -2,7 +2,7 @@
 
 The dashboard's JS template consumes ``DATA.<key>`` for a fixed set of
 top-level keys. ``build_payload`` produces the core keys; the optional
-research layers (decision / aiSemiQuant / aiWatchlist / aics / marketMass /
+research layers (decision / aiSemiQuant / semiLeverage / aiWatchlist / aics / marketMass /
 momentumTop3 / financialStatus) are attached in ``main`` via ``load_*`` helpers. These tests
 build a payload from a small synthetic portfolio and assert:
 
@@ -34,7 +34,7 @@ UI_CORE_KEYS = {
     "optionSettlements",
 }
 UI_OPTIONAL_KEYS = {
-    "decision", "aiSemiQuant", "aiWatchlist", "aics", "marketMass",
+    "decision", "aiSemiQuant", "semiLeverage", "aiWatchlist", "aics", "marketMass",
     "momentumTop3", "financialStatus", "closeVsIntraday", "artifactHealth",
 }
 
@@ -124,6 +124,7 @@ class PayloadSchemaTests(unittest.TestCase):
             optional = {
                 "decision": generate.load_decision_analysis(td, None, health),
                 "aiSemiQuant": generate.load_ai_semi_quant(td, None, health),
+                "semiLeverage": generate.load_semi_leverage(td, None, health),
                 "aiWatchlist": generate.load_ai_watchlist(td, None, health),
                 "aics": generate.load_aics_payload(td, None, health),
                 "marketMass": generate.load_market_mass_dashboard(td, None, health),

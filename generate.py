@@ -3242,6 +3242,10 @@ def load_ai_semi_quant(out_dir, reference_date=None, health=None):
     return _load_optional_artifact(out_dir, "aiSemiQuant", reference_date, health)
 
 
+def load_semi_leverage(out_dir, reference_date=None, health=None):
+    return _load_optional_artifact(out_dir, "semiLeverage", reference_date, health)
+
+
 def load_ai_watchlist(out_dir, reference_date=None, health=None):
     return _load_optional_artifact(out_dir, "aiWatchlist", reference_date, health)
 
@@ -3711,6 +3715,25 @@ svg{width:100%; height:auto; display:block}
 svg text{font-family:var(--f-mono); font-variant-numeric:tabular-nums slashed-zero}
 .chartbox.wide-mobile{overflow-x:auto}
 .chartbox.wide-mobile>svg{min-width:760px}
+.lev-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}
+.lev-toolbar .legend{margin:0}
+.lev-range{display:inline-flex;border:1px solid var(--line);border-radius:var(--r-ctl);overflow:hidden;background:var(--bg2)}
+.lev-range button{
+  min-width:42px;min-height:30px;padding:5px 9px;border:0;border-left:1px solid var(--line);
+  background:transparent;color:var(--mut);font:600 var(--t-xs)/1 var(--f-mono);cursor:pointer;
+}
+.lev-range button:first-child{border-left:0}
+.lev-range button:hover{color:var(--txt);background:var(--panel2)}
+.lev-range button.on{color:var(--accent);background:var(--accent-soft)}
+.lev-range button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.lev-window{display:flex;gap:8px 18px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--hair);font:500 var(--t-xs)/1.5 var(--f-mono);color:var(--mut)}
+.lev-window b{color:var(--txt);font-weight:600}
+.lev-quotes{padding:10px 0 2px;border-top:1px solid var(--hair)}
+.lev-quotes .badge{min-width:170px}
+.lev-quotes .badge .v{font-size:var(--t-lg)}
+.lev-quote-meta{max-width:245px;line-height:1.5}
+.lev-axis-title{font-size:10px}
+@media (max-width:560px){.lev-axis-title{font-size:8px}}
 
 /* ============================== TOOLTIP ============================== */
 .tt{
@@ -4122,6 +4145,9 @@ details[open] summary::before{content:"▾ "}
   #aics-map,.mt-chart{min-width:760px}
   .seg[data-seg="aics"] .chartbox,.seg[data-seg="mom"] .chartbox{overflow-x:auto}
   .ctx{top:calc(var(--header-h) + 8px);right:8px;left:auto;transform:none}
+  .lev-toolbar{align-items:flex-start}
+  .lev-range{width:100%}
+  .lev-range button{flex:1;min-height:44px;padding:12px 8px;font-size:var(--t-sm)}
 }
 </style>
 </head>
@@ -4283,14 +4309,14 @@ document.getElementById('kpis').innerHTML=
 let filter='held', sortKey='value', q='', sel='__OV__';
 const stocks=DATA.stocks;
 const DEFAULT_SEG={ov:'score',stk:'price'};
-const VALID_SEG={ov:['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
-const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', aics:'AICS产业链', aiwatch:'AI观察池', memflow:'存储资金流', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
+const VALID_SEG={ov:['score','decide','fin','aisemi','leverage','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'], stk:['price','fin','tx','fib','journal']};   // allowlist: keeps invalid #/stock/NVDA/banana from silently overwriting localStorage and lets us reject typo-URLs
+const SEG_LABEL={score:'决策一览', decide:'决策分析', fin:'财务状态', aisemi:'AI半导体', leverage:'杠杆压力', aics:'AICS产业链', aiwatch:'AI观察池', memflow:'存储资金流', qt:'QQQ/TQQQ', mass:'重心边界', nw:'净值·账户', cmp:'指数对比', mom:'动量策略', pfib:'技术·节奏', sig:'持仓信号', risk:'波动贡献', struct:'结构', beh:'行为决策', rebal:'再平衡计划', price:'价格 · 操作', tx:'交易明细', fib:'斐波那契'};
 function segLabel(seg,ctx){if(seg==='journal')return ctx==='stk'?'日志':'交易日志'; return SEG_LABEL[seg]||seg||'';}
 // Two-level portfolio nav: 5 themed workspaces (level 1) over the seg sub-rail (level 2).
 // Routing is untouched — hash stays #/portfolio/<seg>; the workspace is derived FROM the seg.
 const WS_MAP=[
  {id:'today', label:'今日决策', segs:['score','decide','qt','mass']},
- {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','aics','aiwatch','memflow']},
+ {id:'ai',    label:'研究·AI',  segs:['fin','aisemi','leverage','aics','aiwatch','memflow']},
  {id:'perf',  label:'净值·表现', segs:['nw','cmp','mom','pfib','sig']},
  {id:'risk',  label:'风险·结构', segs:['risk','struct']},
  {id:'plan',  label:'行为·计划', segs:['beh','journal','rebal']},
@@ -4626,6 +4652,7 @@ function svgLines(ser,defs,opts){
  el+=`<rect x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="none" stroke="${C.line}"/>`+regMarks(mL,mT,W-mL-mR,(typeof stripH!=='undefined')?(H-mT-mB-stripH):(H-mT-mB));
  const n=ser.length;
  let mtx=monthTicks(xmin,xmax);
+ if(opts.tickStride&&opts.tickStride>1&&mtx.length>6)mtx=mtx.filter((_,i)=>i%opts.tickStride===0||i===mtx.length-1);
  if(mtx.length>=2){mtx.forEach(g=>{const x=xs(g.t);el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="${C.hair}"/><text x="${x}" y="${H-mB+18}" fill="${C.mut}" font-size="11" text-anchor="middle">${g.label}</text>`;});}
  else{for(let i=0;i<=5;i++){const idx=Math.round((n-1)*i/5),p=ser[idx],x=xs(p.date),dt=new Date(p.date);
    el+=`<text x="${x}" y="${H-mB+18}" fill="${C.mut}" font-size="11" text-anchor="middle">${dt.getMonth()+1}/${dt.getDate()}</text>`;}}
@@ -5544,6 +5571,146 @@ function aiSemiQuantCard(){
  ${foldCard('Model Card / Score Audit','每次复跑都要可审计',`<div class="scroll"><table><thead><tr><th class="l">项目</th><th>值</th></tr></thead><tbody>${auditRows}</tbody></table></div><div class="scroll" style="margin-top:10px"><table><thead><tr><th class="l">代码</th><th>级别</th><th class="l">规则</th><th class="l">原因</th></tr></thead><tbody>${flagRows}</tbody></table></div>`,0,esc(`v${model.modelVersion||'—'}`))}
  ${foldCard('来源与边界','当前事实需要随财报 / 产业数据更新',`<ul style="margin:0;padding-left:18px;line-height:1.8">${src}</ul><div class="note" style="margin-top:10px">结构因子来自本次目标文件和参考研究的人工先验；价格和趋势来自 Yahoo Finance（如果可用）。请在财报、法说会、TrendForce/SEMI/Counterpoint 数据更新后重跑并复核。<b>非投资建议。</b></div>`,0,(D.sources||[]).length+' sources')}`;
 }
+function levNum(v,d=2,s=''){v=Number(v);return Number.isFinite(v)?v.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})+s:'—';}
+function levSigned(v,d=2,s=''){v=Number(v);return Number.isFinite(v)?(v>=0?'+':'−')+Math.abs(v).toFixed(d)+s:'—';}
+function levPrice(stock,v){
+ v=Number(v);if(!Number.isFinite(v))return'—';
+ const krw=stock.currency==='KRW',digits=krw?0:2;
+ return(krw?'₩':'$')+v.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits});
+}
+function levPressure(p){
+ if(!p||p.zScore==null)return'—';
+ const c=p.zScore>=1.5?C.red:(p.zScore>=.5?C.accent:(p.zScore<=-1?C.green:C.mut2));
+ return `<span style="color:${c}">z ${levSigned(p.zScore,2)} · P${levNum(p.percentile,1)}</span>`;
+}
+function levEvidence(ci){
+ if(!ci||ci.length<2)return'<span class="note">样本不足</span>';
+ const crosses=ci[0]<=0&&ci[1]>=0;
+ return `<span style="color:${crosses?C.mut2:C.accent}">${crosses?'未脱离零':'区间同向'} · [${levSigned(ci[0],2)}, ${levSigned(ci[1],2)}]</span>`;
+}
+const LEV_RANGE={korea:'1Y',us:'ALL',short:'6M'};
+const LEV_RANGE_MONTHS={'1M':1,'3M':3,'6M':6,'1Y':12,'2Y':24};
+function levConfig(kind){
+ const D=DATA.semiLeverage||{},U=D.unitedStates||{},Q=U.muShortFlow||{};
+ if(kind==='korea')return{kind,rows:(D.korea||{}).chart||[],metricLabel:'韩国杠杆比',unit:'%',digits:2,deltaUnit:'pp',color:C.accent,ranges:['6M','1Y','ALL'],stocks:[{key:'005930.KS',label:'Samsung',endLabel:'SEC',currency:'KRW',color:C.mut2},{key:'000660.KS',label:'SK hynix',endLabel:'SKH',currency:'KRW',color:C.green}]};
+ if(kind==='us')return{kind,rows:U.chart||[],metricLabel:'美国杠杆比',unit:'x',digits:2,deltaUnit:'x',color:C.red,ranges:['1Y','2Y','ALL'],stocks:[{key:'MU',label:'MU',currency:'USD',color:C.accent},{key:'SOXX',label:'SOXX',currency:'USD',color:C.mut2,dash:'5 3'}]};
+ return{kind:'short',rows:Q.chart||[],metricLabel:'MU短量5日均值',unit:'%',digits:2,deltaUnit:'pp',color:C.mut2,ranges:['1M','3M','6M','ALL'],stocks:[{key:'MU',label:'MU',currency:'USD',color:C.accent}]};
+}
+function levRangeRows(rows,range){
+ if(!rows||!rows.length||range==='ALL')return(rows||[]).slice();
+ const months=LEV_RANGE_MONTHS[range];if(!months)return rows.slice();
+ const end=new Date(rows[rows.length-1].date+'T00:00:00Z'),cut=new Date(end);cut.setUTCMonth(cut.getUTCMonth()-months);
+ const out=rows.filter(r=>+new Date(r.date+'T00:00:00Z')>=+cut);
+ return out.length>=2?out:rows.slice(-2);
+}
+function levWindowSeries(cfg){
+ const rows=levRangeRows(cfg.rows,LEV_RANGE[cfg.kind]);
+ const out=rows.map(r=>({...r}));
+ cfg.stocks.forEach(s=>{const base=out.find(r=>r[s.key]!=null&&Number(r[s.key])!==0);const b=base?Number(base[s.key]):null;
+   out.forEach(r=>{r[s.key]=b&&r[s.key]!=null?Number(r[s.key])/b*100:null;});});
+ return out;
+}
+function levMetricTick(cfg,v,step){
+ if(cfg.unit==='x')return Number(v).toFixed(step>=1?0:(step>=.1?1:2))+'x';
+ return Number(v).toFixed(step>=1?0:1)+'%';
+}
+function levDualChart(kind){
+ const cfg=levConfig(kind),ser=levWindowSeries(cfg),range=LEV_RANGE[kind];
+ if(ser.length<2)return'<div class="note">价格或杠杆历史不足，无法绘图。</div>';
+ const MOB=CHART_MOB,W=MOB?520:900,H=340,mL=MOB?58:72,mR=MOB?92:108,mT=28,mB=MOB?36:42;
+ const xmin=+new Date(ser[0].date),xmax=+new Date(ser[ser.length-1].date);
+ const mv=ser.map(r=>r.metricValue).filter(Number.isFinite),sv=[];
+ cfg.stocks.forEach(s=>ser.forEach(r=>{if(Number.isFinite(r[s.key]))sv.push(r[s.key]);}));
+ const lt=niceTicks(Math.min(...mv),Math.max(...mv),4),rt=niceTicks(Math.min(...sv),Math.max(...sv),4);
+ const xs=d=>mL+((+new Date(d)-xmin)/((xmax-xmin)||1))*(W-mL-mR);
+ const yl=v=>mT+(1-(v-lt.min)/((lt.max-lt.min)||1))*(H-mT-mB);
+ const yr=v=>mT+(1-(v-rt.min)/((rt.max-rt.min)||1))*(H-mT-mB);
+ const cid='c'+(++CHARTID),gid='lg'+cid;
+ let el=`<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${cfg.color}" stop-opacity=".13"/><stop offset="1" stop-color="${cfg.color}" stop-opacity="0"/></linearGradient></defs><rect x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="${C.bg2}"/>`;
+ const leftTitle=MOB?'LEVERAGE · LEFT':cfg.metricLabel.toUpperCase()+' · LEFT',rightTitle=MOB?'PRICE INDEX · START=100 · RIGHT':'REBASED PRICE INDEX · START=100 · RIGHT';
+ el+=`<text class="lev-axis-title" x="${mL}" y="14" fill="${cfg.color}" font-weight="600">${leftTitle}</text><text class="lev-axis-title" x="${W-mR}" y="14" fill="${C.mut}" font-weight="600" text-anchor="end">${rightTitle}</text>`;
+ lt.ticks.forEach(v=>{const y=yl(v);el+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="${C.hair}"/><text x="${mL-8}" y="${y+4}" fill="${cfg.color}" fill-opacity=".85" font-size="11" text-anchor="end">${levMetricTick(cfg,v,lt.step)}</text>`;});
+ rt.ticks.forEach(v=>{const y=yr(v);el+=`<text x="${W-mR+8}" y="${y+4}" fill="${C.mut}" font-size="11">${fmtTick(v,rt.step)}</text>`;});
+ const tickCount=MOB?4:6,seen=new Set();
+ for(let i=0;i<tickCount;i++){const idx=Math.round((ser.length-1)*i/(tickCount-1));if(seen.has(idx))continue;seen.add(idx);const r=ser[idx],x=xs(r.date),d=new Date(r.date),multi=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear(),lab=(range==='1M'||range==='3M')?(d.getMonth()+1)+'/'+d.getDate():(multi?String(d.getFullYear()).slice(2)+'/':'')+(d.getMonth()+1);el+=`<line x1="${x}" y1="${mT}" x2="${x}" y2="${H-mB}" stroke="${C.hair}"/><text x="${x}" y="${H-mB+19}" fill="${C.mut}" font-size="11" text-anchor="middle">${lab}</text>`;}
+ el+=`<rect x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="none" stroke="${C.line}"/>`+regMarks(mL,mT,W-mL-mR,H-mT-mB);
+ const mp=ser.filter(r=>Number.isFinite(r.metricValue)).map(r=>`${xs(r.date).toFixed(1)},${yl(r.metricValue).toFixed(1)}`).join(' ');
+ if(mp){const first=ser.find(r=>Number.isFinite(r.metricValue)),last=[...ser].reverse().find(r=>Number.isFinite(r.metricValue)),base=yl(lt.min);el+=`<polygon points="${xs(first.date).toFixed(1)},${base} ${mp} ${xs(last.date).toFixed(1)},${base}" fill="url(#${gid})"/><polyline class="draw" points="${mp}" fill="none" stroke="${cfg.color}" stroke-width="2.5"/><circle cx="${xs(last.date)}" cy="${yl(last.metricValue)}" r="3.8" fill="${cfg.color}" stroke="${C.bg}" stroke-width="1.2"/><text x="${xs(last.date)-7}" y="${yl(last.metricValue)-9}" fill="${cfg.color}" font-size="11" font-weight="600" text-anchor="end" stroke="${C.panel}" stroke-width="3" paint-order="stroke">${levNum(last.metricValue,cfg.digits,cfg.unit)}</text>`;}
+ const labels=[];
+ cfg.stocks.forEach(s=>{const f=ser.filter(r=>Number.isFinite(r[s.key])),pts=f.map(r=>`${xs(r.date).toFixed(1)},${yr(r[s.key]).toFixed(1)}`).join(' ');if(!pts)return;el+=`<polyline points="${pts}" fill="none" stroke="${s.color}" stroke-width="1.75" ${s.dash?`stroke-dasharray="${s.dash}"`:''}/>`;const last=f[f.length-1];labels.push({y:yr(last[s.key])+4,color:s.color,text:(s.endLabel||s.label)+' '+Math.round(last[s.key])+' idx'});});
+ labels.sort((a,b)=>a.y-b.y);for(let i=1;i<labels.length;i++)if(labels[i].y-labels[i-1].y<13)labels[i].y=labels[i-1].y+13;
+ labels.forEach(l=>{el+=`<text x="${W-mR+7}" y="${l.y}" fill="${l.color}" font-size="11" font-weight="600" stroke="${C.panel}" stroke-width="3" paint-order="stroke">${l.text}</text>`;});
+ const MY=new Date(xmin).getFullYear()!==new Date(xmax).getFullYear();
+ CHARTREG[cid]={dates:ser.map(r=>+new Date(r.date)),ys:ser.map(r=>Number.isFinite(r.metricValue)?yl(r.metricValue):null),rows:ser.map(r=>{const d=new Date(r.date),stocks=cfg.stocks.map(s=>{const raw=(r.priceValues||{})[s.key];return`<span class="xr"><i style="background:${s.color}"></i>${s.label} ${levPrice(s,raw)} adj close · ${r[s.key]==null?'—':levSigned(r[s.key]-100,1,'%')}</span>`;}).join('');return `<b>${fd(d,MY)}</b><br><span class="xr"><i style="background:${cfg.color}"></i>${cfg.metricLabel} ${levNum(r.metricValue,cfg.digits,cfg.unit)}</span>${stocks}`;})};
+ el+=`<g class="xg" style="display:none"><line class="cx" x1="0" y1="${mT}" x2="0" y2="${H-mB}"/><circle class="cxd" r="3.4"/></g><rect class="xhit" x="${mL}" y="${mT}" width="${W-mL-mR}" height="${H-mT-mB}" fill="transparent"/>`;
+ return `<svg id="${cid}" class="xh" role="img" aria-label="${cfg.metricLabel} 与股票价格双轴时间线" data-x0="${xmin}" data-x1="${xmax}" data-ml="${mL}" data-pw="${W-mL-mR}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${el}</svg>`;
+}
+function levWindowSummary(kind){
+ const cfg=levConfig(kind),ser=levWindowSeries(cfg);if(ser.length<2)return'';
+ const a=ser[0],b=ser[ser.length-1],md=Number(b.metricValue)-Number(a.metricValue);
+ const stocks=cfg.stocks.map(s=>{const v=b[s.key],raw=(b.priceValues||{})[s.key];return v==null?`<span>${s.label} <b>—</b></span>`:`<span>${s.label} <b>${levPrice(s,raw)}</b> · <b class="${v>=100?'pos':'neg'}">${levSigned(v-100,1,'%')}</b></span>`;}).join('');
+ return `<span>${a.date} → ${b.date}</span><span>${cfg.metricLabel} <b class="${md>=0?'pos':'neg'}">${levSigned(md,cfg.digits,cfg.deltaUnit)}</b></span>${stocks}`;
+}
+function levChartShell(kind){
+ const cfg=levConfig(kind),range=LEV_RANGE[kind];
+ const legend=`<div class="legend"><span><i class="ln" style="color:${cfg.color}"></i>${cfg.metricLabel} · 左轴</span>${cfg.stocks.map(s=>`<span><i class="${s.dash?'lnd':'ln'}" style="color:${s.color}"></i>${s.label} 指数 · 右轴</span>`).join('')}</div>`;
+ const buttons=cfg.ranges.map(r=>`<button class="${r===range?'on':''}" aria-pressed="${r===range?'true':'false'}" onclick="levSetRange('${kind}','${r}',this)">${r}</button>`).join('');
+ return `<div class="lev-toolbar">${legend}<div class="lev-range" role="group" aria-label="${cfg.metricLabel} 时间范围">${buttons}</div></div><div id="lev-${kind}-chart" class="chartbox">${levDualChart(kind)}</div><div id="lev-${kind}-window" class="lev-window">${levWindowSummary(kind)}</div>`;
+}
+function levSetRange(kind,range,button){
+ LEV_RANGE[kind]=range;
+ const group=button&&button.parentElement;if(group)group.querySelectorAll('button').forEach(b=>{const on=b===button;b.classList.toggle('on',on);b.setAttribute('aria-pressed',on?'true':'false');});
+ const chart=document.getElementById('lev-'+kind+'-chart'),summary=document.getElementById('lev-'+kind+'-window');
+ if(chart){chart.innerHTML=levDualChart(kind);armDraw(chart);}
+ if(summary)summary.innerHTML=levWindowSummary(kind);
+}
+function leverageTrackerCard(){
+ const D=DATA.semiLeverage;
+ if(!D||!D.korea||!D.unitedStates){
+  return `<div class="card t1"><div class="dh"><h2 class="t">杠杆压力<span class="t-en">LEVERAGE</span></h2><span class="nm">韩国日频 · 美国月频 · 美光日频流量代理</span></div><div class="note" style="line-height:1.8">暂无半导体杠杆数据。运行 <b>python3 scripts/semi_leverage_tracker.py</b> 写入 <b>output/semi_leverage_tracker.json</b>，再运行 <b>python3 generate.py --no-fetch</b>。研究分析，非投资建议。</div></div>`;
+ }
+ const K=D.korea.current||{},U=D.unitedStates.current||{},Q=(D.unitedStates.muShortFlow||{}).current||{};
+ const kp=K.pressure||{},up=U.pressure||{},qp=Q.pressure||{};
+ const status=(D.sources||[]).map(s=>`<span class="chip" style="color:${s.status==='live'?C.green:(s.status==='cache'?C.accent:C.red)};border-color:${s.status==='live'?'var(--chip-bd-green)':(s.status==='cache'?'var(--chip-bd-amber)':'var(--chip-bd-red)')}">${finEsc(s.id)} · ${finEsc(s.status)}</span>`).join('');
+ const top=[
+  ['韩国杠杆比',levNum(K.leverageRatioPct,2,'%'),`${levPressure(kp)} · ${K.date||'—'}`],
+  ['韩国信用余额',`₩${levNum(Number(K.creditLoansKrwBn)/1000,2,'T')}`,`5日 ${levSigned(K.creditChange5dPct,2,'%')} · 预托金 ₩${levNum(Number(K.investorDepositsKrwBn)/1000,2,'T')}`],
+  ['美国杠杆比',levNum(U.leverageRatioX,2,'x'),`${levPressure(up)} · ${U.period||'—'} 月末`],
+  ['美国保证金借款',`$${levNum(Number(U.debitUsdBn)/1000,2,'T')}`,`月变动 ${levSigned(U.debitChangePct,2,'%')} · 自由贷方 $${levNum(U.totalFreeCreditUsdBn,1,'B')}`],
+  ['MU短流量代理',levNum(Q.shortShare5dPct,2,'%'),`${levPressure(qp)} · ${Q.date||'—'}`],
+ ];
+ const quoteOrder=['005930.KS','000660.KS','MU','SOXX'],priceData=D.prices||{};
+ const quoteBadges=quoteOrder.map(symbol=>{
+  const p=priceData[symbol]||{},q=p.latestQuote||{},stock={currency:q.currency||p.currency};
+  const close=q.regularClose,showClose=Number.isFinite(Number(close))&&Math.abs(Number(close)-Number(q.price))>.0001;
+  return `<div class="badge"><div class="l">${finEsc(p.name||symbol)} · ${finEsc(symbol)}</div><div class="v">${levPrice(stock,q.price)}</div><div class="note lev-quote-meta">${finEsc(q.source||'price source unavailable')} · ${finEsc(q.session||'—')}<br>${finEsc(q.asOfLabel||q.asOf||p.asOf||'—')}${showClose?` · close ${levPrice(stock,close)}`:''}</div></div>`;
+ }).join('');
+ const kChart=levChartShell('korea'),uChart=levChartShell('us'),qChart=levChartShell('short');
+ const relationships=((D.analysis||{}).relationships)||[];
+ const rows=relationships.map(a=>{
+  const f=a.forward||[],f0=f[0]||{},f1=f[1]||{},f2=f[2]||{},ev=a.eventStudy||{},rv=a.reverse||{};
+  const metric=a.frequency==='daily proxy'?'短量代理':(a.market==='Korea'?'韩国杠杆':'美国杠杆');
+  return `<tr><td class="l"><b>${finEsc(a.ticker)}</b><br><span class="note">${finEsc(metric)} · ${finEsc(a.frequency)}</span></td><td>${a.alignedObservations||0}</td><td>${levSigned((a.concurrent||{}).pearson,2)}</td><td>${levSigned(f0.pearson,2)}<br><span class="note">${finEsc(f0.horizon||'—')} · n=${f0.n||0}</span></td><td>${levSigned(f1.pearson,2)}<br><span class="note">${finEsc(f1.horizon||'—')} · n=${f1.n||0}</span></td><td>${levSigned(f2.pearson,2)}<br><span class="note">${finEsc(f2.horizon||'—')} · n=${f2.n||0}</span></td><td class="l">${levEvidence(f0.pearsonCi95)}</td><td>${levSigned(ev.spreadPct,2,'pp')}<br><span class="note">${finEsc(ev.horizon||'—')}</span></td><td>${levSigned(rv.pearson,2)}</td></tr>`;
+ }).join('');
+ const stableForward=relationships.some(a=>(a.forward||[]).some(f=>f.pearsonCi95&&!(f.pearsonCi95[0]<=0&&f.pearsonCi95[1]>=0)));
+ const evidenceSummary=stableForward?'至少一个前瞻区间没有跨零；仍需检查多重检验、样本外稳定性与因果方向。':'本次所有前瞻相关的95%区间都跨过零，不能把杠杆变化当成稳定择时信号。';
+ const srcRows=(D.sources||[]).map(s=>`<tr><td class="l"><b>${finEsc(s.name)}</b><br><span class="note">${finEsc(s.scope||'')}</span></td><td style="color:${s.status==='live'?C.green:(s.status==='cache'?C.accent:C.red)}">${finEsc(s.status)}</td><td>${finEsc(s.frequency||'—')}</td><td>${finEsc(s.asOf||'—')}</td><td>${s.observations??'—'}</td><td class="l"><span class="note">${finEsc(s.limitation||'')}</span></td></tr>`).join('');
+ const warns=(D.warnings||[]).map(w=>`<span class="chip" style="color:${C.red};border-color:var(--chip-bd-red)">${finEsc(w)}</span>`).join('');
+ return `<div class="card t1">
+  <div class="dh"><h2 class="t">杠杆压力<span class="t-en">LEVERAGE</span></h2><span class="nm">韩国日频官方余额 · 美国月频官方余额 · MU日频流量代理 · 截至 ${finEsc(D.asOf||'—')}</span></div>
+  <div class="badges">${top.map(x=>`<div class="badge"><div class="l">${x[0]}</div><div class="v">${x[1]}</div><div class="note" style="font-size:var(--t-xs);margin-top:3px">${x[2]}</div></div>`).join('')}</div>
+  <div class="cap" style="margin-top:14px">LATEST VERIFIED STOCK TRADES</div>
+  <div class="badges lev-quotes">${quoteBadges}</div>
+  <div class="note" style="line-height:1.7">Naver/Nasdaq 的 latest trade 可包含盘前或盘后成交；图表与量化检验使用 Yahoo 日频复权收盘价。两者用途不同，时间戳和交易时段均在上方明确列出。</div>
+  <div class="note" style="line-height:1.7;margin-top:10px"><b>不可直接横比：</b>韩国是信用融资 / 投资者预托金的百分比，美国是保证金借款 / 自由贷方余额的倍数。跨市场只比较各自历史 z-score 与百分位。MU 短量占比只是场外报告流量压力代理，不是杠杆或空头存量。</div>
+  <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">${status}${warns}</div>
+ </div>
+ <div class="card"><div class="dh"><h2 class="t">韩国日频压力</h2><span class="nm">左轴=实际杠杆比 · 右轴=股价指数（窗口起点=100）</span></div>${kChart}<div class="note" style="margin-top:9px">当前 ${levNum(K.leverageRatioPct,2,'%')} · 日变动 ${levSigned(K.ratioChangePp,2,'pp')} · 反向卖出金额 ₩${levNum(K.forcedLiquidationKrwBn,1,'B')}。统计检验使用比率变化而非水平。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">美国月频压力</h2><span class="nm">左轴=FINRA实际杠杆倍数 · 右轴=MU/SOXX股价指数（窗口起点=100）</span></div>${uChart}<div class="note" style="margin-top:9px">最新官方月度值为 ${finEsc(U.period||'—')}；历史发布日缺失，因此前瞻检验保守地从次月25日后的第一个价格收盘开始。月度小样本与重叠收益会放大不确定性。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">MU日频流量代理</h2><span class="nm">左轴=短量占比5日均值 · 右轴=MU股价指数（窗口起点=100）</span></div>${qChart}<div class="note" style="margin-top:9px">短量可以包含做市、套保或同日回补，不能解释为净空仓。该代理单独展示，不并入美国官方杠杆比。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">关系检验<span class="t-en">QUANT</span></h2><span class="nm">比率变化 vs 收益 · 发布可用日对齐 · 移动区块Bootstrap</span></div><div class="scroll"><table><thead><tr><th class="l">标的/指标</th><th>对齐样本</th><th>同期 r</th><th>短期前瞻 r</th><th>中期前瞻 r</th><th>长期前瞻 r</th><th class="l">短期95%区间</th><th>事件差</th><th>收益→下期指标 r</th></tr></thead><tbody>${rows}</tbody></table></div><div class="note" style="margin-top:10px;line-height:1.7">${evidenceSummary} 事件差为指标变化最高五分位减最低五分位后的平均前瞻收益差；美国月频每组仅约5个事件，尤其不稳定。</div></div>
+ <div class="card"><div class="dh"><h2 class="t">数据口径与新鲜度</h2><span class="nm">抓取状态 · 频率 · 限制</span></div><div class="scroll"><table><thead><tr><th class="l">来源</th><th>状态</th><th>频率</th><th>截至</th><th>样本</th><th class="l">限制</th></tr></thead><tbody>${srcRows}</tbody></table></div><div class="note" style="margin-top:10px;line-height:1.7">${finEsc(D.disclaimer||'Research analytics only.')}</div></div>`;
+}
 function aicsTone(g){return aiqTone(g);}
 function aicsScoreColor(v){return v>=86?'#4FB286':(v>=76?'#E8B339':(v>=66?'#B89030':'#E5707A'));}
 function aicsGateChip(g){const c=aicsTone(g);return `<span class="chip" style="color:${c};border-color:${chipBd(c)}">${esc(g||'—')}</span>`;}
@@ -6082,6 +6249,7 @@ const PANEL_RENDERERS_OV={
  decide:()=>decisionLabCard(),
  fin:   ()=>financialStatusCard(),
  aisemi:()=>aiSemiQuantCard(),
+ leverage:()=>leverageTrackerCard(),
  aics:()=>aicsToolTab(),
  aiwatch:()=>aiWatchlistCard(),
  memflow:()=>memoryFlowCard(),
@@ -6142,13 +6310,13 @@ function renderOverview(){
  const _ob=document.getElementById('onboard-slot');if(_ob)_ob.innerHTML=onboardStrip();   // onboarding lives below the ledger, out of the hero zone
  // Render skeleton: viewbar + seg-rail + empty seg panels. ensureOvPanel() populates each on first activate.
  // activeSeg from URL is rendered eagerly so the initial paint has actual content.
- const segs=['score','decide','fin','aisemi','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
+ const segs=['score','decide','fin','aisemi','leverage','aics','aiwatch','memflow','qt','mass','nw','cmp','mom','pfib','sig','risk','struct','beh','journal','rebal'];
  const _ls=lastSeg('ov');const initialSeg=segs.indexOf(_ls)>=0?_ls:DEFAULT_SEG.ov;   // validate stale/invalid localStorage seg so .on/syncWs/panelMarkup all agree
  const _segin=document.body.classList.contains('done')?' segin':'';   // post-load renders settle; initial load keeps the stagger
  const panelMarkup=segs.map(s=>`<div class="seg${s===initialSeg?_segin:''}" data-seg="${s}"${s===initialSeg?'':' hidden'}></div>`).join('');
  right.innerHTML=`
  <nav aria-label="工作区" class="ws-rail-wrap"><div class="ws-rail"><span class="rail-here">组合总览</span>${WS_MAP.map(w=>`<button data-ws="${w.id}" title="${w.segs.map(s=>segLabel(s,'ov')).join(' · ')}" onclick="wsGo('${w.id}')">${w.label}</button>`).join('')}</div></nav>
- <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="memflow" title="韩国与美国存储股的投资者流向、杠杆清洗和做市商情景">存储资金流</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
+ <nav aria-label="组合分页" class="seg-rail-wrap"><div class="seg-rail"><button data-seg="score" title="每只持仓今天值不值得你看一眼">决策一览</button><button data-seg="decide" title="现金部署 · 择时 · 多视角量化裁决：理性该买什么">决策分析</button><button data-seg="fin" title="FMP 财务质量、财报记录与下一财报风险评分">财务状态</button><button data-seg="aisemi" title="AI 半导体产业链量化评分与资金瀑布">AI半导体</button><button data-seg="leverage" title="韩国与美国市场杠杆压力及内存股关系检验">杠杆压力</button><button data-seg="aics" title="AI 半导体资金流图谱、评分、情景和预警">AICS产业链</button><button data-seg="aiwatch" title="AI 旧能力重估观察池：价格刷新、评分、闸门">AI观察池</button><button data-seg="memflow" title="韩国与美国存储股的投资者流向、杠杆清洗和做市商情景">存储资金流</button><button data-seg="qt" title="QQQ 判断趋势，TQQQ/期权做执行">QQQ/TQQQ</button><button data-seg="mass" title="价格是否仍围绕成交重心运行，以及概率边界在哪里">重心边界</button><button data-seg="nw" title="我现在到底有多少钱（含现金 / 期权）">净值·账户</button><button data-seg="cmp" title="我跑赢大盘了吗">指数对比</button><button data-seg="mom" title="Momentum Top-3 策略、回测、当前信号和分批建仓进度">动量策略</button><button data-seg="pfib" title="整个组合的动能强弱与节奏（技术参考，非投资建议）">技术·节奏</button><button data-seg="sig" title="各持仓最近的技术信号">持仓信号</button><button data-seg="risk" title="哪只仓位贡献了最多波动">波动贡献</button><button data-seg="struct" title="钱和风险其实集中在哪几个主题">结构</button><button data-seg="beh" title="我的择时帮了还是拖了后腿">行为决策</button><button data-seg="journal" title="把你自己的交易当成诚实反馈：决策质量 vs 结果 + 成熟度评分 + 每周复盘">交易日志</button><button data-seg="rebal" title="该不该调仓、怎么调回我设的区间">再平衡计划</button></div></nav>
  ${panelMarkup}`;
  // Eagerly render the initial-seg panel so the first paint shows content (not an empty placeholder)
  ensureOvPanel(initialSeg);
@@ -7222,6 +7390,7 @@ def main():
     artifact_health = {}
     payload["decision"] = load_decision_analysis(artifact_dir, artifact_reference, artifact_health)
     payload["aiSemiQuant"] = load_ai_semi_quant(artifact_dir, artifact_reference, artifact_health)
+    payload["semiLeverage"] = load_semi_leverage(artifact_dir, artifact_reference, artifact_health)
     payload["aiWatchlist"] = load_ai_watchlist(artifact_dir, artifact_reference, artifact_health)
     payload["aics"] = load_aics_payload(artifact_dir, artifact_reference, artifact_health)
     payload["marketMass"] = load_market_mass_dashboard(artifact_dir, artifact_reference, artifact_health)
