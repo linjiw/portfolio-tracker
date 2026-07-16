@@ -1,0 +1,438 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "public-study.schema.json",
+  "title": "Momentum Public Research Study",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "dataStatus",
+    "siteTitle",
+    "generatedDate",
+    "notice",
+    "strategies",
+    "methodology",
+    "limitations"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "dataStatus": {
+      "enum": ["placeholder", "public-research"]
+    },
+    "siteTitle": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "generatedDate": {
+      "type": "string",
+      "format": "date"
+    },
+    "notice": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "strategies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/strategy"
+      }
+    },
+    "methodology": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "$ref": "#/$defs/method"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 400
+      }
+    }
+  },
+  "$defs": {
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "family",
+        "summary",
+        "exposureUnit",
+        "metrics",
+        "currentModels",
+        "currentSnapshot",
+        "series",
+        "qualityLedger"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{1,48}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "family": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "exposureUnit": {
+          "enum": ["percent", "multiplier"]
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        },
+        "currentModels": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/currentModel"
+          }
+        },
+        "currentSnapshot": {
+          "$ref": "#/$defs/currentSnapshot"
+        },
+        "series": {
+          "type": "array",
+          "minItems": 8,
+          "items": {
+            "$ref": "#/$defs/point"
+          }
+        },
+        "qualityLedger": {
+          "$ref": "#/$defs/qualityLedger"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cagr", "maxDrawdown", "calmar", "annualTurnover", "status"],
+      "properties": {
+        "cagr": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 5
+        },
+        "maxDrawdown": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 0
+        },
+        "calmar": {
+          "type": "number",
+          "minimum": -20,
+          "maximum": 50
+        },
+        "annualTurnover": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "status": {
+          "enum": ["采用", "影子", "基准", "非决策级代理", "研究中"]
+        }
+      }
+    },
+    "currentModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "track",
+        "label",
+        "asOf",
+        "riskyAsset",
+        "targetExposure",
+        "cashExposure",
+        "action",
+        "gate",
+        "note"
+      ],
+      "properties": {
+        "track": {
+          "enum": ["existing-sleeve", "new-capital"]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "asOf": {
+          "type": "string",
+          "format": "date"
+        },
+        "riskyAsset": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "targetExposure": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1.25
+        },
+        "cashExposure": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "gate": {
+          "enum": ["ALLOW", "WATCH", "BLOCK"]
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        }
+      }
+    },
+    "currentSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asOf",
+        "mode",
+        "newCapitalGate",
+        "action",
+        "basketBasis",
+        "modelBasket",
+        "cashWeight",
+        "nextTrigger",
+        "riskTrigger",
+        "note"
+      ],
+      "properties": {
+        "asOf": {
+          "type": "string",
+          "format": "date"
+        },
+        "mode": {
+          "enum": ["PRODUCTION_HOLD", "SHADOW_ONLY", "BENCHMARK", "RESEARCH_BLOCKED"]
+        },
+        "newCapitalGate": {
+          "enum": ["ALLOW", "WATCH", "BLOCK", "NA"]
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "basketBasis": {
+          "enum": ["account-target", "shadow-account-target", "benchmark", "research-sleeve"]
+        },
+        "modelBasket": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/basketItem"
+          }
+        },
+        "cashWeight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "nextTrigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "riskTrigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        }
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "nav", "drawdown", "exposure", "decision"],
+      "properties": {
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "nav": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10000
+        },
+        "drawdown": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 0
+        },
+        "exposure": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "decision": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decision"
+            }
+          ]
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "action", "regime", "reason", "targetExposure", "modelBasket"],
+      "properties": {
+        "kind": {
+          "enum": ["ENTER", "ADD", "HOLD", "REDUCE", "EXIT", "REBALANCE", "BLOCK", "REFERENCE"]
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "regime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "targetExposure": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1.25
+        },
+        "modelBasket": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/basketItem"
+          }
+        }
+      }
+    },
+    "basketItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "weight"],
+      "properties": {
+        "asset": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "weight": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1.25
+        }
+      }
+    },
+    "qualityLedger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top3", "top5"],
+      "properties": {
+        "top3": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/qualityItem"
+          }
+        },
+        "top5": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/qualityItem"
+          }
+        }
+      }
+    },
+    "qualityItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "asset", "momentumReturn", "status", "evidence"],
+      "properties": {
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "asset": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "momentumReturn": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1000
+        },
+        "status": {
+          "enum": ["PASS", "WATCH", "BLOCK_DECISION_GRADE"]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        }
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "body"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        }
+      }
+    }
+  }
+}

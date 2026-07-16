@@ -1,0 +1,57 @@
+name: Publish sanitized momentum research
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: momentum-public-pages
+  cancel-in-progress: false
+
+jobs:
+  validate-and-stage:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@v6
+
+      - name: Validate public bundle
+        run: python3 site/momentum-research-public/tests/test_public_bundle.py
+
+      - name: Stage explicit public allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_dir="$RUNNER_TEMP/momentum-public-site"
+          mkdir -p "$public_dir/data"
+          install -m 0644 site/momentum-research-public/index.html "$public_dir/index.html"
+          install -m 0644 site/momentum-research-public/styles.css "$public_dir/styles.css"
+          install -m 0644 site/momentum-research-public/app.js "$public_dir/app.js"
+          install -m 0644 site/momentum-research-public/public-study.schema.json "$public_dir/public-study.schema.json"
+          install -m 0644 site/momentum-research-public/data/study.json "$public_dir/data/study.json"
+
+      - name: Upload sanitized Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/momentum-public-site
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: validate-and-stage
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy reviewed artifact
+        id: deployment
+        uses: actions/deploy-pages@v4

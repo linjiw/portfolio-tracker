@@ -209,6 +209,96 @@ neither absolute returns nor relative strategy rankings are out-of-sample
 evidence. Schema v2 records this methodology, and artifact validation rejects
 older execution semantics or any artifact that claims decision-grade status.
 
+## Momentum Overlay Ten-Year Research
+
+`scripts/momentum_overlay_research.py` compares adjusted-price SPY, QQQ, SPMO,
+and the 11-month Top-3 research portfolio over a common ten-year window.  It
+loads additional pre-window history for indicators, observes every signal at a
+completed close, fills at the following session's close, charges turnover at
+the configured per-side cost, and credits unused capital with the yield implied
+by the prior available `^IRX` observation.  Generic ETF paths and the Top-3
+constituent engine use the same timing convention.  With all Top-3 overlays
+disabled, the new engine is regression-tested against `momentum_top3.py`; the
+only intentional difference is T-bill interest before the first monthly fill.
+
+Candidate families are prespecified: monthly/daily absolute trend, hysteresis,
+buy-stop/reclaim close proxies, capped volatility targeting, fixed and trailing
+stops, fixed take-profit falsification tests, panic-state de-risking, SPMO
+structural gates, and Top-3 positive-slot/rank-buffer/12-1 variants.  Main
+selection is unlevered.  A separately labeled 1.25x experiment pays the T-bill
+proxy plus a 3% annual funding spread and cannot enter the main ranking.
+
+The chronology is fixed: 2016-2021 train, 2022-2023 validation, and 2024 onward
+fixed replay for the current ten-year sample. Candidate utility combines net
+CAGR, drawdown improvement, and Sharpe improvement; the worse development fold
+dominates the score. Earlier reports have already exposed 2024+, so it is not
+an untouched holdout even though the current run does not use it for ranking.
+The family-member check is an exploratory filter, not a true adjacent-parameter
+plateau test. The 20-session paired block bootstrap is likewise diagnostic: it
+does not preserve a complete 6-12 month trend state or correct for all searched
+parameters. Calendar-year stability and doubled-cost sensitivity remain in the
+artifact as falsification checks.
+
+ETF findings remain research-grade because the yfinance/Yahoo auto-adjusted
+series is an adjusted market-price return proxy, not issuer NAV total return;
+the source can be revised, and adjusted OHLC cannot validate intraday stop
+fills. Top-3 findings remain permanently non-decision-grade because the source
+cache uses today's SPX/NDX/DJIA membership and omits delisted constituents.
+Point-in-time membership, permanent security identifiers, and delisting and
+corporate-action continuity are prerequisites before Top-3 can enter a learning
+environment.
+
+## Cross-Asset Momentum Policy and Final Candidate
+
+`scripts/momentum_policy_lab.py` applies one shared parameter set to SPY, QQQ,
+PDP, MTUM, MMTM, SPMO, and QMOM. The policy families combine completed-month
+6/10/12-month trend votes, optional 21/63-session volatility scaling, and
+explicit fast-brake or parent-market caps. Positions drift between scheduled
+rebalances; a close-t target fills at close t+1 and pays one-way turnover cost.
+Idle cash receives the prior-observation T-bill proxy and exposure above 100%
+pays the configured funding spread.
+
+The policy lab reports both a fixed 2024+ replay and annual nested pseudo-OOS
+selection. Each annual fold uses a rolling five-calendar-year training window,
+the prior year for validation, a 21-session embargo, and the next year for
+testing. Because all later dates have now been viewed, this is a historical
+pseudo-live diagnostic, not a replacement for prospective validation.
+
+`scripts/momentum_final_candidate.py` is the narrower falsification study. It
+pre-registers only 27 monthly asymmetric allocations: 6/10/12-month SMA,
+risk-on exposure 1.00/1.15/1.25, and risk-off exposure 0/0.25/0.50. It evaluates
+one parameter set across all seven ETFs, defines direct grid neighbors, runs
+the same annual pseudo-OOS protocol, and stresses 20bp per-side cost and a 6%
+funding spread over T-bills. The 10-month 1.25/0.50 rule is retained only as a
+prospective SPMO shadow challenger; it is not the development-selected common
+policy and does not pass the cross-asset return/drawdown gate.
+
+## Conservative Time-Series RL Research
+
+`scripts/momentum_rl_research.py` builds a research-only historical allocation
+environment after excluding survivor-biased Top-3 data. The action space has
+six fixed exposure targets plus true `HOLD` and a dynamic continuous
+`BASELINE`. Non-rebalance dates permit only `HOLD`; the baseline controller uses
+the exact policy-lab schedule and continuous target. The environment observes
+close t, lets the old self-financing position earn the t-to-t+1 risky/cash or
+funded return, then trades at close t+1 and charges turnover cost.
+
+The tabular state contains market regime, current exposure, current drawdown,
+running maximum drawdown, decision availability, and the dynamic baseline
+bucket. Support is counted by unique calendar dates, so replayed epochs and
+same-date correlated ETFs do not mechanically increase it. A challenger action
+can enter the Bellman backup only when both it and the dynamic baseline meet the
+support floor; otherwise execution falls back to the baseline. Tests require
+the baseline controller's equity, exposure, and turnover path to match
+`momentum_policy_lab.simulate_targets` to floating-point precision.
+
+This is a support-constrained engineering baseline, not a formal SPIBB
+implementation or a safe-RL guarantee. Historical output is always
+`INCONCLUSIVE_RESEARCH`; at best it can nominate a paper candidate. Annual
+nested RL walk-forward, synchronized block-bootstrap confidence bounds,
+doubled-cost and delayed-fill stress, multiple-testing correction, and a new
+prospective shadow period remain prerequisites for any stronger conclusion.
+
 ## Market-Mass Research
 
 `scripts/market_mass_boundaries.py` estimates a recency- and dollar-volume-

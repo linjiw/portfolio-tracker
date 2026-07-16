@@ -1,16 +1,20 @@
 {
-  "$schema_note": "Momentum Top-3 research config. Signals use month-end closes; targets fill at the next session close after the prior book earns that day's return. Current-universe and in-sample-selection biases make outputs non-decision-grade.",
+  "$schema_note": "Momentum Top-3/Top-5 ten-year research config. Signals use month-end closes; targets fill at the next session close after the prior book earns that day's return. Current-universe, corporate-action, and in-sample-selection limitations make outputs non-decision-grade.",
   "universe": {
     "indices": ["SPX", "NDX", "DJIA"],
     "min_history_coverage": 0.95,
+    "max_anchor_staleness_sessions": 3,
+    "max_signal_staleness_sessions": 0,
     "min_cache_members": 400,
     "min_download_fraction": 0.90,
     "min_fresh_fraction": 0.80,
     "note": "current constituents scraped from Wikipedia -> survivorship bias; neither absolute performance nor in-sample cross-strategy ranking is decision-grade"
   },
   "backtest": {
-    "years": 8,
+    "years": 10,
     "cost_per_side": 0.0010,
+    "warm_start_months": 2,
+    "max_fill_retry_sessions": 3,
     "rebalance": "monthly",
     "benchmarks": ["SPY", "QQQ"]
   },
@@ -34,13 +38,13 @@
       "thesis": "9m lookback is a faster concentrated research variant; relative ranking versus other variants remains in-sample."
     },
     {
-      "id": "RET_5M_top5",
-      "label": "稳健 · 5月动量 Top5",
-      "lookback_months": 5,
+      "id": "RET_11M_top5",
+      "label": "宽度 · 11月动量 Top5",
+      "lookback_months": 11,
       "top_n": 5,
       "weighting": "equal",
       "role": "defensive-diversifier",
-      "thesis": "5m lookback plus 5-name breadth tests whether shorter momentum and wider diversification change the in-sample profile."
+      "thesis": "Exact 11m breadth control: the score, dates, costs, and universe match RET_11M_top3 so only concentration changes."
     }
   ],
   "sleeve_caps": {
@@ -50,9 +54,9 @@
   },
   "live_plan": {
     "strategy_id": "RET_11M_top3",
-    "account_label": "小账户实测",
+    "account_label": "纸面研究",
     "started": "2026-07-06",
-    "note": "3个月分3批等额建仓, 每批跟随当期月末信号; 手工维护 executed/date",
+    "note": "纸面研究：3个月分3批等额跟随月末信号，不对应任何真实账户或执行记录",
     "tranches": [
       {"seq": 1, "target_month_end": "2026-07-31", "fraction": 0.3334, "executed": false, "date": null},
       {"seq": 2, "target_month_end": "2026-08-31", "fraction": 0.3333, "executed": false, "date": null},
